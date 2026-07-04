@@ -6,3 +6,7 @@ bench/fixtures/*.db
 bench/fixtures/*.db-*
 *.log
 .DS_Store
+
+# Hayvenhurst (added by `hayven init`) — generated index + installed skill
+.hayven/
+.claude/skills/
