@@ -1,0 +1,6 @@
+# Sanctioned scratch location for bench fixtures.
+#
+# Harnesses that need to seed a sample ledger on disk write it HERE (or to a
+# scratch tmpdir) — NEVER to the repo-root .sirius/, which the core agent owns.
+# The in-memory FixtureLedger model (bench/lib/ledger.ts) covers current needs,
+# so this directory is usually empty; it exists so on-disk fixtures have a home.

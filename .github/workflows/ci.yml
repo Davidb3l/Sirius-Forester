@@ -1,0 +1,131 @@
+name: CI
+
+# Mirrors the Ametrite workflow: the Rust binary is tested/linted/formatted, the
+# zero-npm-dep Bun console is type-checked, tested, and bundle-checked, and the
+# bench harnesses are smoke-run in fixture mode. Everything runs on all three
+# host OSes so the local-first binary is proven on each.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # The Rust binary: build + test + clippy + fmt on macOS / Ubuntu / Windows.
+  # (Sources are owned by sirius-core; these steps go green once Cargo.toml and
+  #  src/ land. `fmt` and `clippy` run only on Ubuntu to keep the matrix lean,
+  #  matching the Ametrite workflow.)
+  # ─────────────────────────────────────────────────────────────────────────
+  rust:
+    name: rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ matrix.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.os }}-
+
+      - name: Build
+        run: cargo build --locked --verbose
+
+      - name: Test
+        run: cargo test --locked --verbose
+
+      - name: Format check
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # The Console: zero npm runtime deps, Bun only. Type-check, test, and prove
+  # the server entry bundles. Runs on all three OSes.
+  # ─────────────────────────────────────────────────────────────────────────
+  console:
+    name: console (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dev deps (zero runtime deps by policy)
+        run: bun install --frozen-lockfile || bun install
+
+      - name: Type-check
+        run: bunx tsc --noEmit
+
+      - name: Test
+        run: bun test
+
+      - name: Bundle check (server entry must build)
+        run: bun build src/server.ts --target=bun --outdir /tmp/sirius-console-bundle
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Bench smoke: every §8 harness must run to completion in fixture mode and
+  # print a machine-parseable METRIC line. This does NOT --enforce targets (a
+  # simulated number outside target must not break CI); it asserts the harness
+  # is runnable and produced a metric. Ubuntu only — the harnesses are pure Bun
+  # and platform-invariant.
+  # ─────────────────────────────────────────────────────────────────────────
+  bench-smoke:
+    name: bench smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Run every harness in fixture mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+          for h in receipts gate-escape soak wasted-work claim-mode; do
+            echo "::group::bench/$h.ts"
+            out="$(bun run "bench/$h.ts")"
+            echo "$out"
+            if ! grep -q '^METRIC ' <<<"$out"; then
+              echo "::error::bench/$h.ts produced no METRIC line"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$fail"
