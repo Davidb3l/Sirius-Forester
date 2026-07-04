@@ -178,3 +178,68 @@ Verify exact flag names against the installed CLIs (`amt --help`, `hayven --help
   measured number tied to a PRD §8 metric.
 - CI (`.github/workflows/ci.yml`): cargo test/clippy/fmt + web bundle check + bench smoke,
   matrix macOS/Ubuntu/Windows (mirror the Ametrite workflow).
+
+---
+
+## 6. Ground-truth CLI deltas
+
+Verified against the installed `amt 0.1.0` and `hayven 0.0.5` at build time. Where a
+real flag differs from §4's intent, `sirius-core` adapted its code to the form below.
+These deltas are what the binary actually shells; the Console must mirror them if it
+ever shells the parents directly (it should only shell `sirius --json`).
+
+### Ametrite (`amt 0.1.0`)
+
+- **`--json` is a global flag before the subcommand** (`amt --json claim ...`), not a
+  per-subcommand suffix. (It is also accepted after, but Sirius emits it globally.)
+- **Comments:** `amt issue comment <ID> -m/--body <text>` (returns `{"ok":true}`), NOT
+  the §4 `amt comment <ID> "<text>"`.
+- **Status updates:** `amt issue update <ID> --status <s>` (returns the updated issue
+  object), NOT `amt issue update <ID> --status`.
+- **`amt claim` output is NOT `{claimed:bool, issue?}`.** On success it returns the full
+  issue object (`{"id":"AMT-7","title":...,"activity":[...]}`). On no-work it returns
+  `{"claimed":false,"retry_after":N,"counts":{...},"reason":"..."}`. Sirius keys success
+  off the presence of `id`, and no-work off `claimed:false`. `--peek` gives the no-work
+  shape without taking a lease (used by `sirius doctor`).
+- **`amt claim` flags:** `--from` accepts a comma-list/repeat of `backlog,todo`; `--ttl`
+  (default 900), `--cooldown` (default 3600), `--agent`, `--issue <id>` (specific claim /
+  heartbeat), `--peek`, `--all-workspaces` all present as in §4's intent.
+- **`amt release <ID>`** requires `--agent` matching the claimant; takes `--status`
+  (default `in_review`) and `-m/--comment`.
+- **`amt decide` is `amt decide --issue <ID> --title <T> [-b <body>]`** (title required),
+  returns `{"id":"D-n","resolves":"AMT-7",...}`, NOT `amt decide AMT-7 "<why>"`.
+- **Ametrite schema version lives in the `meta` table** (`SELECT value FROM meta WHERE
+  key='schema_version'`), NOT in `PRAGMA user_version` (which reads 0). Observed value on
+  a freshly-`amt init`ed workspace is **v4** (≥ the PRD's "v3" floor). `sirius doctor`
+  reads this read-only and checks `>= 3` pragmatically — a hardcoded `== 3` compare would
+  already be wrong.
+
+### Hayvenhurst (`hayven 0.0.5`)
+
+- **No per-subcommand `--help`:** every `hayven <sub> --help` prints the same global help.
+- **`hayven claim <ids...> --intent "..." [--force]`** — ids are **positional** (multiple
+  allowed), there is **NO `--agent` flag** (agent is derived by the daemon) and **NO
+  `--node`/`--scope`** on claim. Exit codes as in §4: **0 registered, 1 hard overlap
+  (409), 3 oracle adjacency (202)**.
+- **`hayven remember "<note>" [--node <id>] [--kind K] [--scope a,b] [--ttl S]`** — the
+  note is the **first positional arg**; `--scope` is a comma list. Returns
+  `{"id":"mem_...","nodeId":...,"kind":...,"scope":[...]}`. There is no `--agent` (agent
+  is null in the record). This is the reverse-provenance write path (PRD §6 fact 3).
+- **`hayven recall [<term>] [--node <id>] [--kind K] [--json]`** returns
+  `{"count":N,"notes":[{...}]}`.
+- **`hayven affected-tests <symbol> [--changed a,b] [--trace-only] [--json]` has NO
+  `--gate` / `--gate-tier` flags** in 0.0.5. Sirius therefore synthesizes the gate verdict
+  from the command's **exit code** (0 = pass, non-zero = fail), which is the PRD §6 fact-4
+  contract. The requested tier is recorded in the ledger/`--json` output but is NOT passed
+  to 0.0.5; wire `--gate-tier` through only when a future hayven exposes it. Sirius passes
+  the primary mapped symbol positionally and the rest via `--changed`.
+- **Daemon is single-project-bound.** The daemon on `:7777` serves ONE project; a
+  read/write against a workspace whose daemon is not the one on `:7777` fails with exit 1
+  and `"daemon at ... serves a DIFFERENT project — refusing to mutate it"`. Consequence:
+  `sirius` hayven calls only succeed when the `:7777` daemon matches the current workspace
+  (start it with `hayven daemon start` in the repo). `sirius doctor`'s daemon check probes
+  `GET http://localhost:7777/` for a 200 and reports the `hayven daemon status` line;
+  when the workspace mismatches, forward stamping (`amt`) still lands while reverse
+  stamping (`hayven remember`) reports `reverse_ok:false` — verified live.
+- **`hayven --version` prints just `0.0.5`** (no `hayven ` prefix), unlike `amt --version`
+  which prints `amt 0.1.0`.
