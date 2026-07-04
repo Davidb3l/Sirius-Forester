@@ -136,12 +136,16 @@ pub fn why_symbol(amt: &Amt, hv: &Hayven, symbol: &str) -> Result<WhySymbol, Str
 
     let mut issues = Vec::new();
     for r in issue_refs {
-        let title = amt
-            .issue_show(&r)
-            .ok()
-            .and_then(|v| v.get("title").and_then(Value::as_str).map(String::from))
-            .unwrap_or_default();
-        issues.push((r, title));
+        // Resolve against Ametrite; skip candidates that don't exist (the
+        // generic prefix regex may over-match tokens like "UTF-8").
+        if let Ok(v) = amt.issue_show(&r) {
+            let title = v
+                .get("title")
+                .and_then(Value::as_str)
+                .map(String::from)
+                .unwrap_or_default();
+            issues.push((r, title));
+        }
     }
     let mut decisions = Vec::new();
     for r in decision_refs {
@@ -203,10 +207,17 @@ fn collect_note_text(v: &Value) -> String {
     s
 }
 
-/// Extract `AMT-n` and `D-n` references from free text.
+/// Extract issue (`<PREFIX>-n`) and decision (`D-n`) references from free text.
+///
+/// The issue prefix is workspace-configurable in Ametrite (`AMT`, `SIRF`, …),
+/// so we match any `[A-Z][A-Z0-9]+-\d+` token rather than a fixed prefix. That
+/// requires ≥2 leading alphanumerics, which keeps it from colliding with the
+/// single-letter `D-n` decision namespace. Callers resolve each candidate
+/// against Ametrite and drop anything that doesn't exist, so an over-match is
+/// harmless.
 pub fn extract_refs(text: &str) -> (Vec<String>, Vec<String>) {
     // Static regexes, compiled once.
-    let issue_re = Regex::new(r"\bAMT-\d+\b").unwrap();
+    let issue_re = Regex::new(r"\b[A-Z][A-Z0-9]+-\d+\b").unwrap();
     let dec_re = Regex::new(r"\bD-\d+\b").unwrap();
     let mut issues: Vec<String> = Vec::new();
     for m in issue_re.find_iter(text) {
