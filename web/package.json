@@ -1,0 +1,21 @@
+{
+  "name": "sirius-console",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sirius Forester Console — Bun.serve, vanilla TS, zero runtime deps (:1777)",
+  "license": "MIT",
+  "type": "module",
+  "module": "src/server.ts",
+  "scripts": {
+    "start": "bun run src/server.ts",
+    "dev": "bun --watch run src/server.ts",
+    "seed": "bun run fixtures/seed.ts",
+    "demo": "bun run fixtures/seed.ts && SIRIUS_LEDGER=\"$PWD/fixtures/.sirius/sirius.db\" bun run src/server.ts",
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "devDependencies": {
+    "bun-types": "^1.3.14",
+    "typescript": "^6.0.3"
+  }
+}

@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sirius Forester — Fleet Console</title>
+    <link rel="stylesheet" href="/app.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%F0%9F%8C%B2%3C/text%3E%3C/svg%3E"
+    />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">◇</span>
+        <span class="brand-name">SIRIUS FORESTER</span>
+        <span class="brand-sub">fleet console · :1777</span>
+      </div>
+      <div class="topbar-right">
+        <span id="conn" class="conn conn-init" title="live connection">
+          <span class="dot"></span><span class="conn-label">connecting</span>
+        </span>
+        <span id="dataver" class="dataver" title="ledger data_version">v—</span>
+      </div>
+    </header>
+
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-view="fleet" role="tab">Fleet</button>
+      <button class="tab" data-view="history" role="tab">History</button>
+      <button class="tab" data-view="receipts" role="tab">Receipts</button>
+      <button class="tab" data-view="config" role="tab">Config</button>
+    </nav>
+
+    <main id="main">
+      <section id="view-fleet" class="view active"></section>
+      <section id="view-history" class="view"></section>
+      <section id="view-receipts" class="view"></section>
+      <section id="view-config" class="view"></section>
+    </main>
+
+    <div id="drawer" class="drawer" hidden>
+      <div class="drawer-scrim" data-close></div>
+      <aside class="drawer-panel">
+        <button class="drawer-close" data-close aria-label="close">✕</button>
+        <div id="drawer-body"></div>
+      </aside>
+    </div>
+
+    <footer class="footer">
+      <span id="ledger-note"></span>
+      <span class="footer-spacer"></span>
+      <span class="footer-hint">read-only · mutations shell to <code>sirius --json</code></span>
+    </footer>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
