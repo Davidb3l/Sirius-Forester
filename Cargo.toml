@@ -1,0 +1,28 @@
+[package]
+name = "sirius"
+version = "0.1.0"
+edition = "2021"
+description = "Sirius Forester — a local-first fleet foreman for AI coding agents"
+license = "MIT"
+repository = "https://github.com/anchorsanvils/sirius-forester"
+rust-version = "1.74"
+
+[[bin]]
+name = "sirius"
+path = "src/main.rs"
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+
+[features]
+# Opt-in integration tests that shell out to real `amt`/`hayven`.
+# Off by default so `cargo test` runs fully offline.
+integration = []
+
+[profile.release]
+strip = true
+lto = true
