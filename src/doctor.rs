@@ -124,13 +124,21 @@ pub fn run(ws: &Workspace, runner: &dyn Runner) -> DoctorReport {
         .map(|_| " .hayven/ present")
         .unwrap_or(" .hayven/ not found (run `hayven init`)");
     if http {
-        checks.push(Check::ok(
-            "hayven_daemon_7777",
+        // The daemon is single-project-bound: a 200 on :7777 means *a* daemon is
+        // up, not that it serves this workspace. Only call it "healthy" when the
+        // status line isn't an error and this workspace has a .hayven/ to serve.
+        let status_line = first_line(&status);
+        let serving = ws.hayven_dir.is_some()
+            && !status_line.to_ascii_lowercase().contains("error")
+            && !status_line.contains("No .hayven");
+        let detail = if serving {
+            format!("hayven {hv_ver}, daemon healthy on :7777 (status: {status_line});{hv_ws}")
+        } else {
             format!(
-                "hayven {hv_ver}, daemon healthy on :7777 (status: {});{hv_ws}",
-                first_line(&status)
-            ),
-        ));
+                "hayven {hv_ver}, daemon up on :7777 but not serving this workspace (status: {status_line});{hv_ws}"
+            )
+        };
+        checks.push(Check::ok("hayven_daemon_7777", detail));
     } else {
         checks.push(Check::fail(
             "hayven_daemon_7777",
