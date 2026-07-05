@@ -4,24 +4,54 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Sirius Forester — Fleet Console</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
     <link rel="stylesheet" href="/app.css" />
     <link
       rel="icon"
-      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%F0%9F%8C%B2%3C/text%3E%3C/svg%3E"
+      href="data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220%200%2064%2072%22%3E%3Cpath%20d=%22M32,11L36,25.07L50.19,21.5L40,32L50.19,42.5L36,38.93L32,63L28,38.93L13.81,42.5L24,32L13.81,21.5L28,25.07Z%22%20fill=%22%238fd4ff%22/%3E%3C/svg%3E"
     />
   </head>
   <body>
+    <!-- The whole cosmos (drifting dust + starfield + grain) is rendered on this
+         one canvas by stars.js, so the dust moves with the stars. -->
+    <canvas class="starfield" id="starfield" aria-hidden="true"></canvas>
+
     <header class="topbar">
       <div class="brand">
-        <span class="brand-mark">◇</span>
+        <span class="brand-mark" aria-hidden="true">
+          <svg class="sirius-star" viewBox="0 0 64 72" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <g id="sf-pine">
+                <path d="M0,-1 L0.15,-0.55 L0.08,-0.55 L0.27,-0.2 L0.16,-0.2 L0.4,0.05 L-0.4,0.05 L-0.16,-0.2 L-0.27,-0.2 L-0.08,-0.55 L-0.15,-0.55 Z" />
+                <rect x="-0.05" y="0.03" width="0.1" height="0.24" />
+              </g>
+            </defs>
+            <path
+              class="star-body"
+              d="M32,11 L36,25.07 L50.19,21.5 L40,32 L50.19,42.5 L36,38.93 L32,63 L28,38.93 L13.81,42.5 L24,32 L13.81,21.5 L28,25.07 Z"
+              fill="currentColor"
+            />
+            <g class="sf-trees">
+              <use href="#sf-pine" transform="translate(22.6,45) scale(10.5)" />
+              <use href="#sf-pine" transform="translate(41.4,45) scale(10.5)" />
+              <use href="#sf-pine" transform="translate(32,45) scale(15)" />
+            </g>
+          </svg>
+        </span>
         <span class="brand-name">SIRIUS FORESTER</span>
-        <span class="brand-sub">fleet console · :1777</span>
+        <span class="brand-sub">fleet console · α&nbsp;CMa · :1777</span>
       </div>
       <div class="topbar-right">
         <span id="conn" class="conn conn-init" title="live connection">
           <span class="dot"></span><span class="conn-label">connecting</span>
         </span>
         <span id="dataver" class="dataver" title="ledger data_version">v—</span>
+        <button id="fx-toggle" class="fx-toggle" type="button" aria-pressed="true" title="Toggle cosmic background (for low-power devices)">✦</button>
       </div>
     </header>
 
@@ -50,9 +80,10 @@
     <footer class="footer">
       <span id="ledger-note"></span>
       <span class="footer-spacer"></span>
-      <span class="footer-hint">read-only · mutations shell to <code>sirius --json</code></span>
+      <span class="footer-hint">bg: NASA · ESA · CSA · STScI&nbsp;&nbsp;·&nbsp;&nbsp;read-only · mutations shell to <code>sirius --json</code></span>
     </footer>
 
     <script src="/app.js" type="module"></script>
+    <script src="/stars.js"></script>
   </body>
 </html>
