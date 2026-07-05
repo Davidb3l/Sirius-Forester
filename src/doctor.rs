@@ -131,14 +131,26 @@ pub fn run(ws: &Workspace, runner: &dyn Runner) -> DoctorReport {
         let serving = ws.hayven_dir.is_some()
             && !status_line.to_ascii_lowercase().contains("error")
             && !status_line.contains("No .hayven");
-        let detail = if serving {
-            format!("hayven {hv_ver}, daemon healthy on :7777 (status: {status_line});{hv_ws}")
+        if serving {
+            checks.push(Check::ok(
+                "hayven_daemon_7777",
+                format!(
+                    "hayven {hv_ver}, daemon healthy on :7777 (status: {status_line});{hv_ws}"
+                ),
+            ));
         } else {
-            format!(
-                "hayven {hv_ver}, daemon up on :7777 but not serving this workspace (status: {status_line});{hv_ws}"
-            )
-        };
-        checks.push(Check::ok("hayven_daemon_7777", detail));
+            // SIRF-10: the daemon is single-project-bound — a 200 on :7777 means
+            // *a* daemon is up, not that it serves THIS workspace. This is the one
+            // silent-degradation state CONTRACTS documents: forward stamps (amt)
+            // still land but reverse stamps (hayven remember) quietly go one-way
+            // (reverse_ok:false). So a different-project daemon must FAIL, not pass.
+            checks.push(Check::fail(
+                "hayven_daemon_7777",
+                format!(
+                    "hayven {hv_ver}, daemon up on :7777 but not serving this workspace (status: {status_line});{hv_ws} — run `hayven daemon start` in this repo"
+                ),
+            ));
+        }
     } else {
         checks.push(Check::fail(
             "hayven_daemon_7777",
@@ -233,6 +245,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sirius-doctor-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".ametrite")).unwrap();
+        std::fs::create_dir_all(dir.join(".hayven")).unwrap();
         let dbp = dir.join(".ametrite/ametrite.db");
         {
             let c = Connection::open(&dbp).unwrap();
@@ -241,10 +254,12 @@ mod tests {
             c.execute("INSERT INTO meta VALUES ('schema_version','3')", [])
                 .unwrap();
         }
+        // SIRF-10: a genuinely-healthy workspace must have a .hayven/ so the daemon
+        // on :7777 is serving THIS repo (serving == true).
         let ws = Workspace {
             root: dir.clone(),
             ametrite_db: Some(dbp),
-            hayven_dir: None,
+            hayven_dir: Some(dir.join(".hayven")),
         };
 
         let m = MockRunner::new();
@@ -341,6 +356,65 @@ mod tests {
                 .find(|c| c.name == "hayven_daemon_7777")
                 .unwrap()
                 .pass
+        );
+    }
+
+    // SIRF-10: daemon up (http 200) but serving a DIFFERENT project must FAIL,
+    // because reverse stamps (hayven remember) silently go one-way in that state.
+    #[test]
+    fn fails_when_daemon_serves_different_workspace() {
+        let dir = std::env::temp_dir().join(format!("sirius-doctor3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".ametrite")).unwrap();
+        let dbp = dir.join(".ametrite/ametrite.db");
+        {
+            let c = Connection::open(&dbp).unwrap();
+            c.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)", [])
+                .unwrap();
+            c.execute("INSERT INTO meta VALUES ('schema_version','3')", [])
+                .unwrap();
+        }
+        // This workspace has NO .hayven/, so a running daemon on :7777 is serving
+        // some other project — `serving` is false and the check must fail.
+        let ws = Workspace {
+            root: dir.clone(),
+            ametrite_db: Some(dbp),
+            hayven_dir: None,
+        };
+        let m = MockRunner::new();
+        m.expect(&["amt", "--version"], 0, "amt 0.1.0");
+        m.push(MockResponse::new(&["curl"], 0, "200", "")); // daemon IS up
+        m.expect(&["hayven", "--version"], 0, "0.0.5");
+        m.expect(&["hayven", "daemon", "status"], 0, "running (other-repo)");
+        m.push(MockResponse::new(
+            &["amt", "--json", "claim", "--peek"],
+            0,
+            r#"{"claimed":false}"#,
+            "",
+        ));
+        m.push(MockResponse::new(
+            &["hayven", "--help"],
+            0,
+            "affected-tests remember recall",
+            "",
+        ));
+        let report = run(&ws, &m);
+        assert!(!report.ok, "checks: {:?}", report.checks);
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "hayven_daemon_7777")
+            .unwrap();
+        assert!(!c.pass, "expected mismatch to fail, got: {}", c.detail);
+        assert!(
+            c.detail.contains("not serving this workspace"),
+            "detail: {}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("hayven daemon start"),
+            "expected fix-it hint, detail: {}",
+            c.detail
         );
     }
 }
