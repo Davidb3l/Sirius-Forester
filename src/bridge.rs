@@ -57,6 +57,32 @@ pub fn reverse_note_body(r#ref: &str) -> String {
     format!("Governed by {} (recorded by sirius link)", r#ref)
 }
 
+/// Reverse-stamp retry policy (SIRF-4). The `:7777` daemon can return a
+/// transient non-zero (e.g. mid-startup / reindex) right when `sirius link`
+/// runs; without a retry that leaves a permanent half-receipt (forward_ok but
+/// reverse_ok false). So each node's fleet-memory note is retried with
+/// exponential backoff before we give up on it.
+const REVERSE_ATTEMPTS: u32 = 3;
+#[cfg(not(test))]
+const REVERSE_BASE_MS: u64 = 250;
+#[cfg(test)]
+const REVERSE_BASE_MS: u64 = 0; // no real sleeps under test
+
+/// Stamp one node's reverse note, retrying a transient failure with backoff.
+/// Returns true once the note lands, false if every attempt failed.
+fn remember_with_retry(hv: &Hayven, note: &str, node: &str, scope: &[String]) -> bool {
+    for attempt in 0..REVERSE_ATTEMPTS {
+        if hv.remember(note, Some(node), "decision", scope).is_ok() {
+            return true;
+        }
+        if attempt + 1 < REVERSE_ATTEMPTS {
+            let backoff = REVERSE_BASE_MS.saturating_mul(1u64 << attempt);
+            std::thread::sleep(std::time::Duration::from_millis(backoff));
+        }
+    }
+    false
+}
+
 /// Stamp both directions and write a receipt row. `worker_id` is optional
 /// (the bridge is usable outside the loop).
 pub fn link(
@@ -89,10 +115,12 @@ pub fn link(
     };
 
     // Reverse stamp: a decision note on each node, scoped to the whole set.
+    // Each node is retried on a transient daemon failure (SIRF-4) so one hiccup
+    // doesn't leave a permanent half-receipt.
     let note = reverse_note_body(r#ref);
     let mut reverse_all = true;
     for node in symbols {
-        if hv.remember(&note, Some(node), "decision", symbols).is_err() {
+        if !remember_with_retry(hv, &note, node, symbols) {
             reverse_all = false;
         }
     }
@@ -325,12 +353,15 @@ mod tests {
     fn link_reverse_failure_marks_reverse_not_ok() {
         let m = MockRunner::new();
         m.expect(&["amt", "--json", "issue", "comment"], 0, r#"{"ok":true}"#);
-        m.push(crate::shell::MockResponse::new(
-            &["hayven", "remember"],
-            1,
-            "",
-            "daemon down",
-        ));
+        // Every attempt fails → reverse stays not ok (SIRF-4 retries exhausted).
+        for _ in 0..3 {
+            m.push(crate::shell::MockResponse::new(
+                &["hayven", "remember"],
+                1,
+                "",
+                "daemon down",
+            ));
+        }
         let amt = Amt::new(&m);
         let hv = Hayven::new(&m);
         let led = Ledger::open_in_memory().unwrap();
@@ -346,6 +377,55 @@ mod tests {
         .unwrap();
         assert!(r.forward_ok);
         assert!(!r.reverse_ok);
+        // It really did retry the bounded number of times before giving up.
+        let attempts = m
+            .recorded()
+            .iter()
+            .filter(|c| c.contains("remember"))
+            .count();
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn link_reverse_retry_recovers_transient_failure() {
+        // SIRF-4: two transient failures then a success → reverse_ok true,
+        // no permanent half-receipt.
+        let m = MockRunner::new();
+        m.expect(&["amt", "--json", "issue", "comment"], 0, r#"{"ok":true}"#);
+        m.push(crate::shell::MockResponse::new(
+            &["hayven", "remember"],
+            1,
+            "",
+            "daemon not ready",
+        ));
+        m.push(crate::shell::MockResponse::new(
+            &["hayven", "remember"],
+            1,
+            "",
+            "daemon not ready",
+        ));
+        m.expect(&["hayven", "remember"], 0, r#"{"id":"mem_1"}"#);
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let r = link(
+            &amt,
+            &hv,
+            &led,
+            LinkKind::Issue,
+            "AMT-7",
+            &["n".into()],
+            None,
+        )
+        .unwrap();
+        assert!(r.forward_ok);
+        assert!(r.reverse_ok);
+        let attempts = m
+            .recorded()
+            .iter()
+            .filter(|c| c.contains("remember"))
+            .count();
+        assert_eq!(attempts, 3);
     }
 
     #[test]
