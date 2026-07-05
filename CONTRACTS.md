@@ -4,7 +4,7 @@ This is the **single coordination artifact** for parallel implementation. Three 
 build against it concurrently. If any interface below must change, change it *here first*
 and note it in your final report so the other agents can reconcile.
 
-Authoritative sources: [PRD.md](PRD.md) and [ROADMAP.md](ROADMAP.md). This file only
+The product design and roadmap are maintained privately. This file only
 pins the concrete interfaces where the three workstreams meet.
 
 ---
@@ -13,12 +13,12 @@ pins the concrete interfaces where the three workstreams meet.
 
 | Agent | Owns (writes) | Reads only |
 |---|---|---|
-| **sirius-core** | `Cargo.toml`, `Cargo.lock`, `src/**`, `.sirius/` schema (created by `sirius init`) | `CONTRACTS.md`, `PRD.md`, `ROADMAP.md` |
+| **sirius-core** | `Cargo.toml`, `Cargo.lock`, `src/**`, `.sirius/` schema (created by `sirius init`) | `CONTRACTS.md` |
 | **sirius-console** | `web/**` | `CONTRACTS.md`, the ledger schema below, `sirius --json` shapes below |
 | **sirius-bench-docs** | `bench/**`, `.github/**`, `README.md`, `AGENTS.md`, `.claude/skills/sirius/**`, `docs/**` | everything |
 
 Nobody but **sirius-core** touches `Cargo.toml` or `src/`. Nobody but **sirius-console**
-touches `web/`. The top-level `.gitignore`, `LICENSE`, `PRD.md`, `ROADMAP.md`,
+touches `web/`. The top-level `.gitignore`, `LICENSE`, and
 `CONTRACTS.md` already exist — do not overwrite them.
 
 Commit your own work on a branch named `agent/<your-area>` (e.g. `agent/core`,

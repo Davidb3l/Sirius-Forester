@@ -10,3 +10,11 @@ bench/fixtures/*.db-*
 # Hayvenhurst (added by `hayven init`) — generated index + installed skill
 .hayven/
 .claude/skills/
+
+# Private strategy docs — kept local only, never in the public repo.
+# (Working copies live outside the repo in ../sirius-private-docs/)
+/PRD.md
+/ROADMAP.md
+/TODO.md
+/SUITE_CONTRACTS.md
+/CONSOLE_V2.md

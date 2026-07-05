@@ -197,8 +197,7 @@ harness measures and how.
         └────────────────────────────────────┘
 ```
 
-One write path per store, and Sirius owns only its own. See [PRD.md](PRD.md) for
-the full design and [ROADMAP.md](ROADMAP.md) for the build order.
+One write path per store, and Sirius owns only its own.
 
 ---
 

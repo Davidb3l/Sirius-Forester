@@ -35,7 +35,7 @@ your tree:
 | **sirius-console** | `web/**` |
 | **sirius-bench-docs** | `bench/**`, `.github/**`, `README.md`, `AGENTS.md`, `.claude/skills/sirius/**`, `docs/**` |
 
-`CONTRACTS.md`, `PRD.md`, `ROADMAP.md`, `LICENSE`, and `.gitignore` already exist
+`CONTRACTS.md`, `LICENSE`, and `.gitignore` already exist
 — read them, do not overwrite them. If an interface at a workstream boundary must
 change, **change it in `CONTRACTS.md` first** and note it, so the others can
 reconcile.

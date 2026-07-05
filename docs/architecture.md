@@ -1,7 +1,7 @@
 # Architecture & Integration Contract
 
-This is the reader's companion to [PRD.md](../PRD.md) and
-[CONTRACTS.md](../CONTRACTS.md): how the three stores fit together, what Sirius
+This is the reader's companion to [CONTRACTS.md](../CONTRACTS.md): how the
+three stores fit together, what Sirius
 is allowed to write, and the five facts the whole design rests on. Every
 quantitative claim here points at a harness in [`bench/`](../bench/).
 
@@ -70,7 +70,7 @@ release that breaks one is a Sirius-blocking regression:
 ## One iteration, exactly
 
 The loop is claim → map → lock → brief → work → gate → receipt → release. The
-full reference sequence is [PRD §9](../PRD.md); the by-hand version for a single
+full reference sequence lives in the (private) PRD §9; the by-hand version for a single
 worker agent is
 [`.claude/skills/sirius/SKILL.md`](../.claude/skills/sirius/SKILL.md). Two rules
 carry the coordination guarantees:
