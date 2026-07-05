@@ -10,6 +10,7 @@ import { ParentStores } from "./stores.ts";
 import { loadConfig } from "./config.ts";
 import { Sirius } from "./sirius.ts";
 import { VersionPoller, sseResponse } from "./sse.ts";
+import { ValidationError } from "./sirius.ts";
 import {
   fleetBoard,
   historyJson,
@@ -43,11 +44,63 @@ const json = (data: unknown, status = 200) =>
 
 /**
  * Route one request. Exported so tests can drive it without opening a socket.
+ * A top-level try/catch turns any uncaught error into a clean JSON response
+ * (a bad input used to throw and reset the connection): ValidationError → 400,
+ * anything else → 500. (SIRF-11)
  */
 export async function handle(
   req: Request,
   deps: ServerDeps,
 ): Promise<Response> {
+  try {
+    return await route(req, deps);
+  } catch (e) {
+    if (e instanceof ValidationError) return json({ error: e.message }, 400);
+    return json(
+      { error: e instanceof Error ? e.message : String(e) },
+      500,
+    );
+  }
+}
+
+const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+
+/** The hostname of an `Origin:` value (a full URL), or null if unparseable. */
+function originHostname(origin: string | null): string | null {
+  if (!origin) return null;
+  try {
+    return new URL(origin).hostname;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Guard the unauthenticated mutation endpoints against drive-by browser POSTs
+ * (CSRF) and DNS-rebinding: the request `Host` (the authority Bun parses into
+ * `req.url` from the Host header) and the `Origin` (when present) must both be
+ * loopback, and the body must be declared `application/json`. Returns an error
+ * Response to short-circuit, or null to proceed. (SIRF-11)
+ */
+function guardMutation(req: Request): Response | null {
+  // Host: DNS-rebinding defense — a rebinding attack reaches the loopback bind
+  // with an attacker-controlled Host, so reject anything non-loopback.
+  if (!LOOPBACK.has(new URL(req.url).hostname)) {
+    return json({ error: "non-loopback Host refused" }, 403);
+  }
+  // Origin: CSRF defense — a browser attaches the (cross-)origin on POST.
+  const origin = req.headers.get("origin");
+  if (origin !== null && !LOOPBACK.has(originHostname(origin) ?? "")) {
+    return json({ error: "cross-origin request refused" }, 403);
+  }
+  const ct = (req.headers.get("content-type") ?? "").toLowerCase();
+  if (!ct.includes("application/json")) {
+    return json({ error: "content-type must be application/json" }, 415);
+  }
+  return null;
+}
+
+async function route(req: Request, deps: ServerDeps): Promise<Response> {
   const url = new URL(req.url);
   const path = url.pathname;
 
@@ -93,6 +146,10 @@ export async function handle(
   }
 
   // ---- mutation boundary: every mutation shells to `sirius <cmd> --json` ----
+  if (req.method === "POST") {
+    const blocked = guardMutation(req);
+    if (blocked) return blocked;
+  }
   if (req.method === "POST" && path === "/api/gate") {
     const body = (await safeBody(req)) as {
       issue?: string;
@@ -194,6 +251,9 @@ export function startServer(port = Number(process.env.PORT ?? 1777)) {
   const deps = buildDeps();
   const server = Bun.serve({
     port,
+    // Bind loopback only: the mutation endpoints are unauthenticated, so they
+    // must never be reachable from the LAN (0.0.0.0). (SIRF-11)
+    hostname: "127.0.0.1",
     idleTimeout: 0, // keep SSE connections open
     fetch: (req) => handle(req, deps),
   });

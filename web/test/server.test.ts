@@ -29,8 +29,20 @@ afterAll(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+// Loopback base URL so the mutation guard (Host must be loopback) is exercised
+// the same way the real bind on 127.0.0.1 sees it.
 const get = (path: string) =>
-  handle(new Request(`http://x${path}`), deps);
+  handle(new Request(`http://127.0.0.1${path}`), deps);
+
+const postJson = (path: string, body: unknown, headers: Record<string, string> = {}) =>
+  handle(
+    new Request(`http://127.0.0.1${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers },
+      body: JSON.stringify(body),
+    }),
+    deps,
+  );
 
 test("GET /api/health reports ledger available", async () => {
   const res = await get("/api/health");
@@ -120,12 +132,57 @@ test("path traversal cannot escape the public dir", async () => {
 });
 
 test("POST /api/link requires ref or decision", async () => {
+  const res = await postJson("/api/link", { symbols: ["a"] });
+  expect(res.status).toBe(400);
+});
+
+// ---- SIRF-11: console security ---------------------------------------------
+
+test("POST without application/json content-type is rejected (415)", async () => {
   const res = await handle(
-    new Request("http://x/api/link", {
+    new Request("http://127.0.0.1/api/gate", {
       method: "POST",
-      body: JSON.stringify({ symbols: ["a"] }),
+      body: JSON.stringify({ issue: "AMT-7" }),
     }),
     deps,
   );
+  expect(res.status).toBe(415);
+});
+
+test("POST with a cross-origin Origin is refused (403)", async () => {
+  const res = await postJson(
+    "/api/gate",
+    { issue: "AMT-7" },
+    { origin: "https://evil.example" },
+  );
+  expect(res.status).toBe(403);
+});
+
+test("POST with a non-loopback Host is refused (403)", async () => {
+  const res = await handle(
+    new Request("http://evil.example/api/gate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ issue: "AMT-7" }),
+    }),
+    deps,
+  );
+  expect(res.status).toBe(403);
+});
+
+test("a same-origin loopback Origin is allowed through the guard", async () => {
+  // Passes the guard, then fails validation on a bad ref → 400 (not 403).
+  const res = await postJson(
+    "/api/gate",
+    { issue: "--tier" },
+    { origin: "http://localhost:1777" },
+  );
   expect(res.status).toBe(400);
+});
+
+test("POST /api/gate with an argv-injecting issue is rejected (400, no spawn)", async () => {
+  const res = await postJson("/api/gate", { issue: "--target-status" });
+  expect(res.status).toBe(400);
+  const body = await res.json();
+  expect(body.error).toContain("invalid issue");
 });
