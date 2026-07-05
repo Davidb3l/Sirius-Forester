@@ -51,13 +51,17 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Gate an issue: run affected-tests, advance on pass, comment on fail.
+    /// Gate an issue: select affected tests, run them (or the full suite on any
+    /// doubt), advance on pass, comment on fail.
     Gate {
         issue: String,
         #[arg(long)]
         tier: Option<String>,
         #[arg(long)]
         target_status: Option<String>,
+        /// Git range for the changed-file selection (default: working tree vs HEAD).
+        #[arg(long)]
+        range: Option<String>,
         #[arg(long)]
         json: bool,
     },

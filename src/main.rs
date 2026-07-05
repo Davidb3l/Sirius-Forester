@@ -54,8 +54,9 @@ fn main() -> ExitCode {
             issue,
             tier,
             target_status,
+            range,
             json,
-        } => cmd_gate(&ws, &runner, &issue, tier, target_status, json),
+        } => cmd_gate(&ws, &runner, &issue, tier, target_status, range, json),
         Command::Run {
             workers,
             agent_cmd,
@@ -334,12 +335,14 @@ fn regex_is_issue(target: &str) -> bool {
 
 // ---- gate --------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_gate(
     ws: &Workspace,
     runner: &RealRunner,
     issue: &str,
     tier: Option<String>,
     target_status: Option<String>,
+    range: Option<String>,
     json: bool,
 ) -> u8 {
     let ledger = match open_ledger(ws) {
@@ -355,7 +358,17 @@ fn cmd_gate(
     let tier = tier.unwrap_or(cfg.gate_tier);
     let target = target_status.unwrap_or(cfg.target_status);
 
-    match gate::run_gate(&amt, &hv, &ledger, issue, &tier, &target) {
+    match gate::run_gate(
+        &amt,
+        &hv,
+        &ledger,
+        runner,
+        &cfg.gate,
+        issue,
+        &tier,
+        &target,
+        range.as_deref(),
+    ) {
         Ok(o) => {
             if json {
                 print_json(&json!({
@@ -363,16 +376,19 @@ fn cmd_gate(
                     "issue": o.issue,
                     "tier": o.tier,
                     "gate": if o.passed { "pass" } else { "fail" },
+                    "plan": o.plan,
+                    "ran_tests": o.ran_tests,
                     "advanced_to": o.advanced_to,
                     "tests_selected": o.tests_selected,
                     "comment_filed": o.comment_filed
                 }));
             } else {
                 println!(
-                    "gate {} for {}: {} ({} tests){}",
+                    "gate {} for {}: {} [{}] ({} tests){}",
                     o.tier,
                     o.issue,
                     if o.passed { "PASS" } else { "FAIL" },
+                    o.plan,
                     o.tests_selected,
                     o.advanced_to
                         .as_ref()

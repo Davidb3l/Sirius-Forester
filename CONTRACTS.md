@@ -106,9 +106,13 @@ sirius why <symbol> --json  -> {"symbol":str,"issues":[{"ref":"AMT-7","title":st
                                 "decisions":[{"ref":"D-3","summary":str}]}
 sirius why AMT-7 --json     -> {"ref":"AMT-7","symbols":[str],"decisions":[str]}
 
-sirius gate AMT-7 [--tier safe] [--target-status in_review] --json
+sirius gate AMT-7 [--tier safe] [--target-status in_review] [--range <git-range>] --json
    -> {"ok":bool,"issue":"AMT-7","tier":"safe","gate":"pass|fail",
-       "advanced_to":"in_review"|null,"tests_selected":int,"comment_filed":bool}
+       "plan":"subset(n)|full-suite|blocked|pass-with-warning|unconfigured",
+       "ran_tests":bool,"advanced_to":"in_review"|null,
+       "tests_selected":int,"comment_filed":bool}
+   # Selects affected tests over the changed files, then RUNS them via
+   # gate.test_cmd (full suite on any doubt); verdict = the runner's exit code.
 
 sirius run --workers N --agent-cmd "<cmd>" [--from todo] --json
    # streams NDJSON iteration events to stdout, one object per line:
@@ -158,7 +162,7 @@ hayven claim <symbol> --intent "AMT-7: ..." --agent sirius/oak   # exit 0 ok, 1 
 hayven context <symbol> --json
 hayven recall --node <id> --json
 hayven remember --kind decision --node <id> --scope <ids> "<text>"
-hayven affected-tests --changed --gate --gate-tier safe          # exit 0 pass, 1 fail
+hayven affected-tests --changed <files> --json  # SELECTS tests (exit 0 = selected, NOT passed); sirius runs them
 hayven release <claimId>
 ```
 
@@ -227,12 +231,23 @@ ever shells the parents directly (it should only shell `sirius --json`).
   is null in the record). This is the reverse-provenance write path (PRD §6 fact 3).
 - **`hayven recall [<term>] [--node <id>] [--kind K] [--json]`** returns
   `{"count":N,"notes":[{...}]}`.
-- **`hayven affected-tests <symbol> [--changed a,b] [--trace-only] [--json]` has NO
-  `--gate` / `--gate-tier` flags** in 0.0.5. Sirius therefore synthesizes the gate verdict
-  from the command's **exit code** (0 = pass, non-zero = fail), which is the PRD §6 fact-4
-  contract. The requested tier is recorded in the ledger/`--json` output but is NOT passed
-  to 0.0.5; wire `--gate-tier` through only when a future hayven exposes it. Sirius passes
-  the primary mapped symbol positionally and the rest via `--changed`.
+- **`hayven affected-tests` is a test SELECTOR, not a runner** (SIRF-5 / D-3). Its exit
+  code means "selection computed," **never** "the tests pass" — `affected-tests --changed
+  <files> --json` returns exit 0 with `{"roots":[...],"note":...,"tests":[...]}` even when
+  `tests` is empty, and there are no `--gate` / `--gate-tier` flags in 0.0.5. **Sirius owns
+  the run-the-tests half itself.** The gate (`src/gate.rs`): (1) resolves changed files from
+  a git range, (2) calls `hayven affected-tests --changed <csv> --json` to *select*, (3)
+  trusts a narrow selection **only** when the command succeeded, `roots > 0`, there are
+  runnable ids, the `note` raises no under-report/stale flag, and no global-impact file
+  (Cargo.toml, package.json, `.github/`, …) changed — otherwise it **falls back to the full
+  suite**, (4) runs the chosen tests via the configurable **`gate.test_cmd`** (e.g.
+  `cargo test`), and (5) takes the verdict from the **test runner's** exit code. The
+  governing rule is *"ran too much, never missed a test."* `gate.fallback` (`full-suite`
+  default | `fail` | `pass-with-warning`) governs behavior under doubt; with no `test_cmd`
+  the gate is **fail-closed** (refuses to pass). The requested tier is recorded in the
+  ledger/`--json` output; `--gate-tier` is wired through only when a future hayven exposes
+  it. This mirrors the ported reference recipe `ci/hayven-affected-tests.sh` in public
+  Hayvenhurst (SAFE tier: 0 misses across ~62 replayed bugs).
 - **Daemon is single-project-bound.** The daemon on `:7777` serves ONE project; a
   read/write against a workspace whose daemon is not the one on `:7777` fails with exit 1
   and `"daemon at ... serves a DIFFERENT project — refusing to mutate it"`. Consequence:

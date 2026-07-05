@@ -61,6 +61,37 @@ pub enum ClaimMode {
     Adaptive,
 }
 
+/// What the gate does when it cannot trust the selector to be complete
+/// (empty/stale selection, unparseable output, a hub/config change). The
+/// governing rule is "ran too much, never missed a test" — hence the default.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GateFallback {
+    /// Run the entire suite (never miss a test). The default and only safe posture.
+    #[default]
+    FullSuite,
+    /// Block the gate (fail) rather than run everything — for suites too slow to
+    /// run in full, accepting that an un-selectable change cannot pass.
+    Fail,
+    /// Advance with a warning comment — explicitly opting into the miss risk.
+    PassWithWarning,
+}
+
+/// The Gate's runner config (SIRF-5 / D-3). `hayven affected-tests` only
+/// *selects* tests; Sirius runs them. `test_cmd` is the full-suite command;
+/// when a trustworthy narrow selection exists its ids are appended.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GateConfig {
+    /// Full-suite test command, run verbatim via `sh -c` (e.g. `cargo test`,
+    /// `bun test`, `pytest -q`). Unset ⇒ the gate cannot run tests and refuses
+    /// to pass (fail-closed).
+    #[serde(default)]
+    pub test_cmd: Option<String>,
+    /// Behavior when the selection cannot be trusted to be complete.
+    #[serde(default)]
+    pub fallback: GateFallback,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     #[serde(default = "default_true")]
@@ -81,6 +112,8 @@ pub struct Config {
     pub worker_concurrency: u32,
     #[serde(default)]
     pub claim_mode: ClaimMode,
+    #[serde(default)]
+    pub gate: GateConfig,
 }
 
 fn default_true() -> bool {
@@ -111,6 +144,7 @@ impl Default for Config {
             retry_budget: default_retry_budget(),
             worker_concurrency: default_worker_concurrency(),
             claim_mode: ClaimMode::default(),
+            gate: GateConfig::default(),
         }
     }
 }
@@ -161,6 +195,9 @@ mod tests {
         assert_eq!(c.retry_budget, 3);
         assert_eq!(c.worker_concurrency, 3);
         assert_eq!(c.claim_mode, ClaimMode::Adaptive);
+        // Gate: no test command by default (fail-closed), full-suite fallback.
+        assert_eq!(c.gate.test_cmd, None);
+        assert_eq!(c.gate.fallback, GateFallback::FullSuite);
     }
 
     #[test]

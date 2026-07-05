@@ -390,22 +390,27 @@ pub fn run_iteration(
         json!({"agent_ok": work_ok}),
     );
 
-    // 6. GATE.
-    let gate = if entities.is_empty() {
-        // No mapped entities → skip gate (nothing to select tests over).
+    // 6. GATE — select over the agent's ACTUAL changes, run the tests, and take
+    //    the verdict from the test runner (never from the selector's exit code).
+    //    `hayven affected-tests` only selects; on any doubt the gate runs the
+    //    full suite. See gate.rs / SIRF-5 / D-3.
+    let changed_files = crate::gitrange::changed_files(runner, None).unwrap_or_default();
+    let gate_verdict = if changed_files.is_empty() {
+        // The agent changed nothing → there is nothing to gate.
         None
     } else {
-        let primary = &entities[0];
-        let changed: Vec<String> = entities[1..].to_vec();
-        hv.affected_tests(primary, Some(&changed)).ok()
+        Some(crate::gate::evaluate(hv, runner, &config.gate, &changed_files))
     };
-    let gate_result = match &gate {
-        Some(g) if g.passed => {
+    let gate_result = match &gate_verdict {
+        Some(v) if v.passed => {
             let _ = amt.update_status(&issue, &config.target_status);
             "pass"
         }
-        Some(_) => {
-            let _ = amt.comment(&issue, "sirius: gate failed (affected-tests)");
+        Some(v) => {
+            let _ = amt.comment(
+                &issue,
+                &format!("sirius: gate failed [{}]: {}", v.plan, v.reason),
+            );
             "fail"
         }
         None => "skipped",
@@ -415,7 +420,11 @@ pub fn run_iteration(
         worker,
         Some(&issue),
         "gate",
-        json!({"result": gate_result, "tests": gate.as_ref().map(|g| g.selected)}),
+        json!({
+            "result": gate_result,
+            "plan": gate_verdict.as_ref().map(|v| v.plan.clone()),
+            "tests_run": gate_verdict.as_ref().map(|v| v.tests_run),
+        }),
     );
 
     // 7. RECEIPT: decide + two-way link (only on a passing/complete iteration).
@@ -514,6 +523,11 @@ mod tests {
     fn cfg() -> Config {
         Config {
             claim_mode: ClaimMode::Always,
+            // A test command so the gate can actually run (fail-closed otherwise).
+            gate: crate::config::GateConfig {
+                test_cmd: Some("run-suite".into()),
+                fallback: crate::config::GateFallback::FullSuite,
+            },
             ..Config::default()
         }
     }
@@ -692,8 +706,14 @@ mod tests {
         );
         // work (sh -c) → success
         m.expect(&["sh", "-c"], 0, "");
-        // gate pass
-        m.expect(&["hayven", "affected-tests"], 0, r#"{"tests":["t1"]}"#);
+        // gate: changed files → selector (untraced → doubt) → full suite runs → pass
+        m.expect(&["git", "diff"], 0, "src/run.rs\n");
+        m.expect(
+            &["hayven", "affected-tests"],
+            0,
+            r#"{"roots":["run"],"note":"no traces yet — may UNDER-report","tests":[]}"#,
+        );
+        m.expect(&["sh", "-c"], 0, "test result: ok");
         // gate advance
         m.expect(
             &["amt", "--json", "issue", "update"],
@@ -757,9 +777,10 @@ mod tests {
 
     #[test]
     fn failed_gate_does_not_advance_the_issue() {
-        // Same happy path up to the gate, but `hayven affected-tests` exits
-        // non-zero → gate fails. The issue must be released back to `todo`, NOT
-        // promoted to `target_status`, and no receipt may be filed. (SIRF-6)
+        // Same happy path up to the gate, but the gate RUNS the tests and they
+        // fail (a real regression). The issue must be released back to `todo`,
+        // NOT promoted to `target_status`, and no receipt may be filed.
+        // (SIRF-6 release path; SIRF-5 real test run.)
         let m = MockRunner::new();
         m.expect(
             &["amt", "--json", "claim"],
@@ -775,13 +796,21 @@ mod tests {
             0,
             r#"{"id":"AMT-9"}"#,
         );
+        // work agent (sh -c) → success
         m.expect(&["sh", "-c"], 0, "");
-        // Gate: selector exits non-zero → a selected test failed.
-        m.push(MockResponse::new(
+        // Gate: changed files → selector (untraced → doubt) → full suite RUNS
+        // and FAILS (exit 101) → the gate fails on the runner's verdict.
+        m.expect(&["git", "diff"], 0, "src/run.rs\n");
+        m.expect(
             &["hayven", "affected-tests"],
-            1,
+            0,
+            r#"{"roots":["run"],"note":"may UNDER-report","tests":[]}"#,
+        );
+        m.push(MockResponse::new(
+            &["sh", "-c"],
+            101,
+            "test result: FAILED. 1 failed",
             "",
-            "test regression",
         ));
         m.expect(&["hayven", "release"], 0, "ok");
         m.expect(&["amt", "--json", "release"], 0, r#"{"id":"AMT-9"}"#);

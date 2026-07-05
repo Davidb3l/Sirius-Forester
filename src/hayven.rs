@@ -174,39 +174,30 @@ impl<'r> Hayven<'r> {
         }
     }
 
-    /// `hayven affected-tests <symbol> [--changed a,b] --json`.
+    /// `hayven affected-tests --changed <csv> --json` — the reference-recipe
+    /// invocation that selects tests from *changed files* (not a symbol). This
+    /// is a SELECTOR ONLY: exit 0 means "selection computed," never "tests
+    /// pass." The gate parses the returned JSON (`roots`, `note`, `tests`) to
+    /// decide whether to trust a narrow selection or fall back to the full
+    /// suite, and then runs the tests itself (SIRF-5 / D-3).
     ///
-    /// Returns `(selected_test_count, passed)`. Because the real CLI has no
-    /// `--gate` flag, the gate verdict is the command's exit code: 0 = pass,
-    /// non-zero = fail. When it succeeds we also count selected tests from JSON.
-    pub fn affected_tests(
-        &self,
-        symbol: &str,
-        changed: Option<&[String]>,
-    ) -> Result<AffectedTests, String> {
-        let mut args: Vec<String> = vec!["affected-tests".into(), symbol.into()];
-        if let Some(c) = changed {
-            if !c.is_empty() {
-                args.push("--changed".into());
-                args.push(c.join(","));
-            }
+    /// Returns `(command_ok, parsed_json, detail)`. `command_ok` is false on a
+    /// non-zero exit, an execution error, or empty input — every one of which
+    /// the gate treats as doubt.
+    pub fn affected_tests_changed(&self, files: &[String]) -> (bool, Option<Value>, String) {
+        if files.is_empty() {
+            return (false, None, "no changed files".into());
         }
-        args.push("--json".into());
-        let argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let out = self
-            .runner
-            .run("hayven", &argv)
-            .map_err(|e| e.to_string())?;
-        let passed = out.success();
-        let selected = serde_json::from_str::<Value>(&out.stdout)
-            .ok()
-            .map(|v| count_tests(&v))
-            .unwrap_or(0);
-        Ok(AffectedTests {
-            selected,
-            passed,
-            detail: combined(&out).trim().to_string(),
-        })
+        let csv = files.join(",");
+        let argv = ["affected-tests", "--changed", csv.as_str(), "--json"];
+        match self.runner.run("hayven", &argv) {
+            Ok(out) => {
+                let ok = out.success();
+                let parsed = serde_json::from_str::<Value>(&out.stdout).ok();
+                (ok, parsed, combined(&out).trim().to_string())
+            }
+            Err(e) => (false, None, e.to_string()),
+        }
     }
 
     fn json(&self, args: &[&str]) -> Result<Value, String> {
@@ -221,30 +212,6 @@ impl<'r> Hayven<'r> {
             )
         })
     }
-}
-
-/// The parsed result of `affected-tests`.
-#[derive(Debug, Clone)]
-pub struct AffectedTests {
-    pub selected: usize,
-    pub passed: bool,
-    pub detail: String,
-}
-
-/// Best-effort count of selected tests from an affected-tests JSON payload.
-fn count_tests(v: &Value) -> usize {
-    for key in ["tests", "selected", "affected", "hits"] {
-        if let Some(arr) = v.get(key).and_then(Value::as_array) {
-            return arr.len();
-        }
-    }
-    if let Some(n) = v.get("count").and_then(Value::as_u64) {
-        return n as usize;
-    }
-    if let Some(arr) = v.as_array() {
-        return arr.len();
-    }
-    0
 }
 
 /// Combine stdout+stderr for human-readable error/detail text (hayven prints
@@ -314,31 +281,46 @@ mod tests {
     }
 
     #[test]
-    fn affected_tests_pass_counts_selected() {
+    fn affected_tests_changed_reports_ok_and_parses_json() {
         let m = MockRunner::new();
         m.expect(
             &["hayven", "affected-tests"],
             0,
-            r#"{"tests":["t1","t2","t3"]}"#,
+            r#"{"roots":["r"],"note":"clean","tests":[]}"#,
         );
         let h = Hayven::new(&m);
-        let r = h.affected_tests("sym", Some(&["a".into()])).unwrap();
-        assert!(r.passed);
-        assert_eq!(r.selected, 3);
+        let (ok, parsed, _) = h.affected_tests_changed(&["src/a.rs".into()]);
+        assert!(ok);
+        assert!(parsed.is_some());
+        // File-based invocation: --changed <csv>, no positional symbol.
+        assert_eq!(
+            m.recorded()[0],
+            "hayven affected-tests --changed src/a.rs --json"
+        );
     }
 
     #[test]
-    fn affected_tests_fail_on_nonzero_exit() {
+    fn affected_tests_changed_marks_nonzero_exit_not_ok() {
         let m = MockRunner::new();
         m.push(MockResponse::new(
             &["hayven", "affected-tests"],
             1,
             "",
-            "fail",
+            "index error",
         ));
         let h = Hayven::new(&m);
-        let r = h.affected_tests("sym", None).unwrap();
-        assert!(!r.passed);
+        let (ok, _, detail) = h.affected_tests_changed(&["src/a.rs".into()]);
+        assert!(!ok);
+        assert!(detail.contains("index error"));
+    }
+
+    #[test]
+    fn affected_tests_changed_empty_files_is_not_ok() {
+        let m = MockRunner::new();
+        let h = Hayven::new(&m);
+        let (ok, _, _) = h.affected_tests_changed(&[]);
+        assert!(!ok);
+        assert_eq!(m.call_count(), 0);
     }
 
     #[test]
