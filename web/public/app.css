@@ -8,8 +8,8 @@
   --void: #04060d;
   --bg: #060a13;
   --bg-2: #080d1a;
-  --panel: rgba(20, 30, 52, 0.55);
-  --panel-2: rgba(26, 38, 64, 0.6);
+  --panel: rgba(17, 26, 46, 0.72);
+  --panel-2: rgba(23, 34, 58, 0.76);
   --panel-solid: #0c1526;
   --glass-border: rgba(150, 180, 230, 0.14);
   --line: rgba(150, 180, 230, 0.13);
@@ -322,7 +322,18 @@ main {
 }
 .view.active {
   display: block;
-  animation: rise-in 0.4s cubic-bezier(0.22, 1, 0.36, 1);
+  /* Translate-only (no opacity): an opacity animation on this ancestor would
+     isolate it into its own group and disable descendant backdrop-filter for
+     the duration — making the panels' frosted glass pop in a beat late. */
+  animation: view-in 0.4s cubic-bezier(0.22, 1, 0.36, 1);
+}
+@keyframes view-in {
+  from {
+    transform: translateY(8px);
+  }
+  to {
+    transform: none;
+  }
 }
 @keyframes rise-in {
   from {
