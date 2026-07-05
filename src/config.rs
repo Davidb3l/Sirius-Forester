@@ -100,8 +100,10 @@ pub struct Config {
     pub backoff_409: Backoff409,
     #[serde(default)]
     pub oracle_202: Oracle202,
-    #[serde(default)]
-    pub force_budget_tokens: u64,
+    // SIRF-9: `force_budget_tokens` was removed — the loop cannot meter an
+    // agent's token spend, so the knob was never read (the `ForceWithBudget`
+    // path forces unconditionally). Kept out of the struct entirely; the
+    // `Oracle202::ForceWithBudget` variant and its behavior are unchanged.
     #[serde(default = "default_gate_tier")]
     pub gate_tier: String,
     #[serde(default = "default_target_status")]
@@ -114,6 +116,20 @@ pub struct Config {
     pub claim_mode: ClaimMode,
     #[serde(default)]
     pub gate: GateConfig,
+    /// SIRF-7: hard wall-clock cap on a single agent run, in seconds. On expiry
+    /// the agent process is killed and the iteration fails (release without
+    /// advancing + deadend note). This may safely EXCEED `lease_ttl_secs`: the
+    /// heartbeat renews both leases every `heartbeat_interval_secs`
+    /// (= `lease_ttl_secs / 3`) while the agent runs, so the lease never lapses
+    /// mid-run however long the cap is. The invariant that actually matters is
+    /// `heartbeat_interval_secs < lease_ttl_secs`, not `timeout < lease_ttl`.
+    #[serde(default = "default_agent_timeout_secs")]
+    pub agent_timeout_secs: u64,
+    /// SIRF-7: the amt/hayven lease TTL, in seconds. The heartbeat that renews
+    /// both leases fires every `lease_ttl_secs / 3` while the agent runs, so a
+    /// lease can never lapse mid-run (amt's lease is 900s by contract).
+    #[serde(default = "default_lease_ttl_secs")]
+    pub lease_ttl_secs: u64,
 }
 
 fn default_true() -> bool {
@@ -131,6 +147,16 @@ fn default_retry_budget() -> u32 {
 fn default_worker_concurrency() -> u32 {
     3
 }
+fn default_agent_timeout_secs() -> u64 {
+    // 30 min: generous for a real agent run. It intentionally exceeds the 900s
+    // lease — the heartbeat (not this cap) keeps the lease alive by renewing it
+    // every lease_ttl/3; this cap only bounds a hung/runaway agent. (SIRF-7)
+    1800
+}
+fn default_lease_ttl_secs() -> u64 {
+    // amt's claim lease is 900s by contract (see amt.rs claim/heartbeat).
+    900
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -138,14 +164,23 @@ impl Default for Config {
             claim_order_enforced: true,
             backoff_409: Backoff409::default(),
             oracle_202: Oracle202::default(),
-            force_budget_tokens: 0,
             gate_tier: default_gate_tier(),
             target_status: default_target_status(),
             retry_budget: default_retry_budget(),
             worker_concurrency: default_worker_concurrency(),
             claim_mode: ClaimMode::default(),
             gate: GateConfig::default(),
+            agent_timeout_secs: default_agent_timeout_secs(),
+            lease_ttl_secs: default_lease_ttl_secs(),
         }
+    }
+}
+
+impl Config {
+    /// SIRF-7: the interval at which the loop renews both leases while the agent
+    /// runs — `lease_ttl_secs / 3`, floored at 1s so it is never zero.
+    pub fn heartbeat_interval_secs(&self) -> u64 {
+        (self.lease_ttl_secs / 3).max(1)
     }
 }
 
@@ -189,7 +224,6 @@ mod tests {
         assert_eq!(c.backoff_409.base_ms, 500);
         assert_eq!(c.backoff_409.max_ms, 8000);
         assert_eq!(c.oracle_202, Oracle202::BackOff);
-        assert_eq!(c.force_budget_tokens, 0);
         assert_eq!(c.gate_tier, "safe");
         assert_eq!(c.target_status, "in_review");
         assert_eq!(c.retry_budget, 3);
@@ -198,6 +232,10 @@ mod tests {
         // Gate: no test command by default (fail-closed), full-suite fallback.
         assert_eq!(c.gate.test_cmd, None);
         assert_eq!(c.gate.fallback, GateFallback::FullSuite);
+        // SIRF-7: agent timeout well below the lease, heartbeat at lease/3.
+        assert_eq!(c.agent_timeout_secs, 1800);
+        assert_eq!(c.lease_ttl_secs, 900);
+        assert_eq!(c.heartbeat_interval_secs(), 300);
     }
 
     #[test]

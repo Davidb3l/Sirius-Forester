@@ -131,7 +131,6 @@ other stdout formats.
   "claim_order_enforced": true,
   "backoff_409": {"strategy": "release_and_comment", "base_ms": 500, "max_ms": 8000},
   "oracle_202": "back-off",                // "back-off" | "force-with-budget"
-  "force_budget_tokens": 0,
   "gate_tier": "safe",
   "target_status": "in_review",
   "retry_budget": 3,
