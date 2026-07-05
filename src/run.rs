@@ -448,14 +448,26 @@ pub fn run_iteration(
     }
 
     // 8. RELEASE: entities first (reverse), then close out the issue.
+    //    A failed gate must NOT advance the issue — holding a failing change back
+    //    is the gate's whole purpose (gate.rs contract: "fail files a comment and
+    //    leaves status untouched"). Only a passing gate — or a skipped gate over a
+    //    successful agent run — releases to `target_status`. Otherwise the issue
+    //    returns to `todo`: re-claimable, but un-promoted (matching the entity-
+    //    overlap release path above). (SIRF-6)
     release_entities(hv, &claim_ids);
-    let _ = amt.release(&issue, worker, Some(&config.target_status), None);
+    let advanced = gate_result == "pass" || (gate_result == "skipped" && work_ok);
+    let (release_status, release_comment): (&str, Option<&str>) = if advanced {
+        (config.target_status.as_str(), None)
+    } else {
+        ("todo", Some("sirius: released without advancing — gate did not pass"))
+    };
+    let _ = amt.release(&issue, worker, Some(release_status), release_comment);
     emit_event(
         out,
         worker,
         Some(&issue),
         "release",
-        json!({"status": config.target_status}),
+        json!({"status": release_status, "advanced": advanced}),
     );
 
     let outcome = if gate_result == "fail" {
@@ -741,5 +753,94 @@ mod tests {
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("\"phase\":\"receipt\""));
         assert!(s.contains("\"phase\":\"release\""));
+    }
+
+    #[test]
+    fn failed_gate_does_not_advance_the_issue() {
+        // Same happy path up to the gate, but `hayven affected-tests` exits
+        // non-zero → gate fails. The issue must be released back to `todo`, NOT
+        // promoted to `target_status`, and no receipt may be filed. (SIRF-6)
+        let m = MockRunner::new();
+        m.expect(
+            &["amt", "--json", "claim"],
+            0,
+            r#"{"id":"AMT-9","title":"Regress"}"#,
+        );
+        m.expect(&["hayven", "query"], 0, r#"{"hits":[{"id":"e1"}]}"#);
+        m.expect(&["hayven", "claim"], 0, r#"{"id":"c1"}"#);
+        m.expect(&["hayven", "context"], 0, r#"{"pack":true}"#);
+        m.expect(&["hayven", "recall"], 0, r#"{"notes":[]}"#);
+        m.expect(
+            &["amt", "--json", "claim", "--issue"],
+            0,
+            r#"{"id":"AMT-9"}"#,
+        );
+        m.expect(&["sh", "-c"], 0, "");
+        // Gate: selector exits non-zero → a selected test failed.
+        m.push(MockResponse::new(
+            &["hayven", "affected-tests"],
+            1,
+            "",
+            "test regression",
+        ));
+        m.expect(&["hayven", "release"], 0, "ok");
+        m.expect(&["amt", "--json", "release"], 0, r#"{"id":"AMT-9"}"#);
+
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &cfg(),
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
+        );
+        // A failed gate ends the iteration as a deadend, not a completion.
+        assert_eq!(o, IterationOutcome::Deadend);
+
+        // The issue was released to `todo`, never advanced to `in_review`, and
+        // no status-update advance was issued.
+        let calls = m.recorded();
+        let release = calls
+            .iter()
+            .find(|c| c.contains("amt --json release AMT-9"))
+            .expect("issue was released");
+        assert!(
+            release.contains("--status todo"),
+            "gate-failed issue must return to todo, got: {release}"
+        );
+        assert!(
+            !release.contains("in_review"),
+            "gate-failed issue must not be promoted, got: {release}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("issue update")),
+            "no status advance may be issued on a failed gate"
+        );
+        // No receipt (decide/link) was filed for a failing iteration.
+        assert!(!calls.iter().any(|c| c.contains("amt --json decide")));
+
+        // Ledger records the honest outcome: gate_failed, no receipt.
+        let (outcome, gate, rcpt): (String, String, Option<i64>) = led
+            .conn
+            .query_row(
+                "SELECT outcome, gate_result, receipt_id FROM iterations",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(outcome, "gate_failed");
+        assert_eq!(gate, "fail");
+        assert!(rcpt.is_none());
+
+        // The release NDJSON reflects the un-advanced status.
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("\"advanced\":false"));
     }
 }
