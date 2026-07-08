@@ -1,0 +1,23 @@
+{
+  "name": "sirius",
+  "version": "0.1.0",
+  "description": "The fleet foreman for AI coding agents. Ships the Sirius worker Skill so Claude Code runs the claim → map → lock → brief → work → gate → receipt → release loop against your local Ametrite board and Hayvenhurst code graph, plus an installer for the `sirius` CLI binary.",
+  "author": {
+    "name": "Sirius Forester",
+    "email": "info@anchorsanvils.com",
+    "url": "https://github.com/Davidb3l/Sirius-Forester"
+  },
+  "homepage": "https://github.com/Davidb3l/Sirius-Forester",
+  "repository": "https://github.com/Davidb3l/Sirius-Forester",
+  "license": "MIT",
+  "keywords": [
+    "orchestrator",
+    "fleet",
+    "foreman",
+    "agent",
+    "skill",
+    "ametrite",
+    "hayvenhurst",
+    "sirius-forester"
+  ]
+}

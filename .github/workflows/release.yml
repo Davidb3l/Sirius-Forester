@@ -1,0 +1,163 @@
+name: Release
+
+# Tag-triggered: build the `sirius` binary (cargo) for all 5 supported
+# platforms, bundle into per-platform tarballs, sign with Sigstore, and publish
+# a GitHub Release. Mirrors the Hayvenhurst release pipeline so the plugin's
+# install-sirius.sh can map OS/arch -> tarball asset name.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.1.0). Must already exist.'
+        required: true
+
+permissions:
+  contents: write       # create the GitHub Release
+  id-token: write       # required for Sigstore keyless signing
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64-glibc
+            runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            use_cross: false
+            sirius_bin: sirius
+          - platform: linux-arm64
+            runner: ubuntu-latest
+            rust_target: aarch64-unknown-linux-gnu
+            use_cross: true
+            sirius_bin: sirius
+          - platform: macos-x64
+            runner: macos-14
+            rust_target: x86_64-apple-darwin
+            use_cross: false
+            sirius_bin: sirius
+          - platform: macos-arm64
+            runner: macos-14
+            rust_target: aarch64-apple-darwin
+            use_cross: false
+            sirius_bin: sirius
+          - platform: windows-x64
+            runner: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            use_cross: false
+            sirius_bin: sirius.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # If workflow_dispatch, check out the requested tag; otherwise the
+          # tag that triggered the workflow is already the ref.
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve version (strip leading "v")
+        id: version
+        shell: bash
+        run: |
+          ref="${{ inputs.tag || github.ref_name }}"
+          version="${ref#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing version: $version"
+
+      - name: Setup Rust toolchain (${{ matrix.rust_target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Install cross (Linux ARM64 only)
+        if: matrix.use_cross
+        run: cargo install cross --locked
+
+      - name: Build sirius (cargo)
+        if: matrix.use_cross == false
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.rust_target }}
+
+      - name: Build sirius (cross)
+        if: matrix.use_cross == true
+        shell: bash
+        run: cross build --release --locked --target ${{ matrix.rust_target }}
+
+      # ---- Bundle the tarball ----
+      - name: Create release tarball
+        id: bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          stage="sirius-forester-${version}-${{ matrix.platform }}"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.rust_target }}/release/${{ matrix.sirius_bin }}" "$stage/"
+          cp LICENSE "$stage/"
+          cp README.md "$stage/"
+          tarball="${stage}.tar.gz"
+          tar -czf "$tarball" "$stage"
+          # Portable SHA-256: macOS/Linux ship `shasum`; the Windows Git-Bash
+          # runner does NOT (it ships coreutils `sha256sum`). Prefer whichever
+          # exists so all five platforms produce a checksum.
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "$tarball" > "${tarball}.sha256"
+          else
+            sha256sum "$tarball" > "${tarball}.sha256"
+          fi
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          echo "checksum=${tarball}.sha256" >> "$GITHUB_OUTPUT"
+
+      # ---- Sign with Sigstore (keyless OIDC) ----
+      - name: Sign tarball with Sigstore
+        uses: sigstore/gh-action-sigstore-python@v3.0.0
+        with:
+          inputs: ${{ steps.bundle.outputs.tarball }}
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          # NB: sigstore-python v3 emits `<input>.sigstore.json` bundles (not
+          # the v2-era .sig/.crt/.sigstore trio) — list the right name or the
+          # release silently ships unsigned.
+          path: |
+            ${{ steps.bundle.outputs.tarball }}
+            ${{ steps.bundle.outputs.tarball }}.sigstore.json
+            ${{ steps.bundle.outputs.checksum }}
+          if-no-files-found: ignore
+          retention-days: 30
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: ${{ inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: release-artifacts/*
+          draft: false
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
