@@ -6,6 +6,12 @@
       "runtimeExecutable": "bun",
       "runtimeArgs": ["run", "web/src/server.ts"],
       "port": 1777
+    },
+    {
+      "name": "hub",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["run", "web/src/hub.ts"],
+      "port": 6969
     }
   ]
 }

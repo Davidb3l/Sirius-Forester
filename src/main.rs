@@ -151,15 +151,43 @@ fn cmd_init(ws: &Workspace, json: bool) -> u8 {
 
 // ---- doctor ------------------------------------------------------------
 
+/// The Console's URL, honoring its port override (SUITE_CONTRACTS §3.2: a tool
+/// reports the address its UI is *currently* served on, so a moved port is
+/// reported correctly).
+///
+/// Only the namespaced `SIRIUS_CONSOLE_PORT` is read. Deliberately NOT the bare
+/// `PORT`: doctor is usually spawned as a child (a suite hub probing peers), and
+/// a parent that exports `PORT` for its own listener would otherwise make us
+/// advertise the parent's port as our UI. §3.2 says a tool honors *its own*
+/// override, not whatever generic variable happens to be in the environment.
+fn console_ui_url() -> String {
+    let port = std::env::var("SIRIUS_CONSOLE_PORT")
+        .ok()
+        .and_then(|p| p.trim().parse::<u16>().ok())
+        .filter(|p| *p != 0)
+        .unwrap_or(1777);
+    format!("http://localhost:{port}")
+}
+
 fn cmd_doctor(ws: &Workspace, runner: &RealRunner, json: bool) -> u8 {
     let report = doctor::run(ws, runner);
     if json {
+        // SUITE_CONTRACTS §3 envelope. `pass` is kept for existing consumers;
+        // `ok` is the spec's name for the same bit (additive, not a rename).
         let checks: Vec<Value> = report
             .checks
             .iter()
-            .map(|c| json!({"name": c.name, "pass": c.pass, "detail": c.detail}))
+            .map(|c| json!({"name": c.name, "ok": c.pass, "pass": c.pass, "detail": c.detail}))
             .collect();
-        print_json(&json!({"ok": report.ok, "checks": checks}));
+        print_json(&json!({
+            "tool": "sirius",
+            "version": env!("CARGO_PKG_VERSION"),
+            "schemaVersion": 1,
+            "ok": report.ok,
+            "capabilities": ["ui"],
+            "ui": console_ui_url(),
+            "checks": checks,
+        }));
     } else {
         for c in &report.checks {
             println!(

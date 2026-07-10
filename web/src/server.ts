@@ -247,7 +247,15 @@ async function serveStatic(path: string, publicDir: string): Promise<Response> {
 
 // ---- boot -------------------------------------------------------------------
 
-export function startServer(port = Number(process.env.PORT ?? 1777)) {
+// SIRIUS_CONSOLE_PORT is the ONLY port override, and it is the same variable
+// `sirius doctor` reads to report its SUITE_CONTRACTS §3.2 `ui` URL. The bare
+// `PORT` is deliberately not honored on either side: doctor is usually spawned
+// as a child (a suite hub probing its peers), and a parent exporting `PORT` for
+// its own listener would otherwise make the two disagree about where the
+// Console lives.
+export function startServer(
+  port = Number(process.env.SIRIUS_CONSOLE_PORT ?? 1777),
+) {
   const deps = buildDeps();
   const server = Bun.serve({
     port,

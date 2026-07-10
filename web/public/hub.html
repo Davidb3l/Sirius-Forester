@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Suite Hub</title>
+<link rel="stylesheet" href="/hub.css">
+</head>
+<body>
+  <nav class="rail" aria-label="Suite tools">
+    <div class="brand">
+      <span class="glyph" aria-hidden="true">✦</span>
+      <span>Suite Hub</span>
+      <span class="port">:6969</span>
+    </div>
+    <ul class="tools" id="tools"></ul>
+    <footer>
+      <span class="live" id="live" aria-hidden="true"></span>
+      <span id="scanned">scanning…</span>
+    </footer>
+  </nav>
+
+  <main class="stage" id="stage" aria-live="polite">
+    <div class="card">
+      <p class="eyebrow">Suite Hub</p>
+      <h1>Looking for your tools…</h1>
+      <p>Probing <code>amt</code>, <code>hayven</code>, <code>sirius</code>, and
+      <code>catryna</code> for a <code>doctor --json</code> handshake.</p>
+    </div>
+  </main>
+
+  <script src="/hub.js"></script>
+</body>
+</html>
