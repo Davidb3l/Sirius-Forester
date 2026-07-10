@@ -1,10 +1,11 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { seed } from "../fixtures/seed.ts";
 import { buildDeps, handle, type ServerDeps } from "../src/server.ts";
 import type { Workspace } from "../src/db.ts";
+import { rmTempDir } from "./helpers.ts";
 
 let dir: string;
 let deps: ServerDeps;
@@ -26,9 +27,7 @@ beforeAll(() => {
 afterAll(() => {
   deps.ledger.close();
   deps.stores.close();
-  // Windows keeps the sqlite file locked briefly after close(); the unlink
-  // races it and throws EBUSY. Retry instead of failing the suite on cleanup.
-  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  rmTempDir(dir);
 });
 
 // Loopback base URL so the mutation guard (Host must be loopback) is exercised
