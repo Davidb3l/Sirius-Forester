@@ -18,3 +18,4 @@ bench/fixtures/*.db-*
 /TODO.md
 /SUITE_CONTRACTS.md
 /CONSOLE_V2.md
+/TICKET_TO_RECEIPT.md
