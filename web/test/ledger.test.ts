@@ -16,7 +16,9 @@ beforeAll(() => {
 });
 afterAll(() => {
   ledger.close();
-  rmSync(dir, { recursive: true, force: true });
+  // Windows keeps the sqlite file locked briefly after close(); the unlink
+  // races it and throws EBUSY. Retry instead of failing the suite on cleanup.
+  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
 test("ledger opens read-only and reports available", () => {
