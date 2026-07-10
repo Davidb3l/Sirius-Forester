@@ -5,15 +5,17 @@ name: Release
 # a GitHub Release. Mirrors the Hayvenhurst release pipeline so the plugin's
 # install-sirius.sh can map OS/arch -> tarball asset name.
 
+# NB: a manual run must be dispatched WITH THE TAG SELECTED as the ref (the
+# "Use workflow from" picker). Sigstore's keyless certificate records the ref
+# the workflow ran on, and install-sirius.sh pins the expected signer identity
+# to `release.yml@refs/tags/<TAG>`. A dispatch from `main` (or a `tag` input
+# that disagrees with the ref) would publish a genuine release whose signature
+# every installer then rejects — so the tag is read from the ref, never an input.
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Tag to release (e.g. v0.1.0). Must already exist.'
-        required: true
 
 permissions:
   contents: write       # create the GitHub Release
@@ -57,15 +59,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # If workflow_dispatch, check out the requested tag; otherwise the
-          # tag that triggered the workflow is already the ref.
-          ref: ${{ inputs.tag || github.ref }}
+          # Always the ref the run was triggered on — a tag push, or a dispatch
+          # explicitly launched from the tag (see the note at the top).
+          ref: ${{ github.ref }}
 
       - name: Resolve version (strip leading "v")
         id: version
         shell: bash
         run: |
-          ref="${{ inputs.tag || github.ref_name }}"
+          ref="${{ github.ref_name }}"
           version="${ref#v}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Releasing version: $version"
@@ -146,7 +148,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ github.ref }}
           fetch-depth: 0
 
       - name: Download all release artifacts
@@ -159,9 +161,9 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
-          name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
           generate_release_notes: true
           files: release-artifacts/*
           draft: false
-          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
+          prerelease: ${{ contains(github.ref_name, '-') }}

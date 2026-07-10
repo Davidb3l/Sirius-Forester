@@ -248,11 +248,23 @@ verify_signature() {
 
   if have cosign; then
     log "install-sirius: verifying signature (cosign)"
-    cosign verify-blob \
+    # Keep the verifier's own diagnostics: on a real identity mismatch cosign
+    # prints "expected X, got Y", and an OLD cosign (< 3.x) instead fails to
+    # parse sigstore-python v3's `.sigstore.json` bundle at all. Swallowing
+    # both makes a stale toolchain look identical to a tampered artifact.
+    if ! verify_out="$(cosign verify-blob \
       --bundle "$bundle" \
       --certificate-identity "$identity" \
       --certificate-oidc-issuer "$issuer" \
-      "$artifact" >/dev/null 2>&1 || fail "$sig_fail"
+      "$artifact" 2>&1)"; then
+      fail "$sig_fail
+
+        verifier output:
+$verify_out
+
+        If your cosign predates v3.0, it cannot read this bundle format —
+        upgrade cosign (or install the \`sigstore\` python tool) and retry."
+    fi
     log "install-sirius: signature OK (cosign)"
     return 0
   fi
@@ -267,11 +279,16 @@ verify_signature() {
   if [ -n "$sig_cmd" ]; then
     log "install-sirius: verifying signature (sigstore)"
     # shellcheck disable=SC2086
-    $sig_cmd verify identity \
+    if ! verify_out="$($sig_cmd verify identity \
       --bundle "$bundle" \
       --cert-identity "$identity" \
       --cert-oidc-issuer "$issuer" \
-      "$artifact" >/dev/null 2>&1 || fail "$sig_fail"
+      "$artifact" 2>&1)"; then
+      fail "$sig_fail
+
+        verifier output:
+$verify_out"
+    fi
     log "install-sirius: signature OK (sigstore)"
     return 0
   fi

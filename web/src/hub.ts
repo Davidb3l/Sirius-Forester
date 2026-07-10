@@ -219,7 +219,16 @@ export async function handle(
   return new Response("not found", { status: 404 });
 }
 
-export function startHub(port: number = Number(process.env.HUB_PORT ?? HUB_PORT)) {
+/** Parse `HUB_PORT`, falling back to the default on anything unusable — a bare
+ *  `Number("nonsense")` is NaN, which Bun.serve silently turns into a random
+ *  port and the self-port guard then can never match. */
+function resolveHubPort(raw: string | undefined): number {
+  if (raw === undefined) return HUB_PORT;
+  const n = Number(raw.trim());
+  return Number.isInteger(n) && n >= 0 && n <= 65535 ? n : HUB_PORT;
+}
+
+export function startHub(port: number = resolveHubPort(process.env.HUB_PORT)) {
   const getRoster = createRosterCache(spawnProber, fetch, RESCAN_MS, port);
   const server = Bun.serve({
     port,

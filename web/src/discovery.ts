@@ -131,9 +131,15 @@ function normalizeChecks(raw: unknown): DoctorCheck[] {
  * Turn a raw probe into a roster entry, per §3.1's table. Pure: no I/O, so the
  * classification rules are directly testable.
  */
-export function classify(id: ToolId, r: ProbeResult): ToolStatus {
+export function classify(
+  id: ToolId,
+  r: ProbeResult,
+  /** The budget this probe actually ran under — reported verbatim, so a caller
+   *  passing a custom `timeoutMs` isn't told the default in the absent reason. */
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+): ToolStatus {
   if (!r.found) return absent(id, "not installed");
-  if (r.timedOut) return absent(id, `doctor timed out after ${DEFAULT_TIMEOUT_MS}ms`);
+  if (r.timedOut) return absent(id, `doctor timed out after ${timeoutMs}ms`);
   if (r.code !== 0) return absent(id, `doctor exited ${r.code}`);
 
   let env: unknown;
@@ -267,7 +273,7 @@ export async function buildRoster(
   return Promise.all(
     TOOL_IDS.map(async (id) => {
       try {
-        return classify(id, await prober(id, timeoutMs));
+        return classify(id, await prober(id, timeoutMs), timeoutMs);
       } catch (e) {
         return absent(id, `probe failed: ${e instanceof Error ? e.message : String(e)}`);
       }

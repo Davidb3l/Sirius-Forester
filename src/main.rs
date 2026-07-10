@@ -206,7 +206,22 @@ fn cmd_doctor(ws: &Workspace, runner: &RealRunner, json: bool) -> u8 {
             }
         );
     }
-    if report.ok {
+    doctor_exit_code(json, report.ok)
+}
+
+/// Exit code for `doctor`, per SUITE_CONTRACTS §3/§3.1.
+///
+/// `--json` is the discovery handshake: a peer that exits non-zero is ABSENT
+/// ("nothing trustworthy was said"), while exit 0 + a valid envelope carrying
+/// `ok: false` is PRESENT-BUT-UNHEALTHY. Exiting 1 on a failing check would
+/// make an installed-but-degraded sirius indistinguishable from an uninstalled
+/// one, and the Suite Hub's amber row unreachable. Health lives in the `ok`
+/// field; non-zero here is reserved for "no envelope could be produced at all".
+///
+/// Human mode keeps `ok ? 0 : 1` so `sirius doctor` remains a usable CI/shell
+/// gate for contract drift (§4's operational exit codes).
+fn doctor_exit_code(json: bool, ok: bool) -> u8 {
+    if json || ok {
         0
     } else {
         1
@@ -558,5 +573,24 @@ mod tests {
         assert!(regex_is_issue("AMT-7"));
         assert!(!regex_is_issue("some::symbol"));
         assert!(!regex_is_issue("AMT-7-extra"));
+    }
+
+    /// SUITE_CONTRACTS §3.1: under `--json`, an unhealthy-but-speaking tool
+    /// MUST still exit 0 (present-but-unhealthy), or consumers classify it as
+    /// absent and its failing checks are never shown. Human mode stays a gate.
+    #[test]
+    fn doctor_json_reports_health_in_the_envelope_not_the_exit_code() {
+        assert_eq!(doctor_exit_code(true, true), 0);
+        assert_eq!(
+            doctor_exit_code(true, false),
+            0,
+            "§3.1 present-but-unhealthy"
+        );
+        assert_eq!(doctor_exit_code(false, true), 0);
+        assert_eq!(
+            doctor_exit_code(false, false),
+            1,
+            "human mode gates on drift"
+        );
     }
 }
