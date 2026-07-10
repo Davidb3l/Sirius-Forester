@@ -187,9 +187,7 @@ pub fn lock_entities(
                         match hv.claim(std::slice::from_ref(ent), &intent, true) {
                             // SIRF-8: same missing-id guard as the clean path — a
                             // forced claim with no id is unmanageable, so unwind.
-                            ClaimVerdict::Registered {
-                                claim_id: Some(id),
-                            } => {
+                            ClaimVerdict::Registered { claim_id: Some(id) } => {
                                 acquired.push(id);
                                 verdicts.push("forced");
                             }
@@ -202,7 +200,9 @@ pub fn lock_entities(
                                     )
                                     .ok();
                                 return LockResult::Overlap {
-                                    blocker: format!("{ent}: forced claim registered without a claim id"),
+                                    blocker: format!(
+                                        "{ent}: forced claim registered without a claim id"
+                                    ),
                                     acquired,
                                 };
                             }
@@ -252,9 +252,7 @@ fn release_entity_checked(hv: &Hayven, ledger: &Ledger, issue: &str, claim_id: &
                 }
                 // Final failure: shout to stderr AND record a ledger event so a
                 // leaked lock is never silent.
-                eprintln!(
-                    "sirius: FAILED to release hayven claim {claim_id} for {issue}: {e}"
-                );
+                eprintln!("sirius: FAILED to release hayven claim {claim_id} for {issue}: {e}");
                 ledger
                     .log_policy_event(
                         None,
@@ -638,7 +636,12 @@ pub fn run_iteration(
             // The agent changed nothing → there is nothing to gate.
             None
         } else {
-            Some(crate::gate::evaluate(hv, runner, &config.gate, &changed_files))
+            Some(crate::gate::evaluate(
+                hv,
+                runner,
+                &config.gate,
+                &changed_files,
+            ))
         };
         gate_result = match &verdict {
             Some(v) if v.passed => {
@@ -732,9 +735,19 @@ pub fn run_iteration(
     let (release_status, release_comment): (&str, Option<&str>) = if advanced {
         (config.target_status.as_str(), None)
     } else {
-        ("todo", Some("sirius: released without advancing — gate did not pass"))
+        (
+            "todo",
+            Some("sirius: released without advancing — gate did not pass"),
+        )
     };
-    release_issue_checked(amt, ledger, &issue, worker, Some(release_status), release_comment);
+    release_issue_checked(
+        amt,
+        ledger,
+        &issue,
+        worker,
+        Some(release_status),
+        release_comment,
+    );
     emit_event(
         out,
         worker,
@@ -789,7 +802,13 @@ fn agent_log_path(issue: &str) -> Option<std::path::PathBuf> {
     // Sanitize the issue ref for a filename (AMT-7 → AMT-7 is fine; guard slashes).
     let safe: String = issue
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     Some(std::path::PathBuf::from(".sirius/logs").join(format!("{safe}-{ts}.log")))
 }
@@ -827,7 +846,10 @@ mod tests {
         let led = Ledger::open_in_memory().unwrap();
         let r = lock_entities(&hv, &led, &cfg(), "AMT-7", "t", &["e1".into(), "e2".into()]);
         match r {
-            LockResult::Locked { claim_ids, verdicts } => {
+            LockResult::Locked {
+                claim_ids,
+                verdicts,
+            } => {
                 assert_eq!(claim_ids, vec!["c1", "c2"]);
                 // Both claimed clean → both "registered" (SIRF-9).
                 assert_eq!(verdicts, vec!["registered", "registered"]);
@@ -910,7 +932,10 @@ mod tests {
         };
         let r = lock_entities(&hv, &led, &c, "AMT-7", "t", &["e1".into()]);
         match r {
-            LockResult::Locked { claim_ids, verdicts } => {
+            LockResult::Locked {
+                claim_ids,
+                verdicts,
+            } => {
                 assert_eq!(claim_ids, vec!["forced"]);
                 // The entity was oracle-conflicted then FORCED → "forced" (SIRF-9).
                 assert_eq!(verdicts, vec!["forced"]);
@@ -1190,7 +1215,11 @@ mod tests {
         m.expect(&["hayven", "context"], 0, r#"{"pack":true}"#);
         m.expect(&["hayven", "recall"], 0, r#"{"notes":[]}"#);
         // pre-spawn heartbeat + the periodic beats fired by the sim.
-        m.expect(&["amt", "--json", "claim", "--issue"], 0, r#"{"id":"AMT-11"}"#);
+        m.expect(
+            &["amt", "--json", "claim", "--issue"],
+            0,
+            r#"{"id":"AMT-11"}"#,
+        );
         // work: the agent command itself (recorded), then the sim times it out.
         m.expect(&["sh", "-c"], 0, "");
         // release entity + issue (back to todo), then the deadend note.
@@ -1205,7 +1234,15 @@ mod tests {
         let led = Ledger::open_in_memory().unwrap();
         let mut out = Vec::new();
         let o = run_iteration(
-            &amt, &hv, &led, &cfg(), &m, "sirius/oak", Some("todo"), "sleep 999", &mut out,
+            &amt,
+            &hv,
+            &led,
+            &cfg(),
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "sleep 999",
+            &mut out,
         );
         assert_eq!(o, IterationOutcome::Deadend);
 
@@ -1218,9 +1255,14 @@ mod tests {
         assert!(release.contains("--status todo"));
         assert!(!calls.iter().any(|c| c.contains("issue update")));
         assert!(!calls.iter().any(|c| c.contains("amt --json decide")));
-        assert!(!calls.iter().any(|c| c.contains("git diff")), "no gate on timeout");
+        assert!(
+            !calls.iter().any(|c| c.contains("git diff")),
+            "no gate on timeout"
+        );
         // A deadend note was filed naming the timeout.
-        assert!(calls.iter().any(|c| c.contains("hayven remember") && c.contains("timed out")));
+        assert!(calls
+            .iter()
+            .any(|c| c.contains("hayven remember") && c.contains("timed out")));
 
         // Ledger honesty: outcome agent_timeout, no gate, no receipt.
         let (outcome, gate, rcpt): (String, Option<String>, Option<i64>) = led
@@ -1247,12 +1289,20 @@ mod tests {
         // amt issue (re-claim by --issue) and the held Hayvenhurst entity
         // (re-claim = refresh). Arm three beats and count the renewals.
         let m = MockRunner::new();
-        m.expect(&["amt", "--json", "claim"], 0, r#"{"id":"AMT-12","title":"Long"}"#);
+        m.expect(
+            &["amt", "--json", "claim"],
+            0,
+            r#"{"id":"AMT-12","title":"Long"}"#,
+        );
         m.expect(&["hayven", "query"], 0, r#"{"hits":[{"id":"e1"}]}"#);
         m.expect(&["hayven", "claim"], 0, r#"{"id":"c1"}"#);
         m.expect(&["hayven", "context"], 0, r#"{"pack":true}"#);
         m.expect(&["hayven", "recall"], 0, r#"{"notes":[]}"#);
-        m.expect(&["amt", "--json", "claim", "--issue"], 0, r#"{"id":"AMT-12"}"#);
+        m.expect(
+            &["amt", "--json", "claim", "--issue"],
+            0,
+            r#"{"id":"AMT-12"}"#,
+        );
         m.expect(&["sh", "-c"], 0, "");
         m.expect(&["git", "diff"], 0, ""); // no changes → gate skipped
         m.expect(&["amt", "--json", "release"], 0, r#"{"id":"AMT-12"}"#);
@@ -1264,7 +1314,15 @@ mod tests {
         let led = Ledger::open_in_memory().unwrap();
         let mut out = Vec::new();
         let _ = run_iteration(
-            &amt, &hv, &led, &cfg(), &m, "sirius/oak", Some("todo"), "long-cmd", &mut out,
+            &amt,
+            &hv,
+            &led,
+            &cfg(),
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "long-cmd",
+            &mut out,
         );
 
         let calls = m.recorded();
@@ -1290,7 +1348,12 @@ mod tests {
         // second call, which falls through to the mock's benign success) lands.
         // No `release_failure` event is logged because the lease was freed.
         let m = MockRunner::new();
-        m.push(MockResponse::new(&["hayven", "release"], 1, "", "daemon busy"));
+        m.push(MockResponse::new(
+            &["hayven", "release"],
+            1,
+            "",
+            "daemon busy",
+        ));
         let hv = Hayven::new(&m);
         let led = Ledger::open_in_memory().unwrap();
         release_entities(&hv, &led, "AMT-7", &["c1".into()]);
@@ -1310,7 +1373,12 @@ mod tests {
         // recorded (the leaked lock is no longer silent) after RELEASE_ATTEMPTS.
         let m = MockRunner::new();
         for _ in 0..RELEASE_ATTEMPTS {
-            m.push(MockResponse::new(&["hayven", "release"], 1, "", "still down"));
+            m.push(MockResponse::new(
+                &["hayven", "release"],
+                1,
+                "",
+                "still down",
+            ));
         }
         let hv = Hayven::new(&m);
         let led = Ledger::open_in_memory().unwrap();
@@ -1384,7 +1452,11 @@ mod tests {
     /// WORK/GATE/RELEASE calls for the caller to queue per scenario. The mock's
     /// longest-prefix matching + benign-default keeps incidental calls quiet.
     fn program_prefix(m: &MockRunner, issue: &str) {
-        m.expect(&["amt", "--json", "claim"], 0, &format!(r#"{{"id":"{issue}","title":"T"}}"#));
+        m.expect(
+            &["amt", "--json", "claim"],
+            0,
+            &format!(r#"{{"id":"{issue}","title":"T"}}"#),
+        );
         m.expect(&["hayven", "query"], 0, r#"{"hits":[{"id":"e1"}]}"#);
         m.expect(&["hayven", "claim"], 0, r#"{"id":"c1"}"#);
         m.expect(&["hayven", "context"], 0, r#"{"pack":true}"#);
@@ -1401,17 +1473,42 @@ mod tests {
         // Attempt 1: work ok, gate runs the suite and FAILS.
         m.expect(&["sh", "-c"], 0, ""); // agent
         m.expect(&["git", "diff"], 0, "src/run.rs\n");
-        m.expect(&["hayven", "affected-tests"], 0, r#"{"roots":["run"],"note":"doubt","tests":[]}"#);
-        m.push(MockResponse::new(&["sh", "-c"], 101, "test result: FAILED. 1 failed", ""));
+        m.expect(
+            &["hayven", "affected-tests"],
+            0,
+            r#"{"roots":["run"],"note":"doubt","tests":[]}"#,
+        );
+        m.push(MockResponse::new(
+            &["sh", "-c"],
+            101,
+            "test result: FAILED. 1 failed",
+            "",
+        ));
         // Attempt 2: work ok, gate runs the suite and PASSES.
         m.expect(&["sh", "-c"], 0, ""); // agent (2nd attempt)
         m.expect(&["git", "diff"], 0, "src/run.rs\n");
-        m.expect(&["hayven", "affected-tests"], 0, r#"{"roots":["run"],"note":"doubt","tests":[]}"#);
+        m.expect(
+            &["hayven", "affected-tests"],
+            0,
+            r#"{"roots":["run"],"note":"doubt","tests":[]}"#,
+        );
         m.expect(&["sh", "-c"], 0, "test result: ok");
         // advance + receipt + release
-        m.expect(&["amt", "--json", "issue", "update"], 0, r#"{"id":"AMT-20"}"#);
-        m.expect(&["amt", "--json", "decide"], 0, r#"{"id":"D-1","resolves":"AMT-20"}"#);
-        m.expect(&["amt", "--json", "decision", "show"], 0, r#"{"id":"D-1","resolves":"AMT-20"}"#);
+        m.expect(
+            &["amt", "--json", "issue", "update"],
+            0,
+            r#"{"id":"AMT-20"}"#,
+        );
+        m.expect(
+            &["amt", "--json", "decide"],
+            0,
+            r#"{"id":"D-1","resolves":"AMT-20"}"#,
+        );
+        m.expect(
+            &["amt", "--json", "decision", "show"],
+            0,
+            r#"{"id":"D-1","resolves":"AMT-20"}"#,
+        );
         m.expect(&["hayven", "remember"], 0, r#"{"id":"mem"}"#);
         m.expect(&["hayven", "release"], 0, "ok");
         m.expect(&["amt", "--json", "release"], 0, r#"{"id":"AMT-20"}"#);
@@ -1420,9 +1517,20 @@ mod tests {
         let hv = Hayven::new(&m);
         let led = Ledger::open_in_memory().unwrap();
         let mut out = Vec::new();
-        let c = Config { retry_budget: 2, ..cfg() };
+        let c = Config {
+            retry_budget: 2,
+            ..cfg()
+        };
         let o = run_iteration(
-            &amt, &hv, &led, &c, &m, "sirius/oak", Some("todo"), "true", &mut out,
+            &amt,
+            &hv,
+            &led,
+            &c,
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
         );
         assert_eq!(o, IterationOutcome::Completed);
 
@@ -1441,7 +1549,9 @@ mod tests {
         assert_eq!(outcome, "completed");
         assert_eq!(gate, "pass");
         // NDJSON marks a retry.
-        assert!(String::from_utf8(out).unwrap().contains("\"retrying\":true"));
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .contains("\"retrying\":true"));
     }
 
     #[test]
@@ -1455,13 +1565,31 @@ mod tests {
         // Attempt 1: fail.
         m.expect(&["sh", "-c"], 0, ""); // agent
         m.expect(&["git", "diff"], 0, "src/run.rs\n");
-        m.expect(&["hayven", "affected-tests"], 0, r#"{"roots":["run"],"note":"doubt","tests":[]}"#);
-        m.push(MockResponse::new(&["sh", "-c"], 101, "test result: FAILED. 1 failed", ""));
+        m.expect(
+            &["hayven", "affected-tests"],
+            0,
+            r#"{"roots":["run"],"note":"doubt","tests":[]}"#,
+        );
+        m.push(MockResponse::new(
+            &["sh", "-c"],
+            101,
+            "test result: FAILED. 1 failed",
+            "",
+        ));
         // Attempt 2: fail again.
         m.expect(&["sh", "-c"], 0, ""); // agent (2nd)
         m.expect(&["git", "diff"], 0, "src/run.rs\n");
-        m.expect(&["hayven", "affected-tests"], 0, r#"{"roots":["run"],"note":"doubt","tests":[]}"#);
-        m.push(MockResponse::new(&["sh", "-c"], 101, "test result: FAILED. 1 failed", ""));
+        m.expect(
+            &["hayven", "affected-tests"],
+            0,
+            r#"{"roots":["run"],"note":"doubt","tests":[]}"#,
+        );
+        m.push(MockResponse::new(
+            &["sh", "-c"],
+            101,
+            "test result: FAILED. 1 failed",
+            "",
+        ));
         m.expect(&["hayven", "release"], 0, "ok");
         m.expect(&["amt", "--json", "release"], 0, r#"{"id":"AMT-21"}"#);
         m.expect(&["hayven", "remember"], 0, r#"{"id":"mem"}"#);
@@ -1470,9 +1598,20 @@ mod tests {
         let hv = Hayven::new(&m);
         let led = Ledger::open_in_memory().unwrap();
         let mut out = Vec::new();
-        let c = Config { retry_budget: 2, ..cfg() };
+        let c = Config {
+            retry_budget: 2,
+            ..cfg()
+        };
         let o = run_iteration(
-            &amt, &hv, &led, &c, &m, "sirius/oak", Some("todo"), "true", &mut out,
+            &amt,
+            &hv,
+            &led,
+            &c,
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
         );
         assert_eq!(o, IterationOutcome::Deadend);
 
@@ -1518,13 +1657,28 @@ mod tests {
         let hv = Hayven::new(&m);
         let led = Ledger::open_in_memory().unwrap();
         let mut out = Vec::new();
-        let c = Config { retry_budget: 3, ..cfg() };
+        let c = Config {
+            retry_budget: 3,
+            ..cfg()
+        };
         let o = run_iteration(
-            &amt, &hv, &led, &c, &m, "sirius/oak", Some("todo"), "sleep 999", &mut out,
+            &amt,
+            &hv,
+            &led,
+            &c,
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "sleep 999",
+            &mut out,
         );
         assert_eq!(o, IterationOutcome::Deadend);
         // Exactly one agent run — the timeout did NOT loop back.
-        let agent_runs = m.recorded().iter().filter(|c| **c == "sh -c sleep 999").count();
+        let agent_runs = m
+            .recorded()
+            .iter()
+            .filter(|c| **c == "sh -c sleep 999")
+            .count();
         assert_eq!(agent_runs, 1, "a killed agent must not consume retries");
         assert_eq!(led.count_policy_events("retry_budget", 100).unwrap(), 0);
     }
@@ -1537,7 +1691,11 @@ mod tests {
         // iteration's oracle_verdicts must record "forced" for that entity, not
         // a fabricated "registered".
         let m = MockRunner::new();
-        m.expect(&["amt", "--json", "claim"], 0, r#"{"id":"AMT-23","title":"T"}"#);
+        m.expect(
+            &["amt", "--json", "claim"],
+            0,
+            r#"{"id":"AMT-23","title":"T"}"#,
+        );
         m.expect(&["hayven", "query"], 0, r#"{"hits":[{"id":"e1"}]}"#);
         // Lock: e1 → oracle conflict (exit 3), then forced (exit 0 with id).
         m.push(MockResponse::new(&["hayven", "claim"], 3, "", "adjacency"));
@@ -1547,8 +1705,16 @@ mod tests {
         // work ok, no changes → gate skipped → completes.
         m.expect(&["sh", "-c"], 0, "");
         m.expect(&["git", "diff"], 0, "");
-        m.expect(&["amt", "--json", "decide"], 0, r#"{"id":"D-1","resolves":"AMT-23"}"#);
-        m.expect(&["amt", "--json", "decision", "show"], 0, r#"{"id":"D-1","resolves":"AMT-23"}"#);
+        m.expect(
+            &["amt", "--json", "decide"],
+            0,
+            r#"{"id":"D-1","resolves":"AMT-23"}"#,
+        );
+        m.expect(
+            &["amt", "--json", "decision", "show"],
+            0,
+            r#"{"id":"D-1","resolves":"AMT-23"}"#,
+        );
         m.expect(&["hayven", "remember"], 0, r#"{"id":"mem"}"#);
         m.expect(&["hayven", "release"], 0, "ok");
         m.expect(&["amt", "--json", "release"], 0, r#"{"id":"AMT-23"}"#);
@@ -1557,9 +1723,20 @@ mod tests {
         let hv = Hayven::new(&m);
         let led = Ledger::open_in_memory().unwrap();
         let mut out = Vec::new();
-        let c = Config { oracle_202: Oracle202::ForceWithBudget, ..cfg() };
+        let c = Config {
+            oracle_202: Oracle202::ForceWithBudget,
+            ..cfg()
+        };
         let o = run_iteration(
-            &amt, &hv, &led, &c, &m, "sirius/oak", Some("todo"), "true", &mut out,
+            &amt,
+            &hv,
+            &led,
+            &c,
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
         );
         assert_eq!(o, IterationOutcome::Completed);
         // The stored oracle_verdicts JSON reflects the FORCE, not "registered".
@@ -1575,7 +1752,11 @@ mod tests {
         // SIRF-9: the OracleBackoff finish path BACKED OFF (did not force). The
         // ledger must record "backoff", not the old dishonest "forced".
         let m = MockRunner::new();
-        m.expect(&["amt", "--json", "claim"], 0, r#"{"id":"AMT-24","title":"T"}"#);
+        m.expect(
+            &["amt", "--json", "claim"],
+            0,
+            r#"{"id":"AMT-24","title":"T"}"#,
+        );
         m.expect(&["hayven", "query"], 0, r#"{"hits":[{"id":"e1"}]}"#);
         // Lock: e1 → oracle conflict (exit 3), policy is BackOff → back off.
         m.push(MockResponse::new(&["hayven", "claim"], 3, "", "adjacency"));
@@ -1585,9 +1766,20 @@ mod tests {
         let hv = Hayven::new(&m);
         let led = Ledger::open_in_memory().unwrap();
         let mut out = Vec::new();
-        let c = Config { oracle_202: Oracle202::BackOff, ..cfg() };
+        let c = Config {
+            oracle_202: Oracle202::BackOff,
+            ..cfg()
+        };
         let o = run_iteration(
-            &amt, &hv, &led, &c, &m, "sirius/oak", Some("todo"), "true", &mut out,
+            &amt,
+            &hv,
+            &led,
+            &c,
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
         );
         assert_eq!(o, IterationOutcome::ReleasedOverlap);
         let verdicts: String = led

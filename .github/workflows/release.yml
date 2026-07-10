@@ -131,7 +131,11 @@ jobs:
             ${{ steps.bundle.outputs.tarball }}
             ${{ steps.bundle.outputs.tarball }}.sigstore.json
             ${{ steps.bundle.outputs.checksum }}
-          if-no-files-found: ignore
+          # `error`, not `ignore`: install-sirius.sh hard-requires the .sha256
+          # asset, and a missing .sigstore.json means an unsigned release. Fail
+          # loudly here rather than publishing something the installer can't
+          # verify.
+          if-no-files-found: error
           retention-days: 30
 
   release:

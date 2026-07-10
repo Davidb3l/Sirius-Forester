@@ -219,7 +219,8 @@ fn append_exit_trailer(path: Option<&std::path::Path>, code: Option<i32>) {
         let _ = writeln!(
             f,
             "\n[sirius] agent exit: {}",
-            code.map(|c| c.to_string()).unwrap_or_else(|| "killed".into())
+            code.map(|c| c.to_string())
+                .unwrap_or_else(|| "killed".into())
         );
     }
 }
@@ -461,7 +462,9 @@ mod tests {
         };
         let mut beats = 0;
         let mut hb = || beats += 1;
-        let outcome = m.run_agent("sh", &["-c", "sleep 999"], &opts, &mut hb).unwrap();
+        let outcome = m
+            .run_agent("sh", &["-c", "sleep 999"], &opts, &mut hb)
+            .unwrap();
         assert_eq!(beats, 2);
         assert!(outcome.timed_out());
         assert!(!outcome.success());
@@ -537,10 +540,16 @@ mod tests {
         let outcome = r
             .run_agent("sh", &["-c", "yes sirius | head -c 200000"], &opts, &mut hb)
             .unwrap();
-        assert!(!outcome.timed_out(), "large output must not deadlock/timeout");
+        assert!(
+            !outcome.timed_out(),
+            "large output must not deadlock/timeout"
+        );
         assert!(outcome.success());
         let written = std::fs::read_to_string(&log).unwrap();
-        assert!(written.len() >= 200_000, "streamed log should hold the output");
+        assert!(
+            written.len() >= 200_000,
+            "streamed log should hold the output"
+        );
         let _ = std::fs::remove_file(&log);
     }
 }

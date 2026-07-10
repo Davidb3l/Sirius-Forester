@@ -134,9 +134,7 @@ pub fn run(ws: &Workspace, runner: &dyn Runner) -> DoctorReport {
         if serving {
             checks.push(Check::ok(
                 "hayven_daemon_7777",
-                format!(
-                    "hayven {hv_ver}, daemon healthy on :7777 (status: {status_line});{hv_ws}"
-                ),
+                format!("hayven {hv_ver}, daemon healthy on :7777 (status: {status_line});{hv_ws}"),
             ));
         } else {
             // SIRF-10: the daemon is single-project-bound — a 200 on :7777 means

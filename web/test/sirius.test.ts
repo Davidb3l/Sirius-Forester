@@ -4,43 +4,76 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Sirius, ValidationError } from "../src/sirius.ts";
 
-// A fake `sirius` binary: a shell script that emits CONTRACTS §2 shapes on
-// stdout, logs to stderr, and honours the §2 exit codes. Verifies the boundary
-// parses each shape and treats exit 3 as "blocked", not an error.
+// A fake `sirius` binary that emits CONTRACTS §2 shapes on stdout, logs to
+// stderr, and honours the §2 exit codes. Verifies the boundary parses each
+// shape and treats exit 3 as "blocked", not an error.
+//
+// The contract lives in ONE file (fake-sirius.mjs) that Bun runs. Windows
+// cannot spawn an extension-less shell script, so each platform gets a thin
+// launcher that `Bun.spawn` can execute directly: a `.cmd` on Windows, an
+// exec'ing shell script elsewhere.
 let dir: string;
 let bin: string;
 
-const SCRIPT = `#!/usr/bin/env bash
-# fake sirius honoring CONTRACTS.md §2
-echo "log line to stderr" >&2
-case "$1" in
-  --version) echo "sirius 0.1.0"; exit 0 ;;
-  gate)
-    issue="$2"
-    if [ "$issue" = "AMT-99" ]; then
-      echo '{"ok":false,"issue":"AMT-99","tier":"safe","gate":"fail","advanced_to":null,"tests_selected":12,"comment_filed":true}'
-      exit 3
-    fi
-    echo '{"ok":true,"issue":"'"$issue"'","tier":"safe","gate":"pass","advanced_to":"in_review","tests_selected":7,"comment_filed":false}'
-    exit 0 ;;
-  link)
-    echo '{"ok":true,"receipt_id":42,"kind":"issue","ref":"AMT-7","symbols":["a","b"],"forward_ok":true,"reverse_ok":true}'
-    exit 0 ;;
-  why)
-    echo '{"ref":"AMT-7","symbols":["a","b"],"decisions":["D-3"]}'
-    exit 0 ;;
-  doctor)
-    echo '{"ok":true,"checks":[{"name":"amt","pass":true,"detail":"0.1.0"}]}'
-    exit 0 ;;
-  *) echo "usage" >&2; exit 2 ;;
-esac
+const FAKE = String.raw`
+// fake sirius honoring CONTRACTS.md §2
+const args = process.argv.slice(2);
+process.stderr.write("log line to stderr\n");
+const emit = (obj, code) => {
+  process.stdout.write(JSON.stringify(obj) + "\n");
+  process.exit(code);
+};
+switch (args[0]) {
+  case "--version":
+    process.stdout.write("sirius 0.1.0\n");
+    process.exit(0);
+  case "gate": {
+    const issue = args[1];
+    if (issue === "AMT-99") {
+      emit({ ok: false, issue: "AMT-99", tier: "safe", gate: "fail", advanced_to: null, tests_selected: 12, comment_filed: true }, 3);
+    }
+    emit({ ok: true, issue, tier: "safe", gate: "pass", advanced_to: "in_review", tests_selected: 7, comment_filed: false }, 0);
+    break;
+  }
+  case "link":
+    emit({ ok: true, receipt_id: 42, kind: "issue", ref: "AMT-7", symbols: ["a", "b"], forward_ok: true, reverse_ok: true }, 0);
+    break;
+  case "why":
+    emit({ ref: "AMT-7", symbols: ["a", "b"], decisions: ["D-3"] }, 0);
+    break;
+  case "doctor":
+    emit({ ok: true, checks: [{ name: "amt", pass: true, detail: "0.1.0" }] }, 0);
+    break;
+  default:
+    process.stderr.write("usage\n");
+    process.exit(2);
+}
+`;
+
+// Windows: a .cmd that forwards argv and propagates the exit code.
+const CMD_SHIM = [
+  "@echo off",
+  'bun "%~dp0fake-sirius.mjs" %*',
+  "exit /b %ERRORLEVEL%",
+  "",
+].join("\r\n");
+
+// POSIX: exec into bun so the child replaces the shell (exit code passes through).
+const SH_SHIM = String.raw`#!/usr/bin/env bash
+exec bun "$(dirname "$0")/fake-sirius.mjs" "$@"
 `;
 
 beforeAll(() => {
   dir = mkdtempSync(join(tmpdir(), "sirius-bin-"));
-  bin = join(dir, "sirius");
-  writeFileSync(bin, SCRIPT);
-  chmodSync(bin, 0o755);
+  writeFileSync(join(dir, "fake-sirius.mjs"), FAKE);
+  if (process.platform === "win32") {
+    bin = join(dir, "sirius.cmd");
+    writeFileSync(bin, CMD_SHIM);
+  } else {
+    bin = join(dir, "sirius");
+    writeFileSync(bin, SH_SHIM);
+    chmodSync(bin, 0o755);
+  }
 });
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 

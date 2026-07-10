@@ -179,7 +179,10 @@ pub fn decide_plan(sel: &Selection, changed_files: &[String], fallback: GateFall
 /// A human reason the selection wasn't trusted, most-specific first.
 fn doubt_reason(sel: &Selection) -> String {
     if !sel.ok {
-        format!("selector failed or returned no JSON ({})", first_line(&sel.detail))
+        format!(
+            "selector failed or returned no JSON ({})",
+            first_line(&sel.detail)
+        )
     } else if sel.roots == 0 {
         "no changed file mapped to an indexed entity (roots=0)".into()
     } else if note_is_suspect(&sel.note) {
@@ -583,7 +586,15 @@ mod tests {
         let led = Ledger::open_in_memory().unwrap();
         let cfg = gate_cfg(Some("cargo test"), GateFallback::FullSuite);
         let o = run_gate(
-            &amt, &hv, &led, &m, &cfg, "AMT-7", "safe", "in_review", None,
+            &amt,
+            &hv,
+            &led,
+            &m,
+            &cfg,
+            "AMT-7",
+            "safe",
+            "in_review",
+            None,
         )
         .unwrap();
         assert!(o.passed);
@@ -618,7 +629,15 @@ mod tests {
         let led = Ledger::open_in_memory().unwrap();
         let cfg = gate_cfg(Some("cargo test"), GateFallback::FullSuite);
         let o = run_gate(
-            &amt, &hv, &led, &m, &cfg, "AMT-7", "safe", "in_review", None,
+            &amt,
+            &hv,
+            &led,
+            &m,
+            &cfg,
+            "AMT-7",
+            "safe",
+            "in_review",
+            None,
         )
         .unwrap();
         assert!(!o.passed);
@@ -643,7 +662,15 @@ mod tests {
         let led = Ledger::open_in_memory().unwrap();
         let cfg = gate_cfg(None, GateFallback::FullSuite);
         let o = run_gate(
-            &amt, &hv, &led, &m, &cfg, "AMT-7", "safe", "in_review", None,
+            &amt,
+            &hv,
+            &led,
+            &m,
+            &cfg,
+            "AMT-7",
+            "safe",
+            "in_review",
+            None,
         )
         .unwrap();
         assert!(!o.passed);
@@ -661,7 +688,15 @@ mod tests {
         let led = Ledger::open_in_memory().unwrap();
         let cfg = gate_cfg(Some("cargo test"), GateFallback::FullSuite);
         assert!(run_gate(
-            &amt, &hv, &led, &m, &cfg, "AMT-7", "safe", "in_review", None
+            &amt,
+            &hv,
+            &led,
+            &m,
+            &cfg,
+            "AMT-7",
+            "safe",
+            "in_review",
+            None
         )
         .is_err());
     }
