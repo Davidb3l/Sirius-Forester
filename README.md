@@ -9,10 +9,10 @@ Status: **early alpha (v0.1.0).** The `sirius` binary and all six commands below
 are implemented and covered by an offline test suite (`cargo test`); CI runs on
 macOS/Linux/Windows. Prebuilt binaries are published for five platforms on the
 [Releases](https://github.com/Davidb3l/Sirius-Forester/releases) page, each with
-a sha256 checksum and a Sigstore signature. It depends on two companion tools:
-[Hayvenhurst](https://github.com/Davidb3l/Hayvenhurst-dev) (a local code graph,
-public) and Ametrite (a local issue tracker, **not yet publicly released**;
-without it the full loop cannot run today).
+a sha256 checksum and a Sigstore signature. It depends on two companion tools,
+both public: [Hayvenhurst](https://github.com/Davidb3l/Hayvenhurst-dev) (a local
+code graph) and [Ametrite](https://github.com/Davidb3l/Ametrite) (a local issue
+tracker). With both installed the full loop runs end to end.
 
 ## Why
 
@@ -32,7 +32,8 @@ strictly through their CLIs.
 
 - **Rust** ≥ 1.74, only to build the `sirius` binary from source. The prebuilt
   binaries need no toolchain.
-- **Ametrite** (`amt` CLI, schema ≥ v3) — the issue tracker it claims from.
+- **[Ametrite](https://github.com/Davidb3l/Ametrite)** (`amt` CLI, schema ≥ v3)
+  — the issue tracker it claims from.
 - **[Hayvenhurst](https://github.com/Davidb3l/Hayvenhurst-dev)** (`hayven` CLI,
   daemon on `:7777`) — the code graph used for locking, test selection, and
   provenance stamps.
@@ -45,7 +46,50 @@ Every release attaches a tarball per platform (`macos-arm64`, `macos-x64`,
 checksum and a Sigstore signature bundle.
 
 **Claude Code plugin.** Run `/sirius:install-binary`. It picks the tarball for
-this machine's OS and CPU, verifies the checksum, and installs `sirius`.
+this machine's OS and CPU, verifies the checksum and the Sigstore signature,
+and installs `sirius`.
+
+### Verifying what you downloaded
+
+The `.sha256` is served from the same origin as the tarball, so by itself it
+only catches a corrupted download: anyone who could replace the tarball could
+replace its checksum too. Authenticity comes from the Sigstore bundle, whose
+certificate binds the artifact to this repo's release workflow.
+
+`install-sirius.sh` verifies the signature whenever [`cosign`][cosign] or
+[`sigstore`][sigstore] is installed. Two rules are absolute: **a bad signature
+aborts the install**, and **a missing bundle aborts the install**. The second
+matters as much as the first: an attacker who can serve a tampered tarball can
+also serve a 404 for its signature, and a "skip when absent" policy would hand
+them a free downgrade.
+
+The one soft case is a machine with neither verifier installed. There we cannot
+check, so the installer warns loudly and proceeds on TLS plus the checksum. No
+attacker can induce that state remotely, since it depends on what you have
+installed locally. Pass `--require-signature` (or set
+`SIRIUS_REQUIRE_SIGNATURE=1`) to make it fatal:
+
+```bash
+brew install cosign            # or: pip install sigstore
+./install-sirius.sh --require-signature
+```
+
+To check a download by hand, pin both the signer identity and the OIDC issuer
+(an unpinned verify only proves *somebody* signed it):
+
+```bash
+VERSION=0.1.0; PLATFORM=macos-arm64
+STEM="sirius-forester-$VERSION-$PLATFORM"
+cosign verify-blob \
+  --bundle "$STEM.tar.gz.sigstore.json" \
+  --certificate-identity "https://github.com/Davidb3l/Sirius-Forester/.github/workflows/release.yml@refs/tags/v$VERSION" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  "$STEM.tar.gz"
+# Verified OK
+```
+
+[cosign]: https://github.com/sigstore/cosign
+[sigstore]: https://pypi.org/project/sigstore/
 
 **Manual (macOS / Linux).** Download, verify, install:
 

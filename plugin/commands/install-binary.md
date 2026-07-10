@@ -1,5 +1,5 @@
 ---
-description: Download and install the platform-correct `sirius` CLI binary for this OS/arch from the latest Sirius Forester GitHub release, verifying its checksum. Use when `sirius` is not yet installed.
+description: Download and install the platform-correct `sirius` CLI binary for this OS/arch from the latest Sirius Forester GitHub release, verifying its checksum and Sigstore signature. Use when `sirius` is not yet installed.
 argument-hint: "[vX.Y.Z]"
 allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/scripts/install-sirius.sh:*)
 ---
@@ -35,6 +35,11 @@ After it finishes:
 - If the script printed a "fleet suite" note about missing companion tools
   (Ametrite, Hayvenhurst, Catryna Wikinelli), relay it — Sirius is the foreman
   and delivers full fleet control only with the whole suite installed.
-- If the download or checksum verification failed, report the exact error; do not
-  retry silently. A common cause is that no GitHub release exists yet for the
-  resolved tag/platform.
+- If the download, checksum, or signature verification failed, report the exact
+  error; do not retry silently. A common cause is that no GitHub release exists
+  yet for the resolved tag/platform. A SIGNATURE VERIFICATION FAILED error is
+  never routine: stop and surface it, do not work around it.
+- If the script warned that no signature verifier was found, relay that: the
+  binary installed on the strength of TLS and a checksum alone. Suggest
+  `brew install cosign` (or `pip install sigstore`) and re-running with
+  `--require-signature`.

@@ -9,8 +9,31 @@
 # binary with a plugin" mechanism that fits that constraint, so this script is
 # the bridge: detect the OS/arch, map to the matching release tarball asset
 # (mirroring .github/workflows/release.yml's platform matrix), download it,
-# verify its sha256 against the published `<tarball>.sha256`, and install the
-# binary into a known location.
+# verify its sha256 and its Sigstore signature, and install the binary into a
+# known location.
+#
+# SECURITY: the `<tarball>.sha256` is served from the same origin as the
+# tarball, so on its own it only catches a corrupted download, not a tampered
+# release: anyone who can replace the tarball can replace its checksum too.
+# Authenticity comes from the Sigstore bundle (`<tarball>.sigstore.json`), whose
+# Fulcio certificate binds the artifact to THIS repo's release workflow. We pin
+# both the signer identity and the OIDC issuer; otherwise an attacker could sign
+# a malicious tarball with their own identity and it would still "verify".
+#
+# A bad signature ALWAYS aborts. A MISSING bundle ALWAYS aborts: the tarball
+# came from the same origin, every release publishes a bundle, so "tarball but
+# no bundle" is a signature-stripping downgrade, not a benign 404.
+#
+# The one soft case is a box with no verifier installed (`cosign` or
+# `sigstore`): we cannot check, so we warn loudly and continue on TLS plus the
+# checksum. An attacker cannot induce that state remotely (it depends on what is
+# installed locally). Pass --require-signature (or SIRIUS_REQUIRE_SIGNATURE=1)
+# to make it fatal too.
+#
+# NOTE: the trust anchor follows SIRIUS_REPO. Overriding it points both the
+# download AND the expected signer at that repo, so verification then only
+# proves "that repo signed its own artifact". Do not set it to a repo you do
+# not trust.
 #
 # Idempotent + safe to re-run. POSIX sh (macOS / Linux). Windows is not
 # covered here — install from the release tarball manually.
@@ -22,11 +45,13 @@
 #                                     #   already installed, 3 if missing
 #   install-sirius.sh --version vX.Y.Z   # install a specific tag
 #   install-sirius.sh --prefix DIR    # install into DIR/bin (default below)
+#   install-sirius.sh --require-signature  # abort unless the signature verifies
 #
 # Environment:
 #   SIRIUS_INSTALL_PREFIX   override the install prefix (same as --prefix)
 #   SIRIUS_RELEASE_TAG      pin a release tag (same as --version)
 #   SIRIUS_REPO             override owner/repo (default Davidb3l/Sirius-Forester)
+#   SIRIUS_REQUIRE_SIGNATURE=1   same as --require-signature
 
 set -eu
 
@@ -38,10 +63,13 @@ TAG="${SIRIUS_RELEASE_TAG:-}"
 DEFAULT_PREFIX="${SIRIUS_INSTALL_PREFIX:-${CLAUDE_PLUGIN_DATA:-$HOME/.local}}"
 PREFIX="$DEFAULT_PREFIX"
 MODE="install"
+# Make a missing verifier fatal. A BAD signature is fatal regardless.
+REQUIRE_SIG="${SIRIUS_REQUIRE_SIGNATURE:-0}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --check) MODE="check" ;;
+    --require-signature) REQUIRE_SIG=1 ;;
     --version)
       [ -n "${2:-}" ] || { echo "install-sirius: --version needs a tag (e.g. v0.1.0)" >&2; exit 2; }
       TAG="$2"; shift ;;
@@ -49,7 +77,7 @@ while [ $# -gt 0 ]; do
       [ -n "${2:-}" ] || { echo "install-sirius: --prefix needs a directory" >&2; exit 2; }
       PREFIX="$2"; shift ;;
     --help|-h)
-      sed -n '2,29p' "$0"
+      sed -n '2,54p' "$0"
       exit 0
       ;;
     *) echo "install-sirius: unknown argument: $1" >&2; exit 2 ;;
@@ -202,6 +230,63 @@ if [ "$MODE" = "check" ]; then
   exit 3
 fi
 
+# ---- signature verification --------------------------------------------------
+# Verify with whichever Sigstore verifier is on the box. Pin BOTH the signer
+# identity (this repo's release.yml, at this tag) and the OIDC issuer: an
+# unpinned verify only proves "somebody signed this", not "the release workflow
+# signed this".
+verify_signature() {
+  bundle="$1"
+  artifact="$2"
+  identity="https://github.com/$REPO/.github/workflows/release.yml@refs/tags/$TAG"
+  issuer="https://token.actions.githubusercontent.com"
+
+  sig_fail="SIGNATURE VERIFICATION FAILED for $TARBALL
+        expected signer: $identity
+        expected issuer: $issuer
+        Refusing to install: this artifact was not produced by $REPO's release workflow."
+
+  if have cosign; then
+    log "install-sirius: verifying signature (cosign)"
+    cosign verify-blob \
+      --bundle "$bundle" \
+      --certificate-identity "$identity" \
+      --certificate-oidc-issuer "$issuer" \
+      "$artifact" >/dev/null 2>&1 || fail "$sig_fail"
+    log "install-sirius: signature OK (cosign)"
+    return 0
+  fi
+
+  sig_cmd=""
+  if have sigstore; then
+    sig_cmd="sigstore"
+  elif have python3 && python3 -c 'import sigstore' >/dev/null 2>&1; then
+    sig_cmd="python3 -m sigstore"
+  fi
+
+  if [ -n "$sig_cmd" ]; then
+    log "install-sirius: verifying signature (sigstore)"
+    # shellcheck disable=SC2086
+    $sig_cmd verify identity \
+      --bundle "$bundle" \
+      --cert-identity "$identity" \
+      --cert-oidc-issuer "$issuer" \
+      "$artifact" >/dev/null 2>&1 || fail "$sig_fail"
+    log "install-sirius: signature OK (sigstore)"
+    return 0
+  fi
+
+  if [ "$REQUIRE_SIG" = "1" ]; then
+    fail "no signature verifier found, and --require-signature was set.
+        Install one:  brew install cosign   (or)   pip install sigstore"
+  fi
+  log "install-sirius: WARNING: no signature verifier (cosign / sigstore) found."
+  log "install-sirius: WARNING: proceeding on TLS + checksum alone, which cannot"
+  log "install-sirius: WARNING: detect a tampered release. To verify provenance:"
+  log "install-sirius: WARNING:   brew install cosign  (or)  pip install sigstore"
+  log "install-sirius: WARNING: then re-run with --require-signature."
+}
+
 # ---- install ---------------------------------------------------------------
 detect_platform
 resolve_latest_tag
@@ -210,6 +295,7 @@ TARBALL="sirius-forester-${VERSION}-${PLATFORM}.tar.gz"
 BASE_URL="https://github.com/$REPO/releases/download/$TAG"
 TARBALL_URL="$BASE_URL/$TARBALL"
 CHECKSUM_URL="$TARBALL_URL.sha256"
+BUNDLE_URL="$TARBALL_URL.sigstore.json"
 
 log "install-sirius: repo=$REPO tag=$TAG platform=$PLATFORM"
 log "install-sirius: asset=$TARBALL"
@@ -218,6 +304,7 @@ log "install-sirius: asset=$TARBALL"
 if [ "${SIRIUS_INSTALL_DRY_RUN:-}" = "1" ]; then
   log "DRY RUN — would download: $TARBALL_URL"
   log "DRY RUN — would verify:   $CHECKSUM_URL"
+  log "DRY RUN — would verify:   $BUNDLE_URL"
   log "DRY RUN — would install into: $BIN_DIR"
   exit 0
 fi
@@ -242,6 +329,23 @@ if [ "$expected" != "$actual" ]; then
         actual:   $actual"
 fi
 log "install-sirius: checksum OK ($actual)"
+
+# Authenticity. The checksum above came from the same origin as the tarball, so
+# it proves nothing about provenance on its own.
+#
+# A missing bundle is ALWAYS fatal, never a skip. The tarball just downloaded
+# from this same origin, and every release publishes <tarball>.sigstore.json
+# (release.yml uploads with if-no-files-found: error). So "tarball present,
+# bundle absent" is not a benign 404 -- it is exactly what an attacker who can
+# serve a tampered tarball would return in order to strip the signature and
+# downgrade us to the checksum, which they also control.
+log "install-sirius: fetching signature bundle"
+fetch "$BUNDLE_URL" "$TMP/$TARBALL.sigstore.json" 2>/dev/null || fail "no Sigstore bundle at $BUNDLE_URL
+        The tarball downloaded but its signature did not. Refusing to install.
+        Every Sirius Forester release publishes <tarball>.sigstore.json, so a
+        missing bundle means the release is malformed or the download was
+        tampered with."
+verify_signature "$TMP/$TARBALL.sigstore.json" "$TMP/$TARBALL"
 
 log "install-sirius: extracting"
 tar -xzf "$TMP/$TARBALL" -C "$TMP"
