@@ -47,19 +47,36 @@ checksum and a Sigstore signature bundle.
 **Claude Code plugin.** Run `/sirius:install-binary`. It picks the tarball for
 this machine's OS and CPU, verifies the checksum, and installs `sirius`.
 
-**Manual.** Download, verify, install:
+**Manual (macOS / Linux).** Download, verify, install:
 
 ```bash
 VERSION=0.1.0
-PLATFORM=macos-arm64             # or macos-x64, linux-x64-glibc, linux-arm64, windows-x64
+PLATFORM=macos-arm64             # or macos-x64, linux-x64-glibc, linux-arm64
 BASE="https://github.com/Davidb3l/Sirius-Forester/releases/download/v$VERSION"
 STEM="sirius-forester-$VERSION-$PLATFORM"
 
 curl -fsSLO "$BASE/$STEM.tar.gz"
 curl -fsSLO "$BASE/$STEM.tar.gz.sha256"
-shasum -a 256 -c "$STEM.tar.gz.sha256"   # must print: OK
+shasum -a 256 -c "$STEM.tar.gz.sha256"   # prints: <file>: OK
 tar -xzf "$STEM.tar.gz"
 install "$STEM/sirius" /usr/local/bin/   # anywhere on your PATH
+```
+
+**Manual (Windows).** Download `sirius-forester-<version>-windows-x64.tar.gz`
+and its `.sha256` from the releases page, check the hash, then extract it and
+put the binary, which is named **`sirius.exe`**, anywhere on your `%PATH%`:
+
+```powershell
+$Version  = "0.1.0"
+$Stem     = "sirius-forester-$Version-windows-x64"
+$Base     = "https://github.com/Davidb3l/Sirius-Forester/releases/download/v$Version"
+
+curl.exe -fsSLO "$Base/$Stem.tar.gz"
+curl.exe -fsSLO "$Base/$Stem.tar.gz.sha256"
+# compare against the hash in the .sha256 file
+(Get-FileHash "$Stem.tar.gz" -Algorithm SHA256).Hash.ToLower()
+tar -xzf "$Stem.tar.gz"
+# then move $Stem\sirius.exe onto your %PATH%
 ```
 
 **From source.** Needs Rust ≥ 1.74:
