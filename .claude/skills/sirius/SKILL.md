@@ -1,21 +1,80 @@
 ---
 name: sirius
 description: >-
-  Loop etiquette for an AI agent that IS the worker in a Sirius Forester
-  iteration — human-driven or single-agent mode, where you run the loop by hand
-  instead of `sirius run` spawning you. Use when working a task in a repo that
-  has a .sirius/ ledger beside .ametrite/ and .hayven/, or whenever asked to
-  "work an issue the Sirius way", claim → map → lock → brief → work → gate →
-  receipt → release. Covers claim order, 409 backoff, the gate, and filing a
-  two-way receipt.
+  Drive Sirius Forester, the local-first foreman for a fleet of AI coding
+  agents, in any repo that has a .sirius/ ledger beside .ametrite/ and .hayven/.
+  TWO WAYS IN. (1) START THE FOREMAN — when the human says "let's get Sirius",
+  "get Sirius on this repo", "Sirius this repo/Forester", "run the fleet/foreman
+  here", or otherwise asks to kick off the loop, run `sirius run` (or drive one
+  iteration by hand). (2) BE A WORKER — when you ARE the agent inside an
+  iteration ("work an issue the Sirius way"), follow the etiquette: claim → map →
+  lock → brief → work → gate → receipt → release, honoring claim order, 409
+  backoff, the gate, and a two-way receipt. If `sirius` is not installed, run
+  /sirius:install-binary first.
 ---
 
-# Being a Sirius worker
+# Driving Sirius Forester
 
-You are running **one iteration** of the Sirius Forester loop yourself: pull a
-task, turn it into claimed code, do the work, gate the finish, file the
-paperwork, release. This is the exact sequence `sirius run` automates (PRD §9) —
-you are doing it by hand as a single worker.
+Sirius is the **foreman** of the local-first suite: it claims tasks from
+Ametrite (the board), locks the code each touches via Hayvenhurst (the code
+graph), runs your agent, refuses to call anything done until the affected tests
+pass, and files a two-way receipt for every change. (Catryna Wikinelli, the
+wiki, is the fourth tool.)
+
+There are two ways you'll use this skill. **Starting the foreman** — the human
+wants the loop running on a repo. **Being a worker** — you *are* the agent an
+iteration runs. Pick the section that matches; when unsure, ask.
+
+If the `sirius` binary is missing, install it first with `/sirius:install-binary`
+(never build from source unless asked). If the install script reports missing
+companions, relay its suggestion — full fleet control needs all four.
+
+---
+
+## A. Start the foreman — `sirius run`
+
+When the human says **"let's get Sirius"**, "get Sirius on this repo", "Sirius
+this Forester", "run the fleet here", or anything that means *kick off the loop*,
+they want the foreman working the board on the current repo.
+
+1. **Preflight.** `sirius doctor` must be clean — the five §6 contract facts. If
+   it reports drift, stop and surface it: the loop's guarantees don't hold on a
+   broken workspace. (`/sirius:install-binary` first if `sirius` is missing.)
+2. **Agree on the launch before you unleash it.** `sirius run` spawns worker
+   agents that edit code autonomously, without asking per change — so on the
+   first run in a repo, confirm scope with the human and settle three flags:
+   - `--workers N` — how many workers (start small, e.g. 2–3);
+   - `--from <stage>` — which column to pull from (default `todo`);
+   - `--agent-cmd '<command>'` — the command each iteration runs to do the work,
+     e.g. `claude -p "work the claimed issue the Sirius way"`. This is the agent;
+     without it the loop has nothing to run.
+3. **Run it and watch the fleet.**
+   ```bash
+   sirius run --workers 2 --from todo \
+     --agent-cmd 'claude -p "work the claimed issue the Sirius way"'
+   ```
+   It streams one NDJSON event per phase (`claim` → … → `release`), and each
+   iteration also appends to the suite event spine. Tail it to watch provenance
+   land in real time:
+   ```bash
+   tail -f .suite/events/$(date -u +%F).jsonl
+   ```
+   The loop exits when a full round finds no claimable work. Exit codes: `0` ok,
+   `1` failure, `2` usage, `3` gate blocked.
+4. **Read the receipts.** Every completed issue leaves a two-way receipt; spot
+   check with `sirius why <symbol>` and `sirius why <ISSUE>` — both must answer.
+
+Want a single iteration by hand instead of spawning subprocess workers (solo
+mode, tighter control, no autonomous fan-out)? That's section B.
+
+---
+
+## B. Being a Sirius worker
+
+You are running **one iteration** of the loop yourself: pull a task, turn it
+into claimed code, do the work, gate the finish, file the paperwork, release.
+This is the exact sequence `sirius run` automates (PRD §9) — you are doing it by
+hand as a single worker. Reuse the same worker identity throughout (below).
 
 Your worker identity is `sirius/<tree>` (e.g. `sirius/oak`). Use the **same** id
 for every step of one iteration: it flows into `AMT_AGENT`, the Hayvenhurst claim
