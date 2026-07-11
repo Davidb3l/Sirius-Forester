@@ -15,6 +15,7 @@ mod hayven;
 mod ledger;
 mod run;
 mod shell;
+mod spine;
 mod workspace;
 
 use amt::Amt;
@@ -278,6 +279,27 @@ fn cmd_link(
 
     match bridge::link(&amt, &hv, &ledger, kind, &r#ref, &symbols, None) {
         Ok(r) => {
+            // Spine (§2): the receipt is durably filed inside bridge::link above,
+            // so this is a past-tense fact. Best-effort; never fails the command.
+            {
+                let is_issue = r.kind.as_str() == "issue";
+                let extra_ref = if is_issue {
+                    spine::issue_ref(&r.r#ref)
+                } else {
+                    format!("amt:decision/{}", r.r#ref.trim_start_matches("D-"))
+                };
+                let mut data = json!({ "symbols": r.symbols.clone() });
+                if is_issue {
+                    data["issue"] = json!(r.r#ref);
+                } else {
+                    data["decision"] = json!(r.r#ref);
+                }
+                spine::Spine::new(&ws.root).emit(
+                    "receipt.filed",
+                    vec![spine::receipt_ref(r.receipt_id), extra_ref],
+                    data,
+                );
+            }
             if json {
                 print_json(&json!({
                     "ok": true,
@@ -413,6 +435,17 @@ fn cmd_gate(
         range.as_deref(),
     ) {
         Ok(o) => {
+            // Spine (§2): amt status advance / fail comment already applied
+            // inside run_gate. Best-effort; never fails the command.
+            spine::Spine::new(&ws.root).emit(
+                if o.passed {
+                    "gate.passed"
+                } else {
+                    "gate.failed"
+                },
+                vec![spine::issue_ref(&o.issue)],
+                json!({ "issue": o.issue.clone(), "tests": o.test_ids.clone() }),
+            );
             if json {
                 print_json(&json!({
                     "ok": o.passed,
@@ -476,6 +509,7 @@ fn cmd_run(
     let hv = Hayven::new(runner);
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
+    let spine = spine::Spine::new(&ws.root);
 
     // v1 runs workers sequentially in one foreground process (a killable loop,
     // ROADMAP §"A daemon" rationale); concurrency cap bounds the roster names.
@@ -505,6 +539,7 @@ fn cmd_run(
                 from.as_deref(),
                 agent_cmd,
                 &mut lock,
+                Some(&spine),
             );
             iterations += 1;
             match outcome {

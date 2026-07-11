@@ -11,6 +11,9 @@ bench/fixtures/*.db-*
 .hayven/
 .claude/skills/
 
+# Suite event spine — local telemetry, per SUITE_CONTRACTS §2 ("SHOULD gitignore")
+.suite/
+
 # Private strategy docs — kept local only, never in the public repo.
 # (Working copies live outside the repo in ../sirius-private-docs/)
 /PRD.md

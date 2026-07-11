@@ -34,6 +34,8 @@ pub struct GateOutcome {
     pub advanced_to: Option<String>,
     /// Count of tests actually run (0 for a full-suite run — the runner decides).
     pub tests_selected: usize,
+    /// The runnable test ids the gate ran (subset runs); empty for full-suite.
+    pub test_ids: Vec<String>,
     pub comment_filed: bool,
     /// How the gate ran: `subset(n)`, `full-suite`, `blocked`, `pass-with-warning`,
     /// `unconfigured`, or `skipped`.
@@ -205,6 +207,9 @@ pub struct GateVerdict {
     pub reason: String,
     pub ran_tests: bool,
     pub tests_run: usize,
+    /// The runnable test ids the gate selected and ran (subset runs). Empty for
+    /// a full-suite run (the runner picks) or when no tests ran.
+    pub test_ids: Vec<String>,
     pub detail: String,
 }
 
@@ -218,6 +223,7 @@ pub fn execute_plan(runner: &dyn Runner, test_cmd: Option<&str>, plan: GatePlan)
             reason,
             ran_tests: false,
             tests_run: 0,
+            test_ids: vec![],
             detail: String::new(),
         },
         GatePlan::WarnPass(reason) => GateVerdict {
@@ -226,6 +232,7 @@ pub fn execute_plan(runner: &dyn Runner, test_cmd: Option<&str>, plan: GatePlan)
             reason,
             ran_tests: false,
             tests_run: 0,
+            test_ids: vec![],
             detail: String::new(),
         },
         GatePlan::Full(reason) => run_cmd(runner, test_cmd, &[], "full-suite", reason),
@@ -252,6 +259,7 @@ fn run_cmd(
             reason: "gate.test_cmd is not set — cannot run tests, refusing to pass".into(),
             ran_tests: false,
             tests_run: 0,
+            test_ids: vec![],
             detail: String::new(),
         };
     };
@@ -267,6 +275,7 @@ fn run_cmd(
             reason,
             ran_tests: true,
             tests_run: ids.len(),
+            test_ids: ids.to_vec(),
             detail: last_lines(&out.stdout, &out.stderr, 20),
         },
         Err(e) => GateVerdict {
@@ -275,6 +284,9 @@ fn run_cmd(
             reason,
             ran_tests: false,
             tests_run: 0,
+            // The command failed to spawn: no tests ran, so per the field's
+            // contract (ids the gate *ran*) this is empty, not the selection.
+            test_ids: vec![],
             detail: e.to_string(),
         },
     }
@@ -348,6 +360,7 @@ pub fn run_gate(
             passed: true,
             advanced_to: Some(target_status.to_string()),
             tests_selected: v.tests_run,
+            test_ids: v.test_ids,
             comment_filed: v.plan == "pass-with-warning",
             plan: v.plan,
             ran_tests: v.ran_tests,
@@ -376,6 +389,7 @@ pub fn run_gate(
             passed: false,
             advanced_to: None,
             tests_selected: v.tests_run,
+            test_ids: v.test_ids,
             comment_filed,
             plan: v.plan,
             ran_tests: v.ran_tests,

@@ -339,8 +339,31 @@ pub fn run_iteration(
     from: Option<&str>,
     agent_cmd: &str,
     out: &mut dyn Write,
+    spine: Option<&crate::spine::Spine>,
 ) -> IterationOutcome {
     ledger.upsert_worker(worker, "working").ok();
+
+    // Suite spine (§2): past-tense job/gate/receipt facts to <root>/.suite/.
+    // Best-effort and optional (None disables it, e.g. in tests). `out` is the
+    // NDJSON stream; the spine is a separate file sink with its own vocabulary
+    // (job.*/gate.*/receipt.* vs iteration phases), so the two never collide.
+    let emit_spine = |ty: &str, refs: Vec<String>, data: Value| {
+        if let Some(sp) = spine {
+            sp.emit(ty, refs, data);
+        }
+    };
+    let emit_job = |ty: &str, issue: &str| {
+        if let Some(sp) = spine {
+            sp.emit(
+                ty,
+                vec![
+                    crate::spine::issue_ref(issue),
+                    crate::spine::worker_ref(worker),
+                ],
+                json!({ "issue": issue, "worker": worker }),
+            );
+        }
+    };
 
     // 1. CLAIM the issue (Ametrite first — claim-order law).
     let claim = amt.claim(worker, from);
@@ -379,6 +402,8 @@ pub fn run_iteration(
         "claim",
         json!({"claimed": true, "title": title}),
     );
+    // Durable: the Ametrite claim + ledger.start_iteration above.
+    emit_job("job.dispatched", &issue);
 
     // 2. MAP issue → symbols (Hayvenhurst query + impact for blast radius).
     let mut entities: Vec<String> = Vec::new();
@@ -461,6 +486,7 @@ pub fn run_iteration(
                     )
                     .ok();
                 ledger.upsert_worker(worker, "idle").ok();
+                emit_job("job.blocked", &issue);
                 return IterationOutcome::ReleasedOverlap;
             }
             LockResult::OracleBackoff { detail, acquired } => {
@@ -497,6 +523,7 @@ pub fn run_iteration(
                     )
                     .ok();
                 ledger.upsert_worker(worker, "idle").ok();
+                emit_job("job.blocked", &issue);
                 return IterationOutcome::ReleasedOverlap;
             }
         }
@@ -624,6 +651,7 @@ pub fn run_iteration(
                 .ok();
             ledger.upsert_worker(worker, "idle").ok();
             file_deadend(hv, &entities, &issue, "agent timed out");
+            emit_job("job.blocked", &issue);
             return IterationOutcome::Deadend;
         }
 
@@ -669,6 +697,21 @@ pub fn run_iteration(
                 "attempt": attempt + 1,
             }),
         );
+        // Durable: amt status advance (pass) / comment (fail) applied above. A
+        // skipped gate (nothing to test) is not a gate verdict, so no event.
+        if let Some(v) = &verdict {
+            if gate_result != "skipped" {
+                emit_spine(
+                    if gate_result == "pass" {
+                        "gate.passed"
+                    } else {
+                        "gate.failed"
+                    },
+                    vec![crate::spine::issue_ref(&issue)],
+                    json!({ "issue": issue.as_str(), "tests": v.test_ids.clone() }),
+                );
+            }
+        }
 
         // Retry decision (SIRF-9): only a FAIL is retryable, and only while the
         // budget has attempts left. Each retry is recorded as a policy event so
@@ -721,6 +764,17 @@ pub fn run_iteration(
             "receipt",
             json!({"receipt_id": receipt_id}),
         );
+        // Durable: the two-way receipt was written inside bridge::link above.
+        if let Some(rid) = receipt_id {
+            emit_spine(
+                "receipt.filed",
+                vec![
+                    crate::spine::receipt_ref(rid),
+                    crate::spine::issue_ref(&issue),
+                ],
+                json!({ "issue": issue.as_str(), "symbols": entities.clone() }),
+            );
+        }
     }
 
     // 8. RELEASE: entities first (reverse), then close out the issue.
@@ -779,6 +833,14 @@ pub fn run_iteration(
         )
         .ok();
     ledger.upsert_worker(worker, "idle").ok();
+
+    // Durable: the terminal finish_iteration above. "completed" ⇔ advanced;
+    // gate_failed / error are non-completing → blocked.
+    if outcome == "completed" {
+        emit_job("job.completed", &issue);
+    } else {
+        emit_job("job.blocked", &issue);
+    }
 
     if gate_result == "fail" {
         // Record the failure as a deadend note so the next agent does not
@@ -990,6 +1052,7 @@ mod tests {
             Some("todo"),
             "true",
             &mut out,
+            None,
         );
         assert_eq!(
             o,
@@ -1072,6 +1135,7 @@ mod tests {
             Some("todo"),
             "true",
             &mut out,
+            None,
         );
         assert_eq!(o, IterationOutcome::Completed);
 
@@ -1155,6 +1219,7 @@ mod tests {
             Some("todo"),
             "true",
             &mut out,
+            None,
         );
         // A failed gate ends the iteration as a deadend, not a completion.
         assert_eq!(o, IterationOutcome::Deadend);
@@ -1243,6 +1308,7 @@ mod tests {
             Some("todo"),
             "sleep 999",
             &mut out,
+            None,
         );
         assert_eq!(o, IterationOutcome::Deadend);
 
@@ -1323,6 +1389,7 @@ mod tests {
             Some("todo"),
             "long-cmd",
             &mut out,
+            None,
         );
 
         let calls = m.recorded();
@@ -1531,6 +1598,7 @@ mod tests {
             Some("todo"),
             "true",
             &mut out,
+            None,
         );
         assert_eq!(o, IterationOutcome::Completed);
 
@@ -1612,6 +1680,7 @@ mod tests {
             Some("todo"),
             "true",
             &mut out,
+            None,
         );
         assert_eq!(o, IterationOutcome::Deadend);
 
@@ -1671,6 +1740,7 @@ mod tests {
             Some("todo"),
             "sleep 999",
             &mut out,
+            None,
         );
         assert_eq!(o, IterationOutcome::Deadend);
         // Exactly one agent run — the timeout did NOT loop back.
@@ -1737,6 +1807,7 @@ mod tests {
             Some("todo"),
             "true",
             &mut out,
+            None,
         );
         assert_eq!(o, IterationOutcome::Completed);
         // The stored oracle_verdicts JSON reflects the FORCE, not "registered".
@@ -1780,6 +1851,7 @@ mod tests {
             Some("todo"),
             "true",
             &mut out,
+            None,
         );
         assert_eq!(o, IterationOutcome::ReleasedOverlap);
         let verdicts: String = led
