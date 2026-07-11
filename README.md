@@ -49,6 +49,14 @@ checksum and a Sigstore signature bundle.
 this machine's OS and CPU, verifies the checksum and the Sigstore signature,
 and installs `sirius`.
 
+**The whole suite (Sothis).** Sirius is the foreman of **Sothis** — the
+local-first suite of Sirius, Hayvenhurst, Ametrite, and Catryna Wikinelli. This
+repo's Claude Code marketplace is a bundle: `/plugin marketplace add
+Davidb3l/Sirius-Forester` exposes the `sirius`, `hayvenhurst`, and `catryna`
+plugins at once. For the CLIs, run `/sirius:install-suite` (or say "let's Sothis
+this up") — it installs every missing suite binary via each tool's own installer,
+detects `amt`, checks `bun` for Catryna, and ends with `sirius doctor`.
+
 ### Verifying what you downloaded
 
 The `.sha256` is served from the same origin as the tarball, so by itself it

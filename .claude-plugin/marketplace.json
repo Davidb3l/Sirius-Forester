@@ -1,5 +1,6 @@
 {
   "name": "sirius-forester",
+  "description": "The Sothis suite bundle — one `/plugin marketplace add` exposes Sirius (foreman), Hayvenhurst (code graph), and Catryna Wikinelli (code wiki). Pair with plugin/scripts/install-sothis.sh (or /sirius:install-suite) to install the CLIs. Ametrite (the board) is a Rust CLI bootstrapped by its own \"ametrite this repo\" skill, so it isn't a plugin here.",
   "owner": {
     "name": "Sirius Forester",
     "email": "info@anchorsanvils.com"
@@ -9,7 +10,24 @@
       "name": "sirius",
       "source": "./plugin",
       "version": "0.1.0",
-      "description": "The fleet foreman for AI coding agents. Ships the Sirius worker Skill so Claude Code runs the claim → map → lock → brief → work → gate → receipt → release loop against your local Ametrite board and Hayvenhurst code graph, plus an installer for the `sirius` CLI binary."
+      "description": "The fleet foreman for AI coding agents. Ships the Sirius worker Skill so Claude Code runs the claim → map → lock → brief → work → gate → receipt → release loop against your local Ametrite board and Hayvenhurst code graph, plus an installer for the `sirius` CLI binary and the Sothis suite."
+    },
+    {
+      "name": "hayvenhurst",
+      "source": {
+        "source": "git-subdir",
+        "url": "Davidb3l/Hayvenhurst-dev",
+        "path": "plugin"
+      },
+      "description": "Reach for `hayven` over grep. Ships the Hayvenhurst Agent Skill so Claude Code queries a persistent, trace-augmented code graph of your repo (callers/callees, dependencies, runtime traces) through the local Hayvenhurst daemon instead of grepping or reading large files. The code-graph pillar of the Sothis suite."
+    },
+    {
+      "name": "catryna",
+      "source": {
+        "source": "github",
+        "repo": "Davidb3l/Catryna-Wikinelli"
+      },
+      "description": "Living documentation for agents + humans. Ships the Catryna MCP server (create/update/search .docs/ MDX docs, coverage reports) and an Agent Skill that teaches Claude to search project docs before coding and keep them updated after changes. Local-first, git-versioned, no database. The code-wiki pillar of the Sothis suite."
     }
   ]
 }
