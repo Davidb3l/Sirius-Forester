@@ -5,6 +5,9 @@ tracker, locks the code each task touches, runs your agent, refuses to mark
 anything done until the affected tests pass, and files a two-way receipt linking
 every change to the decision behind it.**
 
+Website & docs: **[siriusforester.com](https://siriusforester.com)** ·
+[Getting started](https://siriusforester.com/docs/getting-started/)
+
 Status: **early alpha (v0.1.0).** The `sirius` binary and all six commands below
 are implemented and covered by an offline test suite (`cargo test`); CI runs on
 macOS/Linux/Windows. Prebuilt binaries are published for five platforms on the
