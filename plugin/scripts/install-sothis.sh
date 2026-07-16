@@ -22,9 +22,12 @@
 # hayven verifies a sha256). This script never re-implements a download or a
 # signature check — it orchestrates. The one supply-chain note: when the
 # Hayvenhurst plugin isn't already on disk, this fetches its install-hayven.sh
-# over HTTPS from $HAYVEN_REPO and runs it (a pinned `curl | sh`). Prefer the
-# local copy (found automatically) or pass --skip-hayven and run
-# /hayvenhurst:install-binary yourself if you'd rather not.
+# over HTTPS from $HAYVEN_REPO at $HAYVEN_INSTALLER_REF (default: a release
+# TAG, so the fetched script is an immutable, reviewed revision rather than
+# whatever `main` holds today) and runs it. That fetched script then verifies
+# the hayven binary's sha256 itself. Prefer the local copy (found
+# automatically) or pass --skip-hayven and run /hayvenhurst:install-binary
+# yourself if you'd rather not run a fetched script at all.
 #
 # Idempotent + safe to re-run: anything already on PATH is left alone. POSIX sh
 # (macOS / Linux). Windows: install each tool from its release tarball manually.
@@ -41,15 +44,25 @@
 # Environment:
 #   SOTHIS_INSTALL_PREFIX   override the install prefix (same as --prefix)
 #   HAYVEN_REPO             override hayven's owner/repo (default Davidb3l/Hayvenhurst-dev)
-#   HAYVEN_INSTALLER_REF    ref for the fetched install-hayven.sh (default: main)
+#   HAYVEN_INSTALLER_REF    ref for the fetched install-hayven.sh (default: a release tag)
 #   AMETRITE_REPO           shown in the amt hint (default Davidb3l/Ametrite)
-#   Plus every variable install-sirius.sh honors (SIRIUS_REPO, SIRIUS_RELEASE_TAG, …).
+#   Plus every variable the delegated installers honor (SIRIUS_REPO,
+#   SIRIUS_RELEASE_TAG, SIRIUS_INSTALL_PREFIX, HAYVEN_INSTALL_PREFIX, …).
+#   --prefix / SOTHIS_INSTALL_PREFIX override the per-tool *_INSTALL_PREFIX;
+#   when neither is given, each tool's own default chain applies.
 
 set -eu
 
 PREFIX="${SOTHIS_INSTALL_PREFIX:-${CLAUDE_PLUGIN_DATA:-$HOME/.local}}"
+# Whether the CALLER chose a prefix (flag or SOTHIS_INSTALL_PREFIX). Only then
+# do we force --prefix onto the delegated installers; otherwise each tool's own
+# default chain (TOOL_INSTALL_PREFIX > CLAUDE_PLUGIN_DATA > ~/.local) wins.
+PREFIX_EXPLICIT=0
+if [ -n "${SOTHIS_INSTALL_PREFIX:-}" ]; then PREFIX_EXPLICIT=1; fi
 HAYVEN_REPO="${HAYVEN_REPO:-Davidb3l/Hayvenhurst-dev}"
-HAYVEN_INSTALLER_REF="${HAYVEN_INSTALLER_REF:-main}"
+# A TAG, not `main`: the fetched-over-HTTPS installer should be an immutable,
+# reviewed revision. Bump deliberately when hayven ships installer changes.
+HAYVEN_INSTALLER_REF="${HAYVEN_INSTALLER_REF:-v0.0.6}"
 AMETRITE_REPO="${AMETRITE_REPO:-Davidb3l/Ametrite}"
 MODE="install"
 REQUIRE_SIG=0
@@ -64,9 +77,9 @@ while [ $# -gt 0 ]; do
     --skip-amt) SKIP_AMT=1 ;;
     --prefix)
       [ -n "${2:-}" ] || { echo "install-sothis: --prefix needs a directory" >&2; exit 2; }
-      PREFIX="$2"; shift ;;
+      PREFIX="$2"; PREFIX_EXPLICIT=1; shift ;;
     --help|-h)
-      sed -n '2,46p' "$0"
+      sed -n '2,52p' "$0"
       exit 0
       ;;
     *) echo "install-sothis: unknown argument: $1" >&2; exit 2 ;;
@@ -120,13 +133,17 @@ fi
 # ---- sirius (delegated to the bundled installer) ---------------------------
 install_sirius() {
   if tool_present sirius; then
-    log "sirius: already installed ($(tool_where sirius)) — skipping."
+    log "sirius: already installed ($(tool_where sirius)); skipping."
     return 0
   fi
   installer="$SCRIPT_DIR/install-sirius.sh"
   [ -f "$installer" ] || fail "cannot find install-sirius.sh next to this script ($installer)"
   log "sirius: installing via install-sirius.sh"
-  set -- --prefix "$PREFIX"
+  set --
+  # Force our prefix only when the caller chose one; otherwise let the tool's
+  # own default chain (SIRIUS_INSTALL_PREFIX > CLAUDE_PLUGIN_DATA > ~/.local)
+  # decide, as the header promises.
+  [ "$PREFIX_EXPLICIT" = "1" ] && set -- --prefix "$PREFIX"
   [ "$REQUIRE_SIG" = "1" ] && set -- "$@" --require-signature
   sh "$installer" "$@" || fail "install-sirius.sh failed"
 }
@@ -135,11 +152,20 @@ install_sirius() {
 # Prefer a copy already on disk (installed Hayvenhurst plugin); fall back to
 # fetching it over HTTPS from the pinned repo. Either way, hayven's script does
 # its own download + checksum verification.
+#
+# Layouts differ by install path:
+#   marketplaces/hayvenhurst/            = a clone of Hayvenhurst-dev, so the
+#                                          script sits under plugin/scripts/.
+#   cache/<marketplace>/hayvenhurst/<v>/ = the INSTALLED PLUGIN root (no
+#                                          plugin/ segment), so scripts/ is
+#                                          top-level. <marketplace> is
+#                                          `hayvenhurst` for a standalone
+#                                          install and `sirius-forester` for
+#                                          the Sothis bundle; accept any.
 find_local_hayven_installer() {
-  for base in \
-    "$HOME/.claude/plugins/marketplaces/hayvenhurst" \
-    "$HOME/.claude/plugins/cache/hayvenhurst/hayvenhurst"/* ; do
-    cand="$base/plugin/scripts/install-hayven.sh"
+  for cand in \
+    "$HOME/.claude/plugins/marketplaces/hayvenhurst/plugin/scripts/install-hayven.sh" \
+    "$HOME/.claude/plugins/cache"/*/hayvenhurst/*/scripts/install-hayven.sh ; do
     [ -f "$cand" ] && { printf '%s\n' "$cand"; return 0; }
   done
   return 1
@@ -147,16 +173,18 @@ find_local_hayven_installer() {
 
 install_hayven() {
   if [ "$SKIP_HAYVEN" = "1" ]; then
-    log "hayven: --skip-hayven set — skipping."
+    log "hayven: --skip-hayven set; skipping."
     return 0
   fi
   if tool_present hayven; then
-    log "hayven: already installed ($(tool_where hayven)) — skipping."
+    log "hayven: already installed ($(tool_where hayven)); skipping."
     return 0
   fi
   if local_installer="$(find_local_hayven_installer)"; then
     log "hayven: installing via local install-hayven.sh ($local_installer)"
-    sh "$local_installer" --prefix "$PREFIX" || fail "install-hayven.sh failed"
+    set --
+    [ "$PREFIX_EXPLICIT" = "1" ] && set -- --prefix "$PREFIX"
+    sh "$local_installer" "$@" || fail "install-hayven.sh failed"
     return 0
   fi
   url="https://raw.githubusercontent.com/$HAYVEN_REPO/$HAYVEN_INSTALLER_REF/plugin/scripts/install-hayven.sh"
@@ -168,7 +196,9 @@ install_hayven() {
         (need curl or wget). Install hayven yourself with /hayvenhurst:install-binary,
         or re-run with --skip-hayven."
   [ -s "$tmp" ] || fail "downloaded install-hayven.sh was empty"
-  sh "$tmp" --prefix "$PREFIX" || fail "install-hayven.sh failed"
+  set --
+  [ "$PREFIX_EXPLICIT" = "1" ] && set -- --prefix "$PREFIX"
+  sh "$tmp" "$@" || fail "install-hayven.sh failed"
   rm -f "$tmp"
   trap - EXIT INT TERM
 }
@@ -176,7 +206,7 @@ install_hayven() {
 # ---- amt (detect only; never auto-build) -----------------------------------
 check_amt() {
   if [ "$SKIP_AMT" = "1" ]; then
-    log "amt: --skip-amt set — skipping."
+    log "amt: --skip-amt set; skipping."
     return 0
   fi
   if tool_present amt; then
@@ -184,7 +214,7 @@ check_amt() {
     return 0
   fi
   log ""
-  log "amt (Ametrite, the board): not installed. It's a Rust binary — this"
+  log "amt (Ametrite, the board): not installed. It's a Rust binary, and this"
   log "one-shot deliberately does NOT clone or build it for you. Get it by"
   log "asking Claude Code to \"ametrite this repo\" (the ametrite skill bootstraps"
   log "the amt CLI), or build it yourself:"
@@ -204,7 +234,7 @@ check_catryna() {
     log "  /plugin install catryna@sirius-forester   # from the Sothis bundle"
   fi
   if ! have bun; then
-    log "catryna: WARNING: bun not found. The Catryna MCP server runs on bun —"
+    log "catryna: WARNING: bun not found. The Catryna MCP server runs on bun;"
     log "         install it: https://bun.sh  (curl -fsSL https://bun.sh/install | bash)"
   fi
 }

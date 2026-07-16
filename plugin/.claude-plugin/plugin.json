@@ -1,6 +1,6 @@
 {
   "name": "sirius",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "The fleet foreman for AI coding agents. Ships the Sirius worker Skill so Claude Code runs the claim → map → lock → brief → work → gate → receipt → release loop against your local Ametrite board and Hayvenhurst code graph, plus installers for the `sirius` CLI binary and the whole Sothis suite (/sirius:install-suite, \"let's Sothis this up\").",
   "author": {
     "name": "Sirius Forester",

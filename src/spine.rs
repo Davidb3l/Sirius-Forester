@@ -62,9 +62,15 @@ impl Spine {
 }
 
 /// Serialize one envelope line (including the trailing `\n`). If the full line
-/// would breach the 4 KiB atomicity bound, drop `refs`/`data` to a minimal
-/// marker so we still record that the event happened without risking a
-/// torn/interleaved write.
+/// would breach the 4 KiB atomicity bound, shrink it in two stages so we still
+/// record that the event happened without risking a torn/interleaved write:
+///
+///   1. Drop only `data` (bulky detail belongs in our own store anyway) but
+///      KEEP `refs` — §2's guidance is that the URIs stay in refs precisely so
+///      a truncated `receipt.filed` still says which issue/receipt it was
+///      about. Refs are short suite URIs, so this almost always fits.
+///   2. If the refs themselves are somehow enormous, drop them too; the bound
+///      is a hard atomicity guarantee and must hold unconditionally.
 fn build_line(ts: &str, event_type: &str, refs: Vec<String>, data: Value) -> String {
     let envelope = |refs: Value, data: Value| {
         json!({
@@ -77,11 +83,16 @@ fn build_line(ts: &str, event_type: &str, refs: Vec<String>, data: Value) -> Str
             "data": data,
         })
     };
-    let mut line = serde_json::to_string(&envelope(json!(refs), data)).unwrap_or_default();
     // Conformance (§2.1): the whole line INCLUDING the `\n` must be STRICTLY
     // < 4096 bytes. `line` here excludes the newline, so the total is
     // `line.len() + 1`; truncate once that reaches the bound (`>=`, not `>`),
     // matching validate.ts exactly.
+    let refs = json!(refs);
+    let mut line = serde_json::to_string(&envelope(refs.clone(), data)).unwrap_or_default();
+    if line.len() + 1 >= MAX_LINE_BYTES {
+        line = serde_json::to_string(&envelope(refs, json!({ "truncated": true })))
+            .unwrap_or_default();
+    }
     if line.len() + 1 >= MAX_LINE_BYTES {
         line = serde_json::to_string(&envelope(json!([]), json!({ "truncated": true })))
             .unwrap_or_default();
@@ -235,12 +246,34 @@ mod tests {
         let huge: Vec<String> = (0..2000).map(|i| format!("symbol::number_{i}")).collect();
         spine.emit(
             "receipt.filed",
-            vec![],
+            vec!["amt:issue/A-1".into(), "sirius:receipt/9".into()],
             json!({"issue": "A-1", "symbols": huge}),
         );
         let ev = read_only_line(&dir);
         assert_eq!(ev["data"]["truncated"], true);
+        // Stage-1 truncation drops only `data` — the refs SURVIVE, so a
+        // truncated receipt.filed still says which issue/receipt it was about
+        // (§2: bulky detail goes in your own store; the URIs stay in refs).
+        assert_eq!(ev["refs"], json!(["amt:issue/A-1", "sirius:receipt/9"]));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pathologically_large_refs_are_dropped_as_the_last_resort() {
+        // Stage 2: the 4 KiB bound is a hard atomicity guarantee. If the refs
+        // themselves would breach it, they too are dropped rather than ever
+        // emitting a line that could tear.
+        let huge_refs: Vec<String> = (0..300).map(|i| format!("hayven:node/{i:0>32}")).collect();
+        let line = build_line(
+            "2026-07-11T00:00:00.000Z",
+            "receipt.filed",
+            huge_refs,
+            json!({"issue": "A-1"}),
+        );
+        assert!(line.len() < MAX_LINE_BYTES);
+        let ev: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(ev["data"]["truncated"], true);
+        assert_eq!(ev["refs"], json!([]));
     }
 
     #[test]

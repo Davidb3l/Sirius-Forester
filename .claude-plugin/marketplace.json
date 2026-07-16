@@ -9,7 +9,7 @@
     {
       "name": "sirius",
       "source": "./plugin",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "description": "The fleet foreman for AI coding agents. Ships the Sirius worker Skill so Claude Code runs the claim → map → lock → brief → work → gate → receipt → release loop against your local Ametrite board and Hayvenhurst code graph, plus an installer for the `sirius` CLI binary and the Sothis suite."
     },
     {

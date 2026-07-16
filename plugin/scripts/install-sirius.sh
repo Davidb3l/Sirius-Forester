@@ -110,14 +110,19 @@ suite_hint() {
   s_missing=""
   have amt     || s_missing="$s_missing Ametrite"
   have hayven  || s_missing="$s_missing Hayvenhurst"
-  grep -qs '"catryna@catryna-wikinelli"' "$HOME/.claude/plugins/installed_plugins.json" \
+  # Prefix match: catryna installs as `catryna@<marketplace>` and there are two
+  # legitimate marketplaces (the Sothis bundle `sirius-forester`, and its own
+  # `catryna-wikinelli`). Pinning one key nags the other's users forever.
+  grep -qs '"catryna@' "$HOME/.claude/plugins/installed_plugins.json" \
     || s_missing="$s_missing Catryna"
   if [ -z "$s_missing" ]; then return 0; fi
   log ""
-  log "fleet suite: missing:$s_missing. Sirius is the foreman; for full fleet control install the whole suite:"
-  case "$s_missing" in *Hayvenhurst*) log "  Hayvenhurst (code graph): /plugin marketplace add Davidb3l/Hayvenhurst-dev, /plugin install hayvenhurst@hayvenhurst, then /hayvenhurst:install-binary" ;; esac
-  case "$s_missing" in *Catryna*)     log "  Catryna Wikinelli (code wiki): /plugin marketplace add Davidb3l/Catryna-Wikinelli, then /plugin install catryna@catryna-wikinelli" ;; esac
-  case "$s_missing" in *Ametrite*)    log "  Ametrite (task board): ask Claude to \"ametrite this repo\" — the skill bootstraps the amt CLI" ;; esac
+  log "fleet suite: missing:$s_missing. Sirius is the foreman; for full fleet control install the whole suite (one-shot: /sirius:install-suite):"
+  # Anyone running this script has the sirius plugin, hence the sirius-forester
+  # marketplace: the Sothis bundle entries install with no extra marketplace add.
+  case "$s_missing" in *Hayvenhurst*) log "  Hayvenhurst (code graph): /plugin install hayvenhurst@sirius-forester, then /hayvenhurst:install-binary" ;; esac
+  case "$s_missing" in *Catryna*)     log "  Catryna Wikinelli (code wiki): /plugin install catryna@sirius-forester" ;; esac
+  case "$s_missing" in *Ametrite*)    log "  Ametrite (task board): ask Claude to \"ametrite this repo\" (the skill bootstraps the amt CLI)" ;; esac
 }
 
 # ---- platform detection → release asset name -------------------------------
@@ -319,10 +324,10 @@ log "install-sirius: asset=$TARBALL"
 
 # Allow a dry run of just the detection/mapping logic without network I/O.
 if [ "${SIRIUS_INSTALL_DRY_RUN:-}" = "1" ]; then
-  log "DRY RUN — would download: $TARBALL_URL"
-  log "DRY RUN — would verify:   $CHECKSUM_URL"
-  log "DRY RUN — would verify:   $BUNDLE_URL"
-  log "DRY RUN — would install into: $BIN_DIR"
+  log "DRY RUN: would download: $TARBALL_URL"
+  log "DRY RUN: would verify:   $CHECKSUM_URL"
+  log "DRY RUN: would verify:   $BUNDLE_URL"
+  log "DRY RUN: would install into: $BIN_DIR"
   exit 0
 fi
 
@@ -380,7 +385,7 @@ mv -f "$tmp_dst" "$BIN_DIR/sirius"
 log "install-sirius: installed $BIN_DIR/sirius"
 
 log ""
-log "install-sirius: done — sirius $VERSION installed for $PLATFORM."
+log "install-sirius: done. sirius $VERSION installed for $PLATFORM."
 print_path_hint
 log ""
 log "Next steps:"
