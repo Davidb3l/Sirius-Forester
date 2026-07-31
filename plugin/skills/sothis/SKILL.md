@@ -3,7 +3,8 @@ name: sothis
 description: >-
   Install the whole Sothis suite — the local-first fleet led by Sirius Forester:
   Sirius (foreman), Hayvenhurst (code graph), Ametrite (board), Catryna Wikinelli
-  (docs). Trigger when the human says "let's Sothis this up", "let's Sothis up",
+  (docs), PingMyBell (the bell — optional desktop notch/voice app). Trigger when
+  the human says "let's Sothis this up", "let's Sothis up",
   "install the Sothis suite", "set up the whole suite/fleet", "get the full fleet
   on this repo", or otherwise asks for all the tools at once (not just Sirius).
   Two halves: run the install-sothis.sh one-shot for the CLIs, then the
@@ -14,17 +15,20 @@ description: >-
 
 # Installing the Sothis suite — "let's Sothis this up"
 
-**Sothis** is the local-first suite led by Sirius Forester. Four standalone
+**Sothis** is the local-first suite led by Sirius Forester. Five standalone
 tools that compose through the suite contracts:
 
 - **Sirius Forester** (`sirius`) — the foreman/loop. Signed prebuilt binary.
 - **Hayvenhurst** (`hayven`) — the code graph. Prebuilt binary.
 - **Ametrite** (`amt`) — the task board + decisions. Rust binary (cargo).
 - **Catryna Wikinelli** (`catryna`) — the living "why" docs. bun-based MCP plugin.
+- **PingMyBell** — the bell: voice callouts + a notch command center when the
+  fleet needs you. Desktop app, built from source (optional; early alpha, macOS).
 
-Each stands alone; **full fleet control needs all four.** They install four
-different ways, and two of the steps are interactive `/plugin` commands, so the
-install has two halves. Do both.
+Each stands alone; **full fleet control needs the CLIs (first four).** They
+install five different ways, and two of the steps are interactive `/plugin`
+commands, so the install has two halves. Do both. PingMyBell is the optional
+fifth: the one-shot detects it and points at its repo, never auto-installs it.
 
 ## Half 1 — the CLIs (one shot)
 

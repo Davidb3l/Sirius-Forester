@@ -3,10 +3,11 @@
 #
 # Sothis is the local-first suite led by Sirius Forester: the foreman (`sirius`)
 # claims work from an Ametrite board (`amt`), locks code through a Hayvenhurst
-# code graph (`hayven`), and pairs with Catryna Wikinelli (`catryna`) for the
-# "why" docs. Each tool stands alone; full fleet control comes from all four.
+# code graph (`hayven`), pairs with Catryna Wikinelli (`catryna`) for the
+# "why" docs, and rings PingMyBell (the desktop notch/voice app) when the fleet
+# needs you. Each tool stands alone; full fleet control comes from all five.
 #
-# WHY this exists: the four tools install four different ways, and the two
+# WHY this exists: the tools install five different ways, and the two
 # interactive `/plugin` steps can't run from a shell. This script is the CLI
 # half of "let's Sothis this up" — it installs the binaries the plugins can't
 # ship, then hands you to the marketplace bundle for the plugin adds:
@@ -34,7 +35,7 @@
 #
 # Usage:
 #   install-sothis.sh                   # install every missing suite CLI
-#   install-sothis.sh --check           # report presence of all four; never installs
+#   install-sothis.sh --check           # report presence of all five; never installs
 #   install-sothis.sh --prefix DIR      # install binaries into DIR/bin (forwarded)
 #   install-sothis.sh --require-signature  # forwarded to sirius; abort if unverifiable
 #   install-sothis.sh --skip-hayven     # don't touch hayven (e.g. install it via its plugin)
@@ -116,7 +117,16 @@ tool_where() { # tool_where <bin> -> human location on stdout
   if have "$1"; then command -v "$1"; elif [ -x "$BIN_DIR/$1" ]; then echo "$BIN_DIR/$1 (not on PATH)"; else echo "not installed"; fi
 }
 
-# ---- --check: report all four, install nothing -----------------------------
+# ---- --check: report all five, install nothing -----------------------------
+
+# PingMyBell is a desktop app, not a PATH CLI: count it installed if the app
+# bundle exists (macOS) or a `pingmybell` binary is reachable.
+pingmybell_where() {
+  if [ -d "/Applications/PingMyBell.app" ]; then echo "/Applications/PingMyBell.app"
+  elif have pingmybell; then command -v pingmybell
+  else echo "not installed"; fi
+}
+
 if [ "$MODE" = "check" ]; then
   log "Sothis suite status:"
   for t in sirius hayven amt catryna; do
@@ -124,6 +134,8 @@ if [ "$MODE" = "check" ]; then
   done
   # catryna is a plugin, not a PATH binary; report its runtime instead.
   have bun && log "  bun (catryna runtime): $(command -v bun)" || log "  bun (catryna runtime): not installed"
+  # pingmybell is a desktop app; report the bundle.
+  log "  pingmybell (the bell): $(pingmybell_where)"
   # Exit 0 if the foreman + graph are present, 3 otherwise (mirrors the per-tool
   # --check contract so a SessionStart hook can branch on it).
   if tool_present sirius && tool_present hayven; then exit 0; fi
@@ -239,6 +251,20 @@ check_catryna() {
   fi
 }
 
+# ---- pingmybell (desktop app; detect only, never auto-install) --------------
+check_pingmybell() {
+  case "$(pingmybell_where)" in
+    "not installed")
+      log ""
+      log "pingmybell (the bell, optional): not installed. Voice callouts + a notch"
+      log "command center for the fleet — a desktop app, built from source (early"
+      log "alpha, macOS; no prebuilt releases yet):"
+      log "  https://github.com/Davidb3l/pingmybell"
+      ;;
+    *) log "pingmybell: installed ($(pingmybell_where))." ;;
+  esac
+}
+
 # ---- run --------------------------------------------------------------------
 log "install-sothis: installing the Sothis suite CLIs (prefix: $PREFIX)"
 log ""
@@ -246,6 +272,7 @@ install_sirius
 install_hayven
 check_amt
 check_catryna
+check_pingmybell
 
 # PATH hint if our install dir isn't on PATH.
 case ":$PATH:" in

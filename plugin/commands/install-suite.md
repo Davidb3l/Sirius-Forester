@@ -6,9 +6,10 @@ allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/scripts/install-sothis.sh:*)
 
 # Install the Sothis suite
 
-Sirius is the foreman of the **Sothis** suite; full fleet control comes from all
-four tools. Installing them has two halves — this command handles the CLIs; the
-marketplace bundle handles the interactive `/plugin` steps.
+Sirius is the foreman of the **Sothis** suite; full fleet control comes from the
+four CLIs, with PingMyBell (the desktop notch/voice app) as the optional fifth.
+Installing them has two halves — this command handles the CLIs; the marketplace
+bundle handles the interactive `/plugin` steps.
 
 Run the bundled one-shot. It installs every missing suite CLI by delegating to
 each tool's own authoritative installer (sirius verifies a Sigstore signature,
@@ -42,6 +43,9 @@ After it finishes:
   asking Claude to "ametrite this repo" (the ametrite skill bootstraps `amt`).
 - If it warned that **`bun` is missing**, relay it — the Catryna MCP server runs
   on bun.
+- If it noted **pingmybell not installed**, mention it once as optional — the
+  bell (voice callouts + notch board) is a desktop app built from source at
+  https://github.com/Davidb3l/pingmybell; never attempt to install it yourself.
 - If the script **fetched and ran hayven's installer over HTTPS** (no local copy
   found), that's expected; but if a download, checksum, or **signature
   verification failed**, report the exact error and stop — never work around a

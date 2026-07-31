@@ -26,9 +26,11 @@ the `.sha256`, and put `sirius.exe` on your `PATH`.
 Sirius is the **foreman** of **Sothis**, the local-first suite: it claims work
 from an [Ametrite](https://github.com/Davidb3l/Ametrite) board, locks code
 through a [Hayvenhurst](https://github.com/Davidb3l/Hayvenhurst-dev) code graph,
-and pairs with [Catryna Wikinelli](https://github.com/Davidb3l/Catryna-Wikinelli)
-for living "why" docs. Each tool stands alone, but full fleet control comes from
-running all four.
+pairs with [Catryna Wikinelli](https://github.com/Davidb3l/Catryna-Wikinelli)
+for living "why" docs, and rings
+[PingMyBell](https://github.com/Davidb3l/pingmybell) — the optional desktop
+notch/voice app — when the fleet needs you. Each tool stands alone, but full
+fleet control comes from running the four CLIs.
 
 Installing the suite has two halves. **The plugins** — this marketplace is a
 bundle: one add exposes all three (Ametrite's `amt` is a CLI bootstrapped by its
