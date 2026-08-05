@@ -173,8 +173,11 @@ print_plugin_handoff_block() {
   case "$ph" in *hayvenhurst-plugin*) log "    /plugin install hayvenhurst@sirius-forester" ;; esac
   case "$ph" in *catryna-plugin*)     log "    /plugin install catryna@sirius-forester" ;; esac
   log ""
-  log "  Run those in Claude Code (they are interactive — a script cannot run"
-  log "  them for you), then confirm with:  sirius doctor"
+  log "  Run those in an INTERACTIVE Claude Code session — the \`claude\` CLI in a"
+  log "  terminal. (/plugin is a terminal dialog; it is not available in every"
+  log "  Claude surface, e.g. the desktop app, and no script can run it for you.)"
+  log "  Plugins are per-machine, so once added there they work everywhere."
+  log "  Then confirm with:  sirius doctor"
   log "============================================================================"
 }
 
