@@ -1,0 +1,53 @@
+---
+id: sf-sub-bridge
+title: "The Bridge — sirius link / sirius why"
+path: "subsystems/provenance-bridge"
+tags: ["provenance", "bridge", "rust"]
+relatedFiles: ["src/bridge.rs"]
+anchors: []
+evidence: []
+refs: []
+verifiedCommit: "a7f3a16d384efc451e8c6e25f4823453a64ccf8d"
+verifiedAt: "2026-08-05T07:42:02.491Z"
+driftSuspectSince: ""
+driftSuspectReason: ""
+createdAt: 1785915503544
+updatedAt: 1785915503544
+createdBy: "claude-code"
+---
+
+# The Bridge
+
+Two-way provenance: after work lands, the issue knows which code it touched **and** the code knows which issue touched it. Without both directions you can answer "what did AMT-7 change?" but not "why does this function look like this?", which is the question that actually costs time six months later.
+
+## Two writes, two stores
+
+| Direction | Write | Lands in |
+|---|---|---|
+| **Forward** | `amt issue comment` naming the entity ids touched | Ametrite |
+| **Reverse** | `hayven remember --kind decision --node <id> --scope <ids>` on each touched node, naming the `AMT-n` / `D-n` ref | Hayvenhurst fleet memory |
+
+Both outcomes are recorded independently in the ledger as `forward_ok` and `reverse_ok`. A half-landed stamp is stored honestly as exactly that — see [subsystems/ledger](./ledger).
+
+That independence is load-bearing in a specific real case: when the Hayvenhurst daemon on `:7777` is bound to a *different* project than the current workspace, forward stamping still lands while reverse stamping reports `reverse_ok: false`. The receipt records the truth rather than failing the whole operation.
+
+`remember_with_retry` gives the reverse write a second chance before recording failure.
+
+## `sirius link`
+
+```
+sirius link AMT-7 --symbols a,b,c --json
+sirius link AMT-7 --changed [--range <git-range>] --json
+sirius link --decision D-3 --symbols ... --json
+```
+
+`--changed` resolves the symbols from a git range instead of an explicit list (default: working tree vs HEAD). `LinkKind` distinguishes `issue` from `decision`; both produce a `LinkReceipt` and a `receipts` row.
+
+## `sirius why`
+
+Two shapes, dispatched on the target:
+
+- **`sirius why <symbol>`** — recalls fleet memory for that node and resolves the `AMT-n` / `D-n` references it finds, returning the issues and decisions behind the code.
+- **`sirius why AMT-n`** — reads the issue activity and returns the symbols and decisions attached to it.
+
+`extract_refs` parses `AMT-n` / `D-n` out of note text and `extract_symbols_from_comment` recovers entity ids from the forward comment, so `why` works off what was actually written rather than requiring a side index.

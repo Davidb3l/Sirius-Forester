@@ -1,0 +1,72 @@
+---
+id: sf-sub-loop
+title: "The Loop — sirius run"
+path: "subsystems/loop"
+tags: ["loop", "rust", "coordination", "claims"]
+relatedFiles: ["src/run.rs"]
+anchors: [{"file":"src/ledger.rs","symbol":"count_policy_events"}]
+evidence: []
+refs: []
+verifiedCommit: "a7f3a16d384efc451e8c6e25f4823453a64ccf8d"
+verifiedAt: "2026-08-05T07:54:37.735Z"
+driftSuspectSince: ""
+driftSuspectReason: ""
+createdAt: 1785915503544
+updatedAt: 1785916461329
+createdBy: "claude-code"
+---
+
+# The Loop
+
+`sirius run --workers N --agent-cmd "<cmd>"` drives the fleet. One iteration is eight phases, and `run_iteration` is deterministic and fully mockable — the loop's correctness properties are tested through it without a live `amt`, `hayven`, or agent.
+
+```
+claim → map → lock → brief → work → gate → receipt → release
+```
+
+Those eight strings are the `PHASES` constant and appear verbatim in the NDJSON `phase` field. `sirius run --json` streams one JSON object per line to stdout.
+
+## Claim order is law
+
+**Ametrite issue first, Hayvenhurst entities second; release in reverse.**
+
+On a hard entity overlap (409), the issue is released back with a comment naming the blocker. Sirius never holds an issue while spinning on a code lock — that is the rule that keeps a stuck worker from parking work nobody else can take.
+
+`lock_entities` walks the entity list in order, accumulating `acquired` claim ids. On any failure it returns without releasing anything; the caller unwinds. `LockResult` carries three shapes: `Locked { claim_ids, verdicts }`, `Overlap { blocker, acquired }`, and `OracleBackoff { detail, acquired }`.
+
+The `verdicts` vector is parallel to `claim_ids` and records how each claim was actually obtained — `"registered"` (clean) or `"forced"` (oracle-conflicted, then forced under `Oracle202::ForceWithBudget`). It is written to the ledger verbatim rather than fabricating a uniform `"registered"` vector.
+
+## Two failure modes that used to be silent
+
+Both were fixed and both are worth knowing, because the naive version of each looks like it works:
+
+**A `Registered` verdict with no claim id is treated as a claim failure.** The daemon can register a claim and hand back nothing releasable. Pushing the entity *name* as a stand-in id — the old behavior — makes the later `hayven release` silently fail and leaks the lease. Sirius now unwinds instead: it never manages a lease it cannot release.
+
+**Releases are retried and logged.** `release_entity_checked` and `release_issue_checked` both retry with exponential backoff, and on final failure shout to stderr **and** write a `release_failure` policy event. The earlier `let _ = amt.release(...)` swallowed failures, leaving an issue silently locked to a dead worker. A leaked lock is never silent now.
+
+## Adaptive claiming
+
+`claim_decision` picks between `PreClaim` and `RelyOnGate`:
+
+| `claim_mode` | Behavior |
+|---|---|
+| `always` | always pre-claim entities before work |
+| `never` | never pre-claim; rely on the gate to catch collisions |
+| `adaptive` *(default)* | read contention from ledger history |
+
+Adaptive counts recent `backoff_409` policy events: **2 or more** within the last **20** sampled events flips it to `PreClaim` (`ADAPTIVE_409_THRESHOLD`, `ADAPTIVE_WINDOW`). Contention is sensed from what actually happened, not configured up front.
+
+## Iteration outcomes
+
+`IterationOutcome` is one of `NoWork { retry_after }`, `Completed`, `ReleasedOverlap`, `Deadend` (retry budget exhausted, deadend note filed), or `Error(String)`. Each pass writes exactly one `iterations` row.
+
+## Two output streams, deliberately separate
+
+- **NDJSON on stdout** — iteration phases, for whoever is watching the run.
+- **The suite spine** (`.suite/`) — past-tense `job.*` / `gate.*` / `receipt.*` facts for other tools.
+
+They have different vocabularies on purpose, so they never collide. The spine is optional (`None` disables it, as in tests) and best-effort. See [subsystems/suite-spine](./suite-spine).
+
+## Reading the amt claim shape
+
+`amt claim` does not return `{claimed: bool}` on success — it returns the full issue object. `issue_id` keys success off the presence of `id`; the no-work shape is `{"claimed": false, "retry_after": N, ...}`. This delta is recorded in [`CONTRACTS.md` §6](../../CONTRACTS.md).

@@ -1,0 +1,69 @@
+---
+id: sf-sub-spine
+title: "The Suite Spine — .suite/events"
+path: "subsystems/suite-spine"
+tags: ["spine", "events", "rust", "suite"]
+relatedFiles: ["src/spine.rs"]
+anchors: []
+evidence: []
+refs: []
+verifiedCommit: "a7f3a16d384efc451e8c6e25f4823453a64ccf8d"
+verifiedAt: "2026-08-05T07:42:02.504Z"
+driftSuspectSince: ""
+driftSuspectReason: ""
+createdAt: 1785915503544
+updatedAt: 1785915503544
+createdBy: "claude-code"
+---
+
+# The Suite Spine
+
+A per-repo, append-only notification log at `<repo-root>/.suite/events/<UTC-date>.jsonl`. Sirius is one of four tools that append here — `amt`, `hayven`, `sirius`, `catryna`.
+
+The spine is **never a source of truth**. The ledger is. The spine only tells the other tools what happened.
+
+## Lock-free by construction
+
+Two guarantees make multi-writer appends safe without any locking:
+
+1. One whole line per event, appended with a single `O_APPEND` write.
+2. Every line is **strictly** under 4096 bytes — `PIPE_BUF` on Linux and macOS — so the append is atomic and concurrent workers never interleave.
+
+The bound counts the trailing newline. `build_line` checks `line.len() + 1 >= MAX_LINE_BYTES`, not `>`, and a test sweeps payload widths from 60 to 200 symbols specifically to hit the boundary where an off-by-one would let a 4096-byte line escape.
+
+## Truncation is two-stage, and the order matters
+
+When a line would breach the bound:
+
+1. **Drop `data`, keep `refs`.** Bulky detail belongs in Sirius's own store anyway, while the refs are short suite URIs — so a truncated `receipt.filed` still says *which issue and which receipt* it was about. That is the whole point of the staging.
+2. **If the refs themselves are enormous, drop those too.** The atomicity bound is a hard guarantee and holds unconditionally.
+
+Either way the surviving line carries `data: {"truncated": true}`.
+
+## Envelope
+
+```json
+{
+  "v": 1,
+  "id": "<uuid-v4>",
+  "ts": "2026-07-11T00:00:00.000Z",
+  "source": "sirius",
+  "type": "receipt.filed",
+  "refs": ["sirius:receipt/42", "amt:issue/AMT-7"],
+  "data": { }
+}
+```
+
+Ref helpers mint the suite URIs: `issue_ref` → `amt:issue/<key>`, `worker_ref` → `sirius:worker/<name>`, `receipt_ref` → `sirius:receipt/<rowid>`. Foreign schemes are treated opaquely by consumers.
+
+## The id is not cryptographic, on purpose
+
+`new_uuid_v4` produces a UUIDv4-*shaped* id whose only job is per-event uniqueness so a consumer can dedup on replay. It seeds splitmix64 from wall-clock nanos, the pid, and a per-process atomic counter — so two events never collide within a process (the counter) or across concurrent processes on one repo (pid + nanos). A test asserts 5,000 emits produce no collision. No `uuid` crate is pulled in.
+
+## Emission never fails the operation
+
+Any failure — no disk, no permission, an oversized payload — is printed to stderr and swallowed. The spine must never fail the operation whose fact it is reporting.
+
+<Callout type="info">
+`.suite/` is git-ignored in this repo. That matters beyond tidiness: `catryna drift` warns when the working tree is dirty, and a tracked `.suite/` would make every run report dirt the tools themselves had just created.
+</Callout>

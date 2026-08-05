@@ -1,0 +1,53 @@
+---
+id: sf-sub-ledger
+title: "The Ledger — .sirius/sirius.db"
+path: "subsystems/ledger"
+tags: ["ledger", "sqlite", "rust", "storage"]
+relatedFiles: ["src/ledger.rs"]
+anchors: []
+evidence: []
+refs: []
+verifiedCommit: "a7f3a16d384efc451e8c6e25f4823453a64ccf8d"
+verifiedAt: "2026-08-05T07:42:02.453Z"
+driftSuspectSince: ""
+driftSuspectReason: ""
+createdAt: 1785915503544
+updatedAt: 1785915503544
+createdBy: "claude-code"
+---
+
+# The Ledger
+
+`.sirius/sirius.db` is Sirius's **only** write target. SQLite in WAL mode, `PRAGMA user_version` = `SCHEMA_VERSION` (currently `1`). Created by `sirius init`; read read-only by the console.
+
+It is an **audit log, not a second brain** — delete it and no work is lost, only the trail of how it happened. It is git-ignored and branch-invariant, because the ledger is a fact about work, not a code snapshot.
+
+The authoritative schema DDL is [`CONTRACTS.md` §1](../../CONTRACTS.md); `apply_schema` in `src/ledger.rs` is what actually runs.
+
+## Five tables
+
+| Table | Holds |
+|---|---|
+| `meta` | `schema_version`, `created_at`, `sirius_version` |
+| `workers` | one row per worker id (`sirius/oak`), with `status` and `last_seen_at` |
+| `iterations` | one row per loop pass: issue, entities, outcome, gate result, oracle verdicts, tokens, duration, receipt |
+| `receipts` | provenance stamps — `kind` (`issue`/`decision`), `ref`, `symbols`, `forward_ok`, `reverse_ok` |
+| `policy_events` | why the policy engine did what it did |
+
+`receipts` is created **before** `iterations` in `apply_schema`, because `iterations.receipt_id` references it and foreign keys are ON.
+
+## The write API
+
+- `upsert_worker(id, status)` — insert-or-refresh, so a worker rejoining updates `last_seen_at` rather than erroring.
+- `start_iteration(worker, issue)` → row id; `finish_iteration(...)` fills in outcome, gate result, oracle verdicts, tokens, duration, receipt. Two calls, one row.
+- `insert_receipt(kind, ref, symbols, forward_ok, reverse_ok, worker)` → row id. `forward_ok` / `reverse_ok` are stored independently, so a half-landed stamp is recorded honestly rather than as a success or a failure.
+- `log_policy_event(iteration_id, kind, detail)` — `detail` is arbitrary JSON.
+- `count_policy_events(kind, limit)` — counts within the most recent `limit` events of that kind. This is what adaptive claiming reads to sense contention; see [subsystems/loop](./loop).
+
+## Read API for the console
+
+`schema_version()`, `meta(key)`, and `data_version()` are marked `#[allow(dead_code)]` — they are the read surface the console consumes over WAL, not called by the CLI itself. `data_version()` wraps `PRAGMA data_version`, which bumps on any external write; the console polls it to drive SSE updates without a filesystem watcher.
+
+## No chrono
+
+`now_iso8601()` / `format_iso8601()` implement the civil-from-days algorithm by hand rather than pull in `chrono`, which is outside the allowed crate set (`rusqlite`, `serde`, `serde_json`, `clap`, `regex`). Both are unit-tested against the epoch and a known 2026 timestamp.

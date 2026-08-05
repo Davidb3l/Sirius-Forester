@@ -1,0 +1,60 @@
+---
+id: 96301a4d-3f3f-4a18-b40e-f5f3366b9596
+title: "The Console & Suite Hub — web/"
+path: "subsystems/web-console"
+tags: ["console", "hub", "web", "bun", "suite"]
+relatedFiles: ["web/src/server.ts", "web/src/hub.ts", "web/src/discovery.ts", "web/src/api.ts", "web/src/sse.ts", "web/src/stores.ts", "web/src/ledger.ts", "web/src/sirius.ts", "web/src/db.ts", "web/src/schema.ts", "web/src/config.ts"]
+anchors: []
+evidence: []
+refs: []
+verifiedCommit: "a7f3a16d384efc451e8c6e25f4823453a64ccf8d"
+verifiedAt: "2026-08-05T07:54:35.428Z"
+driftSuspectSince: ""
+driftSuspectReason: ""
+createdAt: 1785916441493
+updatedAt: 1785916441493
+createdBy: "claude-code"
+---
+
+# The Console & Suite Hub
+
+`web/` is a zero-npm-dependency Bun app holding **two** subsystems: the **Sirius Console** (the fleet dashboard) and the **Suite Hub** (the one page that fronts every suite tool). They share a folder and a style — vanilla TS, `Bun.serve`, no framework — but have different jobs and different rules.
+
+## The one invariant
+
+**The Console never writes any SQLite.** It reads the three stores read-only (`web/src/db.ts` opens everything read-only), and its ONLY mutation path is shelling `sirius <cmd> --json` through `web/src/sirius.ts`. That keeps the write-path story identical everywhere: one write path per store, and the console owns none of them — see [architecture/overview](../architecture/overview).
+
+## The Console
+
+| File | Role |
+|---|---|
+| `web/src/server.ts` | `Bun.serve` HTTP server — routes, static assets |
+| `web/src/api.ts` | Pure JSON payload assembly over Ledger + ParentStores; unit-testable against fixtures |
+| `web/src/ledger.ts` | Typed read queries over the ledger (CONTRACTS.md §1) |
+| `web/src/stores.ts` | Best-effort enrichment from parent stores — probes defensively, degrades to bare refs |
+| `web/src/sirius.ts` | The ONLY place that shells the `sirius` binary; maps exit 3 to a non-error "blocked" |
+| `web/src/sse.ts` | Live updates: one shared `PRAGMA data_version` poller drives all SSE client streams |
+| `web/src/db.ts` | Read-only SQLite opens for all three stores |
+| `web/src/schema.ts` | Ledger DDL copy — used only by the fixture seeder/tests |
+| `web/src/config.ts` | Read-only `.sirius/config.json` reader (absent ⇒ defaults) |
+
+Two details worth knowing:
+
+- **Live updates cost ~nothing on an idle fleet.** `sse.ts` polls `PRAGMA data_version`, which bumps on any external write; clients are only notified on change. This is the proven Ametrite pattern, and it is why there is no filesystem watcher.
+- **Parent schemas are treated as opaque.** CONTRACTS.md pins the *ledger* schema, not Ametrite's or Hayvenhurst's internals. `stores.ts` probes for recognizable shapes and degrades gracefully; the authoritative runtime source for issue/symbol detail is `sirius why --json`.
+- **Input rejection happens at the argv boundary.** `sirius.ts` validates refs/tiers/statuses before anything reaches a shell; the server maps rejections to HTTP 400.
+
+## The Suite Hub (`:6969`)
+
+`web/src/hub.ts` + `web/src/discovery.ts`. One page that discovers every installed suite tool and switches between their UIs.
+
+Two rules, from CONSOLE_V2's *"the deck owns no state"* and SUITE_CONTRACTS §3.2:
+
+1. **The hub owns no state.** It probes each tool's `<tool> doctor --json` (the §3 discovery handshake), classifies ABSENT vs present-but-unhealthy (§3.1 — absence is a state, not an error), and renders the roster. No database, no cache beyond seconds of memoization.
+2. **The hub is a shell, not a proxy.** It frames or links each tool's own UI at that tool's own port (the §3.2 `ui` capability). It never reverse-proxies, rewrites paths, or moves anybody's port.
+
+`discovery.ts` pins the tool ids to their CLI names, mirroring the §3 registry.
+
+## Frontend
+
+Static assets in `web/public/` (`app.js`, `hub.js`, `stars.js`) — hand-written JS served as-is, no bundler. Fixtures for tests live in `web/fixtures/` with a seeder that produces a ledger byte-shaped like `sirius init`'s.

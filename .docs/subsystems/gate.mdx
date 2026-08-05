@@ -1,0 +1,79 @@
+---
+id: sf-sub-gate
+title: "The Gate — select, doubt, run, verdict"
+path: "subsystems/gate"
+tags: ["gate", "tests", "rust", "safety"]
+relatedFiles: ["src/gate.rs"]
+anchors: [{"file":"src/config.rs","symbol":"GateConfig"}]
+evidence: []
+refs: []
+verifiedCommit: "a7f3a16d384efc451e8c6e25f4823453a64ccf8d"
+verifiedAt: "2026-08-05T07:42:02.440Z"
+driftSuspectSince: ""
+driftSuspectReason: ""
+createdAt: 1785915503544
+updatedAt: 1785915503544
+createdBy: "claude-code"
+---
+
+# The Gate
+
+`sirius gate AMT-n` decides whether an issue may advance. It exists because of one discovery, recorded in `src/gate.rs`'s own header:
+
+> **`hayven affected-tests` is a SELECTOR, not a runner.** Its exit code means "selection computed", never "the tests pass".
+
+A gate keyed on that exit code passes with **zero tests executed** — and both real gate runs to date did exactly that (`roots` matched, `tests: []`, exit 0). So Sirius owns the run-the-tests half itself.
+
+## The five steps
+
+1. Resolve changed files from a git range (`src/gitrange.rs`; default working tree vs HEAD).
+2. Ask `hayven affected-tests --changed <files> --json` which tests those files can affect.
+3. Decide whether that selection can be **trusted to be complete**.
+4. Run the chosen tests via `gate.test_cmd`.
+5. Take the verdict from the **test runner's** exit code.
+
+The governing rule is *"ran too much, never missed a test."*
+
+## The trust bar
+
+`decide_plan` is pure and unit-tested. A narrow (subset) run requires **all** of:
+
+- the selector command succeeded and its stdout parsed as JSON (`sel.ok`)
+- at least one changed file mapped to an indexed entity (`roots > 0`)
+- there is at least one runnable test id
+- the selector's own `note` raises no under-reporting flag
+- **no global-impact file changed**
+
+Anything short of all of that is *doubt*, and doubt defers to `gate.fallback`.
+
+`note_is_suspect` matches the selector's self-reported caveats: `stale`, `cold`, `under-report`, `under report`, `under_report`, `no traces`, `may under`. This matters in practice — an untraced index emits `"no traces yet — static only, may UNDER-report"`, and that alone forces the full suite even when the selection looks narrow and healthy.
+
+`is_global_impact` forces a full run for any changed file under `.github/`, or named `Cargo.toml`, `Cargo.lock`, `build.rs`, `package.json`, `package-lock.json`, `bun.lockb`, `tsconfig.json`, `conftest.py`, `pyproject.toml`, `setup.py`, `setup.cfg`, `tox.ini`, `pytest.ini`, or beginning `requirements`. These are files whose blast radius a static graph cannot bound.
+
+## Plans and fallback
+
+`GatePlan` has four shapes: `Subset(ids, reason)`, `Full(reason)`, `Block(reason)`, `WarnPass(reason)`. Under doubt, `gate.fallback` picks between the last three:
+
+| `gate.fallback` | Behavior under doubt |
+|---|---|
+| `full-suite` *(default)* | Run everything. The only safe posture. |
+| `fail` | Block rather than run everything — for suites too slow to run in full. |
+| `pass-with-warning` | Advance anyway, explicitly opting into the miss risk. |
+
+`pass-with-warning` files an Ametrite comment saying it advanced **without running tests**, so the choice is visible on the board rather than silent.
+
+## Fail-closed
+
+With no `gate.test_cmd` configured, a plan that requires running tests yields `plan: "unconfigured"` and does **not** pass. The gate refuses to bless code it could not test — asserted by `execute_without_test_cmd_fails_closed`, which also checks that no command was run at all.
+
+## Outcome
+
+On pass: `amt issue update --status <target>` advances the issue. On fail: the failure is filed as an issue comment (last 20 non-empty lines of combined stdout/stderr) and the status is left untouched. Either way a `gate_tier` policy event lands in the ledger.
+
+<Callout type="warning">
+**Naming wart worth knowing.** `GateOutcome.tests_selected` is populated from `GateVerdict.tests_run`, not from the size of the selection — its own doc comment says "Count of tests actually run (0 for a full-suite run — the runner decides)". A full-suite run therefore reports `tests_selected: 0` while having run the entire suite. `CONTRACTS.md` §2 documents the field by its name. Read `plan` and `ran_tests` for the truth.
+</Callout>
+
+## Where the rationale lives
+
+The decision record is SIRF-5 / D-3, summarized in [`CONTRACTS.md` §6](../../CONTRACTS.md) under the Hayvenhurst deltas. That section was verified against `hayven 0.0.5`; the installed daemon is now newer, so treat its flag-level claims as needing a re-check rather than as current fact.

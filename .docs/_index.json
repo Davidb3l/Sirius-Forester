@@ -1,0 +1,218 @@
+{
+  "version": 1,
+  "docs": [
+    {
+      "id": "sf-arch-overview",
+      "path": "architecture/overview",
+      "title": "Architecture Overview",
+      "tags": [
+        "architecture",
+        "rust",
+        "suite"
+      ],
+      "relatedFiles": [
+        "src/main.rs",
+        "src/cli.rs",
+        "src/workspace.rs"
+      ],
+      "anchors": [],
+      "evidence": [],
+      "refs": [],
+      "verifiedCommit": "a7f3a16d384efc451e8c6e25f4823453a64ccf8d",
+      "verifiedAt": "2026-08-05T07:42:02.425Z",
+      "driftSuspectSince": "",
+      "driftSuspectReason": "",
+      "createdAt": 1785915503544,
+      "updatedAt": 1785915503544,
+      "createdBy": "claude-code"
+    },
+    {
+      "id": "sf-sub-gate",
+      "path": "subsystems/gate",
+      "title": "The Gate — select, doubt, run, verdict",
+      "tags": [
+        "gate",
+        "tests",
+        "rust",
+        "safety"
+      ],
+      "relatedFiles": [
+        "src/gate.rs"
+      ],
+      "anchors": [
+        {
+          "file": "src/config.rs",
+          "symbol": "GateConfig"
+        }
+      ],
+      "evidence": [],
+      "refs": [],
+      "verifiedCommit": "a7f3a16d384efc451e8c6e25f4823453a64ccf8d",
+      "verifiedAt": "2026-08-05T07:42:02.440Z",
+      "driftSuspectSince": "",
+      "driftSuspectReason": "",
+      "createdAt": 1785915503544,
+      "updatedAt": 1785915503544,
+      "createdBy": "claude-code"
+    },
+    {
+      "id": "sf-sub-ledger",
+      "path": "subsystems/ledger",
+      "title": "The Ledger — .sirius/sirius.db",
+      "tags": [
+        "ledger",
+        "sqlite",
+        "rust",
+        "storage"
+      ],
+      "relatedFiles": [
+        "src/ledger.rs"
+      ],
+      "anchors": [],
+      "evidence": [],
+      "refs": [],
+      "verifiedCommit": "a7f3a16d384efc451e8c6e25f4823453a64ccf8d",
+      "verifiedAt": "2026-08-05T07:42:02.453Z",
+      "driftSuspectSince": "",
+      "driftSuspectReason": "",
+      "createdAt": 1785915503544,
+      "updatedAt": 1785915503544,
+      "createdBy": "claude-code"
+    },
+    {
+      "id": "sf-sub-loop",
+      "path": "subsystems/loop",
+      "title": "The Loop — sirius run",
+      "tags": [
+        "loop",
+        "rust",
+        "coordination",
+        "claims"
+      ],
+      "relatedFiles": [
+        "src/run.rs"
+      ],
+      "anchors": [
+        {
+          "file": "src/ledger.rs",
+          "symbol": "count_policy_events"
+        }
+      ],
+      "evidence": [],
+      "refs": [],
+      "verifiedCommit": "a7f3a16d384efc451e8c6e25f4823453a64ccf8d",
+      "verifiedAt": "2026-08-05T07:54:37.735Z",
+      "driftSuspectSince": "",
+      "driftSuspectReason": "",
+      "createdAt": 1785915503544,
+      "updatedAt": 1785916461329,
+      "createdBy": "claude-code"
+    },
+    {
+      "id": "sf-sub-config",
+      "path": "subsystems/policy-config",
+      "title": "Policy config — .sirius/config.json",
+      "tags": [
+        "config",
+        "policy",
+        "rust"
+      ],
+      "relatedFiles": [
+        "src/config.rs"
+      ],
+      "anchors": [],
+      "evidence": [],
+      "refs": [],
+      "verifiedCommit": "a7f3a16d384efc451e8c6e25f4823453a64ccf8d",
+      "verifiedAt": "2026-08-05T07:42:02.479Z",
+      "driftSuspectSince": "",
+      "driftSuspectReason": "",
+      "createdAt": 1785915503544,
+      "updatedAt": 1785915503544,
+      "createdBy": "claude-code"
+    },
+    {
+      "id": "sf-sub-bridge",
+      "path": "subsystems/provenance-bridge",
+      "title": "The Bridge — sirius link / sirius why",
+      "tags": [
+        "provenance",
+        "bridge",
+        "rust"
+      ],
+      "relatedFiles": [
+        "src/bridge.rs"
+      ],
+      "anchors": [],
+      "evidence": [],
+      "refs": [],
+      "verifiedCommit": "a7f3a16d384efc451e8c6e25f4823453a64ccf8d",
+      "verifiedAt": "2026-08-05T07:42:02.491Z",
+      "driftSuspectSince": "",
+      "driftSuspectReason": "",
+      "createdAt": 1785915503544,
+      "updatedAt": 1785915503544,
+      "createdBy": "claude-code"
+    },
+    {
+      "id": "sf-sub-spine",
+      "path": "subsystems/suite-spine",
+      "title": "The Suite Spine — .suite/events",
+      "tags": [
+        "spine",
+        "events",
+        "rust",
+        "suite"
+      ],
+      "relatedFiles": [
+        "src/spine.rs"
+      ],
+      "anchors": [],
+      "evidence": [],
+      "refs": [],
+      "verifiedCommit": "a7f3a16d384efc451e8c6e25f4823453a64ccf8d",
+      "verifiedAt": "2026-08-05T07:42:02.504Z",
+      "driftSuspectSince": "",
+      "driftSuspectReason": "",
+      "createdAt": 1785915503544,
+      "updatedAt": 1785915503544,
+      "createdBy": "claude-code"
+    },
+    {
+      "id": "96301a4d-3f3f-4a18-b40e-f5f3366b9596",
+      "path": "subsystems/web-console",
+      "title": "The Console & Suite Hub — web/",
+      "tags": [
+        "console",
+        "hub",
+        "web",
+        "bun",
+        "suite"
+      ],
+      "relatedFiles": [
+        "web/src/server.ts",
+        "web/src/hub.ts",
+        "web/src/discovery.ts",
+        "web/src/api.ts",
+        "web/src/sse.ts",
+        "web/src/stores.ts",
+        "web/src/ledger.ts",
+        "web/src/sirius.ts",
+        "web/src/db.ts",
+        "web/src/schema.ts",
+        "web/src/config.ts"
+      ],
+      "anchors": [],
+      "evidence": [],
+      "refs": [],
+      "verifiedCommit": "a7f3a16d384efc451e8c6e25f4823453a64ccf8d",
+      "verifiedAt": "2026-08-05T07:54:35.428Z",
+      "driftSuspectSince": "",
+      "driftSuspectReason": "",
+      "createdAt": 1785916441493,
+      "updatedAt": 1785916441493,
+      "createdBy": "claude-code"
+    }
+  ],
+  "lastUpdated": 1785916477735
+}

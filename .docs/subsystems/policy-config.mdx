@@ -1,0 +1,57 @@
+---
+id: sf-sub-config
+title: "Policy config — .sirius/config.json"
+path: "subsystems/policy-config"
+tags: ["config", "policy", "rust"]
+relatedFiles: ["src/config.rs"]
+anchors: []
+evidence: []
+refs: []
+verifiedCommit: "a7f3a16d384efc451e8c6e25f4823453a64ccf8d"
+verifiedAt: "2026-08-05T07:42:02.479Z"
+driftSuspectSince: ""
+driftSuspectReason: ""
+createdAt: 1785915503544
+updatedAt: 1785915503544
+createdBy: "claude-code"
+---
+
+# Policy config
+
+`.sirius/config.json` is the policy engine. An **absent file means committed defaults**; a malformed one is a hard error rather than a silent fallback. A partial file fills the rest from defaults, so you only write the knobs you are changing. `sirius` reads it; the console displays it read-only.
+
+`Config::default_json()` pretty-prints the defaults and is what `sirius init` writes.
+
+## The knobs, as the struct actually defines them
+
+| Field | Default | Meaning |
+|---|---|---|
+| `claim_order_enforced` | `true` | issue first, entities second |
+| `backoff_409.strategy` | `"release_and_comment"` | the only strategy the loop honors today |
+| `backoff_409.base_ms` / `max_ms` | `500` / `8000` | exponential, clamped — see below |
+| `oracle_202` | `back-off` | or `force-with-budget` |
+| `gate_tier` | `"safe"` | recorded in the ledger and `--json` |
+| `target_status` | `"in_review"` | where a passing gate advances an issue |
+| `retry_budget` | `3` | before an iteration is a deadend |
+| `worker_concurrency` | `3` | |
+| `claim_mode` | `adaptive` | `always` / `never` / `adaptive` |
+| `gate.test_cmd` | *unset* | full-suite command, run via `sh -c`. Unset ⇒ fail-closed |
+| `gate.fallback` | `full-suite` | `fail` / `pass-with-warning` also available |
+| `agent_timeout_secs` | `1800` | hard wall-clock cap on one agent run |
+| `lease_ttl_secs` | `900` | amt/hayven lease TTL |
+
+`backoff_delay_ms(attempt)` is `base << attempt`, clamped to `max_ms`: 500, 1000, 2000, 4000, 8000, then flat.
+
+## The timeout / lease relationship is deliberately counter-intuitive
+
+`agent_timeout_secs` (1800) **exceeds** `lease_ttl_secs` (900), and that is correct. The loop renews both leases every `heartbeat_interval_secs()` = `lease_ttl_secs / 3` (floored at 1s, so 300s by default) for as long as the agent runs, so the lease never lapses mid-run however long the cap is.
+
+The invariant that actually matters is **`heartbeat_interval_secs < lease_ttl_secs`**, not `timeout < lease_ttl`. The timeout only bounds a hung or runaway agent; on expiry the agent process is killed and the iteration fails with a release and a deadend note.
+
+## Removed knob
+
+`force_budget_tokens` was removed (SIRF-9): the loop cannot meter an agent's token spend, so the knob was never read and the `ForceWithBudget` path forces unconditionally. The `Oracle202::ForceWithBudget` variant and its behavior are unchanged — only the unused dial is gone.
+
+<Callout type="warning">
+[`CONTRACTS.md` §3](../../CONTRACTS.md) shows an older shape of this file. It omits `gate` (`test_cmd`, `fallback`), `agent_timeout_secs`, and `lease_ttl_secs`, all of which `Config` defines today. Treat `src/config.rs` as ground truth for the shape and CONTRACTS §3 as the record of intent.
+</Callout>

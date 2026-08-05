@@ -14,6 +14,10 @@ bench/fixtures/*.db-*
 # Suite event spine — local telemetry, per SUITE_CONTRACTS §2 ("SHOULD gitignore")
 .suite/
 
+# Per-machine MCP config (absolute local path to the Catryna server) — each
+# clone points at its own install; never commit a personal path.
+.mcp.json
+
 # Private strategy docs — kept local only, never in the public repo.
 # (Working copies live outside the repo in ../sirius-private-docs/)
 /PRD.md
