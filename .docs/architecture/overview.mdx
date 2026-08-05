@@ -7,10 +7,10 @@ relatedFiles: ["src/main.rs", "src/cli.rs", "src/workspace.rs"]
 anchors: []
 evidence: []
 refs: []
-verifiedCommit: "dc56b56a30d7fda1dc4ece639f126df97d3ae345"
-verifiedAt: "2026-08-05T08:10:35.397Z"
-driftSuspectSince: ""
-driftSuspectReason: ""
+verifiedCommit: "da259806d8a3c72a5b6c27e68c8383b458387f60"
+verifiedAt: "2026-08-05T16:53:42.114Z"
+driftSuspectSince: "2026-08-05T16:54:22.561Z"
+driftSuspectReason: "code.changed touched src/main.rs"
 createdAt: 1785915503544
 updatedAt: 1785915503544
 createdBy: "claude-code"
@@ -18,7 +18,7 @@ createdBy: "claude-code"
 
 # Architecture Overview
 
-Sirius Forester is a **local-first fleet foreman for AI coding agents** — a Rust CLI that claims work from Ametrite, locks the code it will touch in Hayvenhurst, runs an agent against it, gates the result on real tests, and stamps two-way provenance. Roughly 6,600 lines across 14 modules in `src/`, plus a zero-dependency Bun console under `web/`.
+Sirius Forester is a **local-first fleet foreman for AI coding agents** — a Rust CLI that claims work from Ametrite, locks the code it will touch in Hayvenhurst, runs an agent against it, gates the result on real tests, and stamps two-way provenance. The code is small modules in `src/` (the map below is the complete list), plus a zero-dependency Bun console under `web/`.
 
 This doc is the map of the code. It deliberately does **not** restate the design rationale — that lives in prose already:
 
