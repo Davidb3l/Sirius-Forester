@@ -53,12 +53,24 @@ this machine's OS and CPU, verifies the checksum and the Sigstore signature,
 and installs `sirius`.
 
 **The whole suite (Sothis).** Sirius is the foreman of **Sothis** — the
-local-first suite of Sirius, Hayvenhurst, Ametrite, and Catryna Wikinelli. This
-repo's Claude Code marketplace is a bundle: `/plugin marketplace add
-Davidb3l/Sirius-Forester` exposes the `sirius`, `hayvenhurst`, and `catryna`
-plugins at once. For the CLIs, run `/sirius:install-suite` (or say "let's Sothis
-this up") — it installs every missing suite binary via each tool's own installer,
-detects `amt`, checks `bun` for Catryna, and ends with `sirius doctor`.
+local-first suite of Sirius, Hayvenhurst, Ametrite, and Catryna Wikinelli
+(plus PingMyBell, the optional bell). The install is **two halves — plugins,
+then CLIs — in this order**, because every other entry point lives inside the
+plugin you haven't installed yet:
+
+```
+1. /plugin marketplace add Davidb3l/Sirius-Forester    # works from a cold start
+2. /plugin install sirius@sirius-forester              # unlocks /sirius:* commands
+3. /plugin install hayvenhurst@sirius-forester         # skip any plugin you already
+4. /plugin install catryna@sirius-forester             #   have from its own marketplace
+5. /sirius:install-suite                               # or say "let's Sothis this up"
+```
+
+Step 5 installs every missing suite CLI via each tool's own installer, detects
+`amt`, checks `bun` for Catryna, ends with `sirius doctor` — and finishes by
+**verifying the plugin half**, so a half-done install says so loudly instead of
+looking finished. `sirius doctor` also reports the plugin half as an advisory
+check, with the exact commands to fix whatever is missing.
 
 ### Verifying what you downloaded
 
@@ -150,7 +162,10 @@ sirius init                      # creates .sirius/{sirius.db,config.json}
 sirius doctor                    # verifies the integration contracts, live
 ```
 
-`sirius doctor` checks the five facts Sirius depends on and tells you exactly
+`sirius doctor` checks the five facts Sirius depends on — plus an advisory
+`plugin_handoff` check that warns (never fails) when the Claude Code plugin
+half of the suite is missing, naming the exact `/plugin` commands to finish.
+It tells you exactly
 what is missing:
 
 ```

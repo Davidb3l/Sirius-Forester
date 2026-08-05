@@ -7,8 +7,8 @@ relatedFiles: ["src/main.rs", "src/cli.rs", "src/workspace.rs"]
 anchors: []
 evidence: []
 refs: []
-verifiedCommit: "a7f3a16d384efc451e8c6e25f4823453a64ccf8d"
-verifiedAt: "2026-08-05T07:42:02.425Z"
+verifiedCommit: "dc56b56a30d7fda1dc4ece639f126df97d3ae345"
+verifiedAt: "2026-08-05T08:10:35.397Z"
 driftSuspectSince: ""
 driftSuspectReason: ""
 createdAt: 1785915503544
@@ -55,7 +55,7 @@ Sirius never opens either parent's SQLite for writing. The console (`web/`) read
 | `src/spine.rs` | The `.suite/` append-only event log | [subsystems/suite-spine](../subsystems/suite-spine) |
 | `src/amt.rs`, `src/hayven.rs` | Thin adapters over the two parent CLIs | — |
 | `src/shell.rs` | `Runner` trait + `MockRunner`, the seam every test uses | — |
-| `src/doctor.rs` | `sirius doctor` — checks the five contract facts live | — |
+| `src/doctor.rs` | `sirius doctor` — the five contract facts live, plus an advisory `plugin_handoff` check (WARN, never gates `ok`) | — |
 | `src/gitrange.rs` | Changed-file resolution from a git range | — |
 
 ## Subcommands
@@ -64,7 +64,7 @@ Sirius never opens either parent's SQLite for writing. The console (`web/`) read
 
 ```
 sirius init            create .sirius/sirius.db beside an existing .ametrite/
-sirius doctor          check the five contract facts live
+sirius doctor          five contract facts live + plugin-handoff advisory
 sirius link <AMT-n>    stamp two-way provenance (--decision D-n for decisions)
 sirius why <target>    explain a symbol's issues/decisions, or an issue's symbols
 sirius gate <AMT-n>    select affected tests, run them, advance on pass

@@ -178,7 +178,7 @@ fn cmd_doctor(ws: &Workspace, runner: &RealRunner, json: bool) -> u8 {
         let checks: Vec<Value> = report
             .checks
             .iter()
-            .map(|c| json!({"name": c.name, "ok": c.pass, "pass": c.pass, "detail": c.detail}))
+            .map(|c| json!({"name": c.name, "ok": c.pass, "pass": c.pass, "detail": c.detail, "gating": c.gating}))
             .collect();
         print_json(&json!({
             "tool": "sirius",
@@ -191,19 +191,22 @@ fn cmd_doctor(ws: &Workspace, runner: &RealRunner, json: bool) -> u8 {
         }));
     } else {
         for c in &report.checks {
-            println!(
-                "[{}] {} — {}",
-                if c.pass { "OK" } else { "FAIL" },
-                c.name,
-                c.detail
-            );
+            // An advisory (non-gating) failure is a WARN: worth fixing, but it
+            // does not mean the contract facts drifted.
+            let tag = match (c.pass, c.gating) {
+                (true, _) => "OK",
+                (false, true) => "FAIL",
+                (false, false) => "WARN",
+            };
+            println!("[{tag}] {} — {}", c.name, c.detail);
         }
+        let advisories_warned = report.checks.iter().any(|c| !c.pass && !c.gating);
         println!(
             "{}",
-            if report.ok {
-                "all contract facts hold"
-            } else {
-                "CONTRACT DRIFT DETECTED"
+            match (report.ok, advisories_warned) {
+                (true, false) => "all contract facts hold",
+                (true, true) => "all contract facts hold (advisory warnings above)",
+                (false, _) => "CONTRACT DRIFT DETECTED",
             }
         );
     }

@@ -117,6 +117,67 @@ tool_where() { # tool_where <bin> -> human location on stdout
   if have "$1"; then command -v "$1"; elif [ -x "$BIN_DIR/$1" ]; then echo "$BIN_DIR/$1 (not on PATH)"; else echo "not installed"; fi
 }
 
+# ---- the plugin half (the audited drop-off) ---------------------------------
+# The CLIs and the Claude Code plugins install SEPARATELY, and a real machine
+# audit (2026-08-05) found every binary present with the sirius plugin never
+# installed — the printed /plugin handoff had silently dropped. So we CHECK the
+# plugin half instead of only printing instructions.
+#
+# Detection: ~/.claude/plugins/known_marketplaces.json is keyed by marketplace
+# name; installed_plugins.json v2 keys plugins as "<name>@<marketplace>". The
+# same plugin can come from DIFFERENT marketplaces (hayvenhurst@hayvenhurst vs
+# hayvenhurst@sirius-forester), so match the "<name>@ prefix, never a full key.
+# Only the bundle marketplace is matched by its exact name.
+CLAUDE_PLUGINS_DIR="${CLAUDE_PLUGINS_DIR:-$HOME/.claude/plugins}"
+
+plugin_handoff_missing() { # -> " item," list on stdout; empty = complete
+  pm_missing=""
+  grep -qs '"sirius-forester"' "$CLAUDE_PLUGINS_DIR/known_marketplaces.json" \
+    || pm_missing="$pm_missing bundle-marketplace,"
+  for p in sirius hayvenhurst catryna; do
+    grep -qs "\"$p@" "$CLAUDE_PLUGINS_DIR/installed_plugins.json" \
+      || pm_missing="$pm_missing $p-plugin,"
+  done
+  printf '%s' "${pm_missing%,}"
+}
+
+# The loud finish. A printed list buried in install output is a drop-off point;
+# this block is unmissable and names ONLY what is actually missing.
+#
+# Deliberate asymmetry rule (mirrors doctor's plugin_handoff intent): a box
+# with NO ~/.claude at all is not a Claude Code machine — yelling YOU ARE NOT
+# DONE about /plugin commands there is a false alarm, so we print one quiet
+# note instead. But ~/.claude PRESENT with no plugins state is exactly the
+# cold-start Claude Code user this block exists for — full volume.
+print_plugin_handoff_block() {
+  if [ ! -d "$HOME/.claude" ] && [ ! -d "$CLAUDE_PLUGINS_DIR" ]; then
+    log ""
+    log "install-sothis: no Claude Code detected on this machine — skipping the"
+    log "  plugin-half check. If you use Claude Code elsewhere, finish there with:"
+    log "  /plugin marketplace add Davidb3l/Sirius-Forester"
+    return 0
+  fi
+  ph="$(plugin_handoff_missing)"
+  if [ -z "$ph" ]; then
+    log ""
+    log "install-sothis: plugin half complete — bundle marketplace + plugins present."
+    return 0
+  fi
+  log ""
+  log "============================================================================"
+  log "  YOU ARE NOT DONE."
+  log "  The CLIs are installed, but the Claude Code PLUGIN half is missing:$ph"
+  log ""
+  case "$ph" in *bundle-marketplace*) log "    /plugin marketplace add Davidb3l/Sirius-Forester" ;; esac
+  case "$ph" in *" sirius-plugin"*|"sirius-plugin"*) log "    /plugin install sirius@sirius-forester" ;; esac
+  case "$ph" in *hayvenhurst-plugin*) log "    /plugin install hayvenhurst@sirius-forester" ;; esac
+  case "$ph" in *catryna-plugin*)     log "    /plugin install catryna@sirius-forester" ;; esac
+  log ""
+  log "  Run those in Claude Code (they are interactive — a script cannot run"
+  log "  them for you), then confirm with:  sirius doctor"
+  log "============================================================================"
+}
+
 # ---- --check: report all five, install nothing -----------------------------
 
 # PingMyBell is a desktop app, not a PATH CLI: count it installed if the app
@@ -136,6 +197,14 @@ if [ "$MODE" = "check" ]; then
   have bun && log "  bun (catryna runtime): $(command -v bun)" || log "  bun (catryna runtime): not installed"
   # pingmybell is a desktop app; report the bundle.
   log "  pingmybell (the bell): $(pingmybell_where)"
+  # The plugin half — the audited drop-off. Report it here too so a --check
+  # is a complete picture, not just the CLI half.
+  ph="$(plugin_handoff_missing)"
+  if [ -n "$ph" ]; then
+    log "  claude code plugin half: MISSING —$ph"
+  else
+    log "  claude code plugin half: complete"
+  fi
   # Exit 0 if the foreman + graph are present, 3 otherwise (mirrors the per-tool
   # --check contract so a SessionStart hook can branch on it).
   if tool_present sirius && tool_present hayven; then exit 0; fi
@@ -285,16 +354,11 @@ case ":$PATH:" in
 esac
 
 log ""
-log "install-sothis: done. Finish the interactive half in Claude Code:"
-log "  /plugin marketplace add Davidb3l/Sirius-Forester   # the Sothis bundle"
-log "  /plugin install sirius@sirius-forester"
-log "  /plugin install hayvenhurst@sirius-forester"
-log "  /plugin install catryna@sirius-forester"
-log ""
+log "install-sothis: CLI half done."
 
-# End with the foreman's health check — the suite's ground truth. It needs a
-# .sirius/ workspace; if there isn't one yet, point at `sirius init` instead of
-# letting doctor error out.
+# The foreman's health check — the suite's ground truth. It needs a .sirius/
+# workspace; if there isn't one yet, point at `sirius init` instead of letting
+# doctor error out.
 if tool_present sirius; then
   SIRIUS_BIN="sirius"
   have sirius || SIRIUS_BIN="$BIN_DIR/sirius"
@@ -305,3 +369,7 @@ if tool_present sirius; then
     log "Next: in your repo, run  sirius init  then  sirius doctor"
   fi
 fi
+
+# LAST output on purpose: verify the plugin half instead of trusting a printed
+# list. If anything is missing this is an unmissable YOU ARE NOT DONE block.
+print_plugin_handoff_block

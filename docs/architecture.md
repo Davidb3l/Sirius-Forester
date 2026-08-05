@@ -52,6 +52,12 @@ read-only and polls `PRAGMA data_version` for live SSE updates.
 Sirius is built on facts verified in both parent codebases (PRD §6). Any parent
 release that breaks one is a Sirius-blocking regression:
 
+(Doctor also runs one check that is *not* a contract fact: `plugin_handoff`, an
+advisory that warns — never fails — when the Claude Code plugin half of the
+Sothis install is missing, naming the exact `/plugin` commands. Sirius works
+without the plugin layer; the check exists because the CLI half and plugin half
+install separately and the gap is otherwise silent.)
+
 1. **Ametrite claims are hard locks.** `BEGIN IMMEDIATE`; zero double-claims
    under a 4-claimer race. Leases default 900 s; re-claiming your own id is a
    heartbeat. → measured by [`bench/soak.ts`](../bench/soak.ts).

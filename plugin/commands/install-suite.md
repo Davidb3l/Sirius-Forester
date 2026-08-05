@@ -1,5 +1,5 @@
 ---
-description: Install the whole Sothis suite in one shot — the sirius + hayven CLIs (and a check for amt + catryna/bun), verified by each tool's own installer, ending with `sirius doctor`. Use for "let's Sothis this up" / installing the full fleet, not just sirius.
+description: Install the whole Sothis suite in one shot — the sirius + hayven CLIs (and a check for amt + catryna/bun), verified by each tool's own installer, running `sirius doctor` and ending with a verification of the Claude Code plugin half. Use for "let's Sothis this up" / installing the full fleet, not just sirius.
 argument-hint: "[--skip-hayven] [--skip-amt] [--require-signature]"
 allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/scripts/install-sothis.sh:*)
 ---
@@ -27,16 +27,14 @@ passed, run it with no arguments.
 
 After it finishes:
 
-- **Do the interactive half yourself, once the CLIs are in.** The script can't
-  run `/plugin` commands. Tell the user (or do it if they're driving Claude Code
-  interactively) to run the Sothis bundle:
-  ```
-  /plugin marketplace add Davidb3l/Sirius-Forester
-  /plugin install sirius@sirius-forester
-  /plugin install hayvenhurst@sirius-forester
-  /plugin install catryna@sirius-forester
-  ```
-  One marketplace add exposes all three plugins.
+- **Honor the plugin-half verdict — it is checked, not assumed.** The script
+  ends by VERIFYING the Claude Code plugin half (bundle marketplace + the
+  sirius/hayvenhurst/catryna plugins, matched by `<name>@` prefix so a plugin
+  from its own standalone marketplace counts). If it printed a
+  **`YOU ARE NOT DONE`** block, relay that block prominently and tell the user
+  to run exactly the `/plugin` commands it lists — the script cannot run them
+  (they are interactive). Do NOT summarize the install as complete while that
+  block is present. If it printed "plugin half complete", say so.
 - If the script printed a **PATH note**, relay it verbatim so the user can add
   the install dir to their shell rc.
 - If it reported **`amt` missing**, relay the guidance: the fastest path is

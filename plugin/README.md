@@ -45,5 +45,7 @@ own "ametrite this repo" skill, not a plugin):
 
 **The CLIs** — run `/sirius:install-suite` (or say "let's Sothis this up"). It
 installs every missing suite binary by delegating to each tool's own installer,
-detects `amt`, checks `bun` for Catryna, and ends with `sirius doctor`. To
+detects `amt`, checks `bun` for Catryna, runs `sirius doctor`, and ends by
+verifying the plugin half above — if any `/plugin` step was skipped, its last
+output is a `YOU ARE NOT DONE` block naming exactly what's left. To
 install only the sirius binary, use `/sirius:install-binary`.
