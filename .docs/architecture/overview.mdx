@@ -7,10 +7,10 @@ relatedFiles: ["src/main.rs", "src/cli.rs", "src/workspace.rs"]
 anchors: []
 evidence: []
 refs: []
-verifiedCommit: "da259806d8a3c72a5b6c27e68c8383b458387f60"
-verifiedAt: "2026-08-05T16:53:42.114Z"
-driftSuspectSince: "2026-08-05T16:54:22.561Z"
-driftSuspectReason: "code.changed touched src/main.rs"
+verifiedCommit: "5054083202881c2a74ea4b5757e4cc8a1e512857"
+verifiedAt: "2026-08-05T18:11:14.708Z"
+driftSuspectSince: ""
+driftSuspectReason: ""
 createdAt: 1785915503544
 updatedAt: 1785915503544
 createdBy: "claude-code"
@@ -75,7 +75,7 @@ Exit codes follow the suite convention: `0` ok, `1` operational failure, `2` usa
 
 ## Workspace discovery
 
-`Workspace::discover` walks up from the cwd for `.ametrite/ametrite.db` and `.hayven/`. `.sirius/` is placed beside `.ametrite/` when it is found, otherwise in the starting directory. Sirius mints no registry of its own.
+`Workspace::discover` walks up from the cwd for `.ametrite/ametrite.db` and `.hayven/` — but **never into `$HOME` or above** (both paths canonicalized first): `~/.ametrite` and `~/.hayven` are the parents' global state dirs, not workspace markers, and adopting them once fabricated ".hayven/ present" for repos that had neither. Candidates are type-checked (`.hayven` must be a directory, `ametrite.db` a file). `.sirius/` is placed beside `.ametrite/` when found, otherwise in the starting directory. Sirius mints no registry of its own.
 
 ## Testing seam
 
