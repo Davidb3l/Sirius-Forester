@@ -3,7 +3,10 @@
 //!
 //! 1. amt present + schema (read the ametrite `meta.schema_version` read-only;
 //!    pragmatic ≥ 3, NOT a version-string compare — `amt 0.1.0` ships schema 3).
-//! 2. hayven daemon on :7777 (health probe + `hayven daemon status`).
+//! 2. hayven daemon on :7777 — the HTTP probe AND an affirmatively-running
+//!    `hayven daemon status` AND a verified repo-local `.hayven/` must all
+//!    agree; port-answers-but-status-stopped is flagged as an orphan daemon
+//!    (with the actual listener pids via lsof, best-effort).
 //! 3. claim exit-code semantics (amt claim JSON shape is parseable; hayven claim
 //!    surface present).
 //! 4. gate exit codes (hayven affected-tests present).
@@ -89,6 +92,29 @@ pub fn ametrite_schema_version(ws: &Workspace) -> Result<i64, String> {
     v.trim()
         .parse::<i64>()
         .map_err(|e| format!("ametrite schema_version not an integer: {e}"))
+}
+
+/// The pids actually LISTENING on :7777, via `lsof` (best-effort: empty on
+/// any failure — lsof missing, no permission). Used only to enrich the
+/// orphan-daemon failure detail; never gates on its own. `-t` prints one pid
+/// per line; distinct pids preserved in order.
+fn listener_pids(runner: &dyn Runner) -> Vec<String> {
+    match runner.run("lsof", &["-nP", "-iTCP:7777", "-sTCP:LISTEN", "-t"]) {
+        Ok(o) => {
+            let mut pids: Vec<String> = Vec::new();
+            for line in o.stdout.lines() {
+                let p = line.trim();
+                if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) {
+                    let p = p.to_string();
+                    if !pids.contains(&p) {
+                        pids.push(p);
+                    }
+                }
+            }
+            pids
+        }
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Probe the hayven daemon health on :7777 via a plain HTTP GET (no deps —
@@ -247,34 +273,69 @@ pub fn run_with_plugins_dir(
     let http = daemon_http_ok(runner);
     let status = hv.daemon_status().unwrap_or_default();
     let hv_ver = hv.version().unwrap_or_else(|_| "unknown".into());
-    let hv_ws = ws
-        .hayven_dir
-        .as_ref()
-        .map(|_| " .hayven/ present")
-        .unwrap_or(" .hayven/ not found (run `hayven init`)");
+    // VERIFY the directory exists right now — never infer presence from
+    // discovery alone (2026-08-05 defect: ".hayven/ present" was reported for
+    // a directory this repo did not have).
+    let hv_dir_ok = ws.hayven_dir.as_deref().is_some_and(Path::is_dir);
+    let hv_ws = if hv_dir_ok {
+        " .hayven/ present"
+    } else {
+        " .hayven/ not found (run `hayven init`)"
+    };
     if http {
-        // The daemon is single-project-bound: a 200 on :7777 means *a* daemon is
-        // up, not that it serves this workspace. Only call it "healthy" when the
-        // status line isn't an error and this workspace has a .hayven/ to serve.
         let status_line = first_line(&status);
-        let serving = ws.hayven_dir.is_some()
-            && !status_line.to_ascii_lowercase().contains("error")
-            && !status_line.contains("No .hayven");
-        if serving {
+        // AFFIRMATIVE health only: the status line must actually say the
+        // tracked daemon is running. "Not an error" is not health — a 200
+        // paired with `status: stopped` means SOMETHING answers the port that
+        // the pidfile does not know about (an orphan daemon), and the old
+        // check blessed exactly that broken state as "healthy (status:
+        // stopped)" (observed 2026-08-05, two daemons, one orphaned).
+        // starts_with, not contains: hayven's status vocabulary today is
+        // "running (pid N)" / "stale pidfile (…)" / "stopped" (verified in
+        // daemon.ts statusDaemon), but a future upstream reword to
+        // "not running" would turn a contains() check back into the original
+        // healthy-while-stopped bug. Prefix-matching is wording-proof.
+        let running = status_line.to_ascii_lowercase().starts_with("running");
+        // Branch ORDER matters: a missing repo-local .hayven/ is diagnosed
+        // FIRST — in that state `hayven daemon status` errors too, and the
+        // orphan branch below would misread it as "kill the (legitimate)
+        // listener". The local, actionable cause wins over the exotic one.
+        if !hv_dir_ok {
+            // SIRF-10: a 200 on :7777 means *a* daemon is up, not that it
+            // serves THIS workspace. This is the one silent-degradation state
+            // CONTRACTS documents: forward stamps (amt) still land but reverse
+            // stamps (hayven remember) quietly go one-way (reverse_ok:false).
+            // So a daemon that cannot be serving this repo must FAIL, not pass.
+            checks.push(Check::fail(
+                "hayven_daemon_7777",
+                format!(
+                    "hayven {hv_ver}, daemon up on :7777 but not serving this workspace (status: {status_line});{hv_ws} — run `hayven init` then `hayven daemon start` in this repo"
+                ),
+            ));
+        } else if running {
             checks.push(Check::ok(
                 "hayven_daemon_7777",
                 format!("hayven {hv_ver}, daemon healthy on :7777 (status: {status_line});{hv_ws}"),
             ));
         } else {
-            // SIRF-10: the daemon is single-project-bound — a 200 on :7777 means
-            // *a* daemon is up, not that it serves THIS workspace. This is the one
-            // silent-degradation state CONTRACTS documents: forward stamps (amt)
-            // still land but reverse stamps (hayven remember) quietly go one-way
-            // (reverse_ok:false). So a different-project daemon must FAIL, not pass.
+            // Workspace is set up, port answers, THIS repo's pidfile disagrees.
+            // Two states look identical from here: an orphan daemon nothing
+            // tracks, or a healthy daemon started from ANOTHER repo (0.0.6+ is
+            // multi-project; this repo just never claimed the pidfile). The
+            // remedy must try the non-destructive one first: `hayven daemon
+            // start` attaches to a healthy daemon and claims the pidfile —
+            // advising a kill first would take down a daemon serving other
+            // repos. Name the listener(s) so the last-resort kill is precise.
+            let pids = listener_pids(runner);
+            let who = match pids.len() {
+                0 => String::new(),
+                1 => format!(" (listener pid: {})", pids[0]),
+                _ => format!(" (MULTIPLE listeners: pids {})", pids.join(", ")),
+            };
             checks.push(Check::fail(
                 "hayven_daemon_7777",
                 format!(
-                    "hayven {hv_ver}, daemon up on :7777 but not serving this workspace (status: {status_line});{hv_ws} — run `hayven daemon start` in this repo"
+                    "a daemon ANSWERS on :7777 but `hayven daemon status` reports '{status_line}' — either an orphan daemon or one started from another repo{who};{hv_ws} — run `hayven daemon start` in this repo first (it attaches and fixes the pidfile); only if status STILL disagrees, kill the listener pid"
                 ),
             ));
         }
@@ -649,6 +710,113 @@ mod tests {
                 .unwrap()
                 .pass
         );
+    }
+
+    // The 2026-08-05 defect: doctor said "daemon healthy on :7777 (status:
+    // stopped)" — an orphan answered the port while the pidfile said stopped.
+    // A 200 without an affirmatively-running status must FAIL and name the
+    // real listener(s).
+    #[test]
+    fn port_answering_while_status_stopped_is_an_orphan_not_healthy() {
+        let dir = std::env::temp_dir().join(format!("sirius-doctor-orphan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".ametrite")).unwrap();
+        std::fs::create_dir_all(dir.join(".hayven")).unwrap();
+        let dbp = dir.join(".ametrite/ametrite.db");
+        {
+            let c = Connection::open(&dbp).unwrap();
+            c.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)", [])
+                .unwrap();
+            c.execute("INSERT INTO meta VALUES ('schema_version','3')", [])
+                .unwrap();
+        }
+        let ws = Workspace {
+            root: dir.clone(),
+            ametrite_db: Some(dbp),
+            hayven_dir: Some(dir.join(".hayven")),
+        };
+        let m = MockRunner::new();
+        m.expect(&["amt", "--version"], 0, "amt 0.1.0");
+        m.push(MockResponse::new(&["curl"], 0, "200", "")); // port ANSWERS
+        m.expect(&["hayven", "--version"], 0, "0.0.7");
+        m.expect(&["hayven", "daemon", "status"], 0, "stopped"); // pidfile disagrees
+        m.push(MockResponse::new(&["lsof"], 0, "61445\n72001\n61445\n", ""));
+        m.push(MockResponse::new(
+            &["amt", "--json", "claim", "--peek"],
+            0,
+            r#"{"claimed":false}"#,
+            "",
+        ));
+        m.push(MockResponse::new(
+            &["hayven", "--help"],
+            0,
+            "affected-tests remember recall",
+            "",
+        ));
+        let report = run_with_plugins_dir(&ws, &m, None);
+        assert!(!report.ok, "healthy-while-stopped must be a FAIL");
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "hayven_daemon_7777")
+            .unwrap();
+        assert!(!c.pass);
+        assert!(c.detail.contains("orphan"), "detail: {}", c.detail);
+        // Distinct listeners named, deduped, flagged as MULTIPLE.
+        assert!(
+            c.detail.contains("MULTIPLE listeners: pids 61445, 72001"),
+            "detail: {}",
+            c.detail
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Presence must be VERIFIED at check time, not inferred from discovery: a
+    // hayven_dir pointing at a path that does not exist is "not found".
+    #[test]
+    fn claimed_hayven_dir_must_actually_exist() {
+        let dir = std::env::temp_dir().join(format!("sirius-doctor-ghost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".ametrite")).unwrap();
+        let dbp = dir.join(".ametrite/ametrite.db");
+        {
+            let c = Connection::open(&dbp).unwrap();
+            c.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)", [])
+                .unwrap();
+            c.execute("INSERT INTO meta VALUES ('schema_version','3')", [])
+                .unwrap();
+        }
+        let ws = Workspace {
+            root: dir.clone(),
+            ametrite_db: Some(dbp),
+            hayven_dir: Some(dir.join(".hayven")), // never created on disk
+        };
+        let m = MockRunner::new();
+        m.expect(&["amt", "--version"], 0, "amt 0.1.0");
+        m.push(MockResponse::new(&["curl"], 0, "200", ""));
+        m.expect(&["hayven", "--version"], 0, "0.0.7");
+        m.expect(&["hayven", "daemon", "status"], 0, "running (pid 999)");
+        m.push(MockResponse::new(
+            &["amt", "--json", "claim", "--peek"],
+            0,
+            r#"{"claimed":false}"#,
+            "",
+        ));
+        m.push(MockResponse::new(
+            &["hayven", "--help"],
+            0,
+            "affected-tests remember recall",
+            "",
+        ));
+        let report = run_with_plugins_dir(&ws, &m, None);
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "hayven_daemon_7777")
+            .unwrap();
+        assert!(!c.pass, "ghost .hayven/ must not pass: {}", c.detail);
+        assert!(c.detail.contains(".hayven/ not found"), "{}", c.detail);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // SIRF-10: daemon up (http 200) but serving a DIFFERENT project must FAIL,
