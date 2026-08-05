@@ -6,8 +6,8 @@ Ships the **Sirius worker Skill** (the claim → map → lock → brief → work
 ## Install
 
 ```
-/plugin marketplace add Davidb3l/Sirius-Forester
-/plugin install sirius@sirius-forester
+claude plugin marketplace add Davidb3l/Sirius-Forester   # any shell — or use the
+claude plugin install sirius@sirius-forester             # app's + → Plugins browser
 /sirius:install-binary
 ```
 
@@ -37,15 +37,19 @@ bundle: one add exposes all three (Ametrite's `amt` is a CLI bootstrapped by its
 own "ametrite this repo" skill, not a plugin):
 
 ```
-/plugin marketplace add Davidb3l/Sirius-Forester
-/plugin install sirius@sirius-forester
-/plugin install hayvenhurst@sirius-forester
-/plugin install catryna@sirius-forester
+claude plugin marketplace add Davidb3l/Sirius-Forester
+claude plugin install sirius@sirius-forester
+claude plugin install hayvenhurst@sirius-forester
+claude plugin install catryna@sirius-forester
 ```
+
+(Runnable from any shell — Claude can run them for you. Desktop-app
+alternative: **+** next to the prompt box → Plugins → Add plugin. The
+interactive `/plugin` dialog in a terminal session works too.)
 
 **The CLIs** — run `/sirius:install-suite` (or say "let's Sothis this up"). It
 installs every missing suite binary by delegating to each tool's own installer,
 detects `amt`, checks `bun` for Catryna, runs `sirius doctor`, and ends by
-verifying the plugin half above — if any `/plugin` step was skipped, its last
+verifying the plugin half above — if the plugin half is still incomplete, its last
 output is a `YOU ARE NOT DONE` block naming exactly what's left. To
 install only the sirius binary, use `/sirius:install-binary`.

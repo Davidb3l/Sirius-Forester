@@ -168,11 +168,15 @@ pub fn plugin_handoff_check(plugins_dir: Option<&Path>) -> Check {
         plugin_keys.iter().any(|k| k.starts_with(&prefix))
     };
 
+    // The fix commands are the NON-interactive `claude plugin` CLI (v2.1.195+),
+    // which runs from any plain shell — unlike the interactive `/plugin`
+    // dialog, which desktop-app users don't have at all. App users can also
+    // use the plugin browser (the + next to the prompt box → Plugins).
     let mut fixes: Vec<String> = Vec::new();
     let mut missing: Vec<&str> = Vec::new();
     if !marketplace_ok {
         missing.push("sirius-forester marketplace");
-        fixes.push("/plugin marketplace add Davidb3l/Sirius-Forester".into());
+        fixes.push("claude plugin marketplace add Davidb3l/Sirius-Forester".into());
     }
     for name in ["sirius", "hayvenhurst", "catryna"] {
         if !has_plugin(name) {
@@ -181,7 +185,7 @@ pub fn plugin_handoff_check(plugins_dir: Option<&Path>) -> Check {
                 "hayvenhurst" => "hayvenhurst plugin",
                 _ => "catryna plugin",
             });
-            fixes.push(format!("/plugin install {name}@sirius-forester"));
+            fixes.push(format!("claude plugin install {name}@sirius-forester"));
         }
     }
 
@@ -196,7 +200,8 @@ pub fn plugin_handoff_check(plugins_dir: Option<&Path>) -> Check {
             NAME,
             false,
             format!(
-                "CLIs alone are half the install — missing: {}. Fix in Claude Code: {}",
+                "CLIs alone are half the install — missing: {}. Fix from any shell: {} \
+                 (or in the Claude desktop app: + → Plugins → Add plugin)",
                 missing.join(", "),
                 fixes.join("  then  ")
             ),
@@ -502,11 +507,13 @@ mod tests {
         assert!(c.detail.contains("sirius plugin"));
         assert!(!c.detail.contains("hayvenhurst plugin"), "{}", c.detail);
         assert!(!c.detail.contains("catryna plugin"), "{}", c.detail);
-        // The fix commands are exact and in cold-start order.
+        // The fix commands are exact, shell-runnable, and in cold-start order.
         assert!(c
             .detail
-            .contains("/plugin marketplace add Davidb3l/Sirius-Forester"));
-        assert!(c.detail.contains("/plugin install sirius@sirius-forester"));
+            .contains("claude plugin marketplace add Davidb3l/Sirius-Forester"));
+        assert!(c
+            .detail
+            .contains("claude plugin install sirius@sirius-forester"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -7,9 +7,10 @@ description: >-
   the human says "let's Sothis this up", "let's Sothis up",
   "install the Sothis suite", "set up the whole suite/fleet", "get the full fleet
   on this repo", or otherwise asks for all the tools at once (not just Sirius).
-  Two halves IN ORDER: the marketplace bundle's interactive `/plugin` adds
-  first (they work from a cold start), then the install-sothis.sh one-shot for
-  the CLIs — which ends by verifying the plugin half. To install ONLY the
+  Two halves IN ORDER: the marketplace bundle's plugins first (Claude runs the
+  non-interactive `claude plugin` CLI itself — works from a cold start), then
+  the install-sothis.sh one-shot for the CLIs — which auto-installs and
+  verifies any remaining plugin half. To install ONLY the
   sirius binary, use /sirius:install-binary; to just RUN the foreman once it's
   installed, that's the `sirius` skill.
 ---
@@ -27,34 +28,40 @@ tools that compose through the suite contracts:
   fleet needs you. Desktop app, built from source (optional; early alpha, macOS).
 
 Each stands alone; **full fleet control needs the CLIs (first four).** They
-install five different ways, and two of the steps are interactive `/plugin`
-commands, so the install has two halves — **plugins first, then CLIs, in that
-order.** The plugin half is the one that historically got dropped (a real
+install five different ways, split across two halves — **plugins first, then
+CLIs, in that order** (both halves are runnable by Claude itself; nothing
+requires the human to touch a terminal). The plugin half is the one that historically got dropped (a real
 audit found machines with every CLI installed and the sirius plugin missing),
 and every other entry point lives inside the plugin — so it goes first.
 PingMyBell is the optional fifth: the one-shot detects it and points at its
 repo, never auto-installs it.
 
-## Half 1 — the plugins (interactive `/plugin`)
+## Half 1 — the plugins (Claude runs these via Bash)
 
 The CLIs are the binaries; the plugins are the Skills, commands, and MCP servers
-Claude Code loads. One marketplace add exposes all three plugins in the Sothis
-bundle, and it works from a completely cold start:
+Claude Code loads. **Run this half yourself via Bash** — Claude Code v2.1.195+
+ships a NON-interactive `claude plugin` CLI, so no human terminal work is
+needed and this works from a completely cold start on any surface, including
+the desktop app:
 
-```
-/plugin marketplace add Davidb3l/Sirius-Forester
-/plugin install sirius@sirius-forester
-/plugin install hayvenhurst@sirius-forester
-/plugin install catryna@sirius-forester
+```bash
+claude plugin marketplace add Davidb3l/Sirius-Forester
+claude plugin install sirius@sirius-forester
+claude plugin install hayvenhurst@sirius-forester
+claude plugin install catryna@sirius-forester
 ```
 
 A plugin already installed from its own standalone marketplace
-(`hayvenhurst@hayvenhurst`, `catryna@catryna-wikinelli`) counts — skip it.
-(Ametrite has no plugin here — its `amt` CLI comes from the ametrite skill and
-Half 2, not from a `/plugin install`.)
+(`hayvenhurst@hayvenhurst`, `catryna@catryna-wikinelli`) counts — check with
+`claude plugin list` and skip what's present. (Ametrite has no plugin here —
+its `amt` CLI comes from the ametrite skill and Half 2, not from a plugin.)
 
-If you're driving Claude Code interactively you can run these yourself; otherwise
-hand them to the human — `/plugin` commands can't be run from a script.
+Fallbacks, only if the `claude` CLI is missing or too old for non-interactive
+plugin commands: tell the human to use the desktop app's plugin browser
+(**+** next to the prompt box → Plugins → Add plugin), or the interactive
+`/plugin` dialog in a terminal `claude` session. Plugins are per-machine —
+any one route covers every surface. New sessions pick them up; the current
+session may need a restart to see newly installed plugins.
 
 ## Half 2 — the CLIs (one shot)
 
@@ -82,15 +89,18 @@ What it does, in order:
 4. **catryna** — checks that its plugin is installed and that `bun` (its MCP
    runtime) is present; warns if either is missing.
 5. Runs **`sirius doctor`** — the suite's ground-truth health check.
-6. Ends by **verifying the plugin half** (bundle marketplace + the three
-   plugins, matched by `<name>@` prefix so any marketplace counts). If anything
-   is missing its LAST output is a `YOU ARE NOT DONE` block naming the exact
-   `/plugin` commands.
+6. Ends by **auto-installing any missing plugin half** via the non-interactive
+   `claude plugin` CLI (skippable with `--skip-plugins`), then **verifying** it
+   (bundle marketplace + the three plugins, matched by `<name>@` prefix so any
+   marketplace counts). Only if something is STILL missing is its last output
+   a `YOU ARE NOT DONE` block listing the remaining routes (shell commands,
+   the desktop app's plugin browser, or `/plugin`).
 
 Relay anything the script surfaces: a PATH note, a missing-`amt` hint, a missing
 `bun` warning. **If it printed a `YOU ARE NOT DONE` block, relay that block
-prominently and do NOT summarize the install as complete** — go back to Half 1
-and finish the listed `/plugin` commands. **Never** work around a
+prominently and do NOT summarize the install as complete** — run the block's
+listed `claude plugin` commands yourself (or point the human at the desktop
+app's + → Plugins browser) and re-verify. **Never** work around a
 `SIGNATURE VERIFICATION FAILED` error — stop and report it.
 
 `/sirius:install-suite` is the slash-command entry to this same one-shot (forward

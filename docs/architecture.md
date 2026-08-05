@@ -54,7 +54,7 @@ release that breaks one is a Sirius-blocking regression:
 
 (Doctor also runs one check that is *not* a contract fact: `plugin_handoff`, an
 advisory that warns — never fails — when the Claude Code plugin half of the
-Sothis install is missing, naming the exact `/plugin` commands. Sirius works
+Sothis install is missing, naming the exact `claude plugin` commands. Sirius works
 without the plugin layer; the check exists because the CLI half and plugin half
 install separately and the gap is otherwise silent.)
 

@@ -7,16 +7,16 @@
 # "why" docs, and rings PingMyBell (the desktop notch/voice app) when the fleet
 # needs you. Each tool stands alone; full fleet control comes from all five.
 #
-# WHY this exists: the tools install five different ways, and the two
-# interactive `/plugin` steps can't run from a shell. This script is the CLI
-# half of "let's Sothis this up" — it installs the binaries the plugins can't
-# ship, then hands you to the marketplace bundle for the plugin adds:
+# WHY this exists: the tools install five different ways. This script is the
+# workhorse of "let's Sothis this up" — it installs the binaries the plugins
+# can't ship, then finishes the Claude Code plugin half itself via the
+# NON-interactive `claude plugin` CLI (v2.1.195+), and verifies the result:
 #
 #   sirius   — signed prebuilt binary  → this repo's install-sirius.sh (delegated)
 #   hayven   — prebuilt binary         → Hayvenhurst's install-hayven.sh (delegated)
 #   amt      — Rust binary (cargo)     → detected; guided if missing (never auto-built)
-#   catryna  — bun-based MCP plugin    → bun checked; the plugin itself is a
-#                                        `/plugin install` (see the marketplace bundle)
+#   catryna  — bun-based MCP plugin    → bun checked; the plugin comes from the
+#                                        marketplace bundle (auto-installed below)
 #
 # DELEGATION, not duplication: each binary is fetched and verified by that
 # tool's OWN authoritative installer (sirius verifies a Sigstore signature;
@@ -40,10 +40,12 @@
 #   install-sothis.sh --require-signature  # forwarded to sirius; abort if unverifiable
 #   install-sothis.sh --skip-hayven     # don't touch hayven (e.g. install it via its plugin)
 #   install-sothis.sh --skip-amt        # don't check/guide amt
+#   install-sothis.sh --skip-plugins    # never run `claude plugin ...` (report only)
 #   install-sothis.sh --help
 #
 # Environment:
 #   SOTHIS_INSTALL_PREFIX   override the install prefix (same as --prefix)
+#   SOTHIS_SKIP_PLUGIN_INSTALL=1   same as --skip-plugins
 #   HAYVEN_REPO             override hayven's owner/repo (default Davidb3l/Hayvenhurst-dev)
 #   HAYVEN_INSTALLER_REF    ref for the fetched install-hayven.sh (default: a release tag)
 #   AMETRITE_REPO           shown in the amt hint (default Davidb3l/Ametrite)
@@ -76,11 +78,14 @@ while [ $# -gt 0 ]; do
     --require-signature) REQUIRE_SIG=1 ;;
     --skip-hayven) SKIP_HAYVEN=1 ;;
     --skip-amt) SKIP_AMT=1 ;;
+    --skip-plugins) SOTHIS_SKIP_PLUGIN_INSTALL=1 ;;
     --prefix)
       [ -n "${2:-}" ] || { echo "install-sothis: --prefix needs a directory" >&2; exit 2; }
       PREFIX="$2"; PREFIX_EXPLICIT=1; shift ;;
     --help|-h)
-      sed -n '2,52p' "$0"
+      # Print the whole header comment block, however long it grows (stops at
+      # the first non-comment line) — no line-number to keep in sync.
+      awk 'NR==1{next} /^#/{print; next} {exit}' "$0"
       exit 0
       ;;
     *) echo "install-sothis: unknown argument: $1" >&2; exit 2 ;;
@@ -141,6 +146,39 @@ plugin_handoff_missing() { # -> " item," list on stdout; empty = complete
   printf '%s' "${pm_missing%,}"
 }
 
+# Auto-install the plugin half when possible. Claude Code v2.1.195+ ships a
+# NON-interactive `claude plugin` CLI, so this script can finish the handoff
+# itself instead of printing homework. Guarded three ways: the kill-switch
+# (--skip-plugins / SOTHIS_SKIP_PLUGIN_INSTALL=1 — tests use the env so
+# fixture runs never mutate real plugin state), a missing `claude` CLI (fall
+# through to the printed instructions), and per-command || fallbacks (an older
+# claude that prompts interactively just fails fast under </dev/null and the
+# block below picks up whatever is still missing).
+attempt_plugin_autoinstall() {
+  [ "${SOTHIS_SKIP_PLUGIN_INSTALL:-0}" = "1" ] && return 0
+  have claude || return 0
+  ph="$(plugin_handoff_missing)"
+  [ -z "$ph" ] && return 0
+  log ""
+  log "install-sothis: finishing the plugin half via the claude CLI (non-interactive)"
+  case "$ph" in *bundle-marketplace*)
+    if claude plugin marketplace add Davidb3l/Sirius-Forester </dev/null >/dev/null 2>&1; then
+      log "  added marketplace: sirius-forester"
+    else
+      log "  marketplace add failed (claude CLI too old? needs v2.1.195+) — see below"
+    fi ;;
+  esac
+  for p in sirius hayvenhurst catryna; do
+    case "$ph" in *" $p-plugin"*|"$p-plugin"*)
+      if claude plugin install "$p@sirius-forester" </dev/null >/dev/null 2>&1; then
+        log "  installed plugin: $p@sirius-forester"
+      else
+        log "  $p plugin install failed — see below"
+      fi ;;
+    esac
+  done
+}
+
 # The loud finish. A printed list buried in install output is a drop-off point;
 # this block is unmissable and names ONLY what is actually missing.
 #
@@ -154,7 +192,7 @@ print_plugin_handoff_block() {
     log ""
     log "install-sothis: no Claude Code detected on this machine — skipping the"
     log "  plugin-half check. If you use Claude Code elsewhere, finish there with:"
-    log "  /plugin marketplace add Davidb3l/Sirius-Forester"
+    log "  claude plugin marketplace add Davidb3l/Sirius-Forester"
     return 0
   fi
   ph="$(plugin_handoff_missing)"
@@ -168,15 +206,21 @@ print_plugin_handoff_block() {
   log "  YOU ARE NOT DONE."
   log "  The CLIs are installed, but the Claude Code PLUGIN half is missing:$ph"
   log ""
-  case "$ph" in *bundle-marketplace*) log "    /plugin marketplace add Davidb3l/Sirius-Forester" ;; esac
-  case "$ph" in *" sirius-plugin"*|"sirius-plugin"*) log "    /plugin install sirius@sirius-forester" ;; esac
-  case "$ph" in *hayvenhurst-plugin*) log "    /plugin install hayvenhurst@sirius-forester" ;; esac
-  case "$ph" in *catryna-plugin*)     log "    /plugin install catryna@sirius-forester" ;; esac
+  log "  Any ONE of these routes finishes it:"
   log ""
-  log "  Run those in an INTERACTIVE Claude Code session — the \`claude\` CLI in a"
-  log "  terminal. (/plugin is a terminal dialog; it is not available in every"
-  log "  Claude surface, e.g. the desktop app, and no script can run it for you.)"
-  log "  Plugins are per-machine, so once added there they work everywhere."
+  log "  a) From any shell (claude CLI v2.1.195+):"
+  case "$ph" in *bundle-marketplace*) log "       claude plugin marketplace add Davidb3l/Sirius-Forester" ;; esac
+  case "$ph" in *" sirius-plugin"*|"sirius-plugin"*) log "       claude plugin install sirius@sirius-forester" ;; esac
+  case "$ph" in *hayvenhurst-plugin*) log "       claude plugin install hayvenhurst@sirius-forester" ;; esac
+  case "$ph" in *catryna-plugin*)     log "       claude plugin install catryna@sirius-forester" ;; esac
+  log ""
+  log "  b) Claude DESKTOP APP (no terminal): click + next to the prompt box"
+  log "     -> Plugins -> Add plugin -> add the Davidb3l/Sirius-Forester"
+  log "     marketplace and install what's listed above."
+  log ""
+  log "  c) Terminal claude session: the interactive /plugin dialog."
+  log ""
+  log "  Plugins are per-machine — one route, any surface, done everywhere."
   log "  Then confirm with:  sirius doctor"
   log "============================================================================"
 }
@@ -314,8 +358,8 @@ check_catryna() {
     log "catryna: plugin installed."
   else
     log ""
-    log "catryna (Catryna Wikinelli, the docs): install the plugin (interactive):"
-    log "  /plugin install catryna@sirius-forester   # from the Sothis bundle"
+    log "catryna (Catryna Wikinelli, the docs): plugin not installed — the"
+    log "  auto-install step at the end of this run will try to fix that."
   fi
   if ! have bun; then
     log "catryna: WARNING: bun not found. The Catryna MCP server runs on bun;"
@@ -373,6 +417,8 @@ if tool_present sirius; then
   fi
 fi
 
-# LAST output on purpose: verify the plugin half instead of trusting a printed
-# list. If anything is missing this is an unmissable YOU ARE NOT DONE block.
+# Finish the plugin half ourselves when the claude CLI allows it, then verify.
+# LAST output on purpose: if anything is STILL missing after the attempt, this
+# is an unmissable YOU ARE NOT DONE block.
+attempt_plugin_autoinstall
 print_plugin_handoff_block

@@ -8,8 +8,9 @@ allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/scripts/install-sothis.sh:*)
 
 Sirius is the foreman of the **Sothis** suite; full fleet control comes from the
 four CLIs, with PingMyBell (the desktop notch/voice app) as the optional fifth.
-Installing them has two halves — this command handles the CLIs; the marketplace
-bundle handles the interactive `/plugin` steps.
+Installing them has two halves — this command handles the CLIs, and the script
+finishes the plugin half itself via the non-interactive `claude plugin` CLI
+(v2.1.195+), falling back to printed routes when it can't.
 
 Run the bundled one-shot. It installs every missing suite CLI by delegating to
 each tool's own authoritative installer (sirius verifies a Sigstore signature,
@@ -28,13 +29,15 @@ passed, run it with no arguments.
 After it finishes:
 
 - **Honor the plugin-half verdict — it is checked, not assumed.** The script
-  ends by VERIFYING the Claude Code plugin half (bundle marketplace + the
-  sirius/hayvenhurst/catryna plugins, matched by `<name>@` prefix so a plugin
-  from its own standalone marketplace counts). If it printed a
-  **`YOU ARE NOT DONE`** block, relay that block prominently and tell the user
-  to run exactly the `/plugin` commands it lists — the script cannot run them
-  (they are interactive). Do NOT summarize the install as complete while that
-  block is present. If it printed "plugin half complete", say so.
+  ends by AUTO-INSTALLING any missing Claude Code plugin half via the
+  non-interactive `claude plugin` CLI, then VERIFYING it (bundle marketplace +
+  the sirius/hayvenhurst/catryna plugins, matched by `<name>@` prefix so a
+  plugin from its own standalone marketplace counts). If it still printed a
+  **`YOU ARE NOT DONE`** block, the auto-attempt failed (old/missing `claude`
+  CLI): relay the block prominently — you may run its `claude plugin ...`
+  commands yourself via Bash, or point desktop-app users at **+ → Plugins →
+  Add plugin**. Do NOT summarize the install as complete while that block is
+  present. If it printed "plugin half complete", say so.
 - If the script printed a **PATH note**, relay it verbatim so the user can add
   the install dir to their shell rc.
 - If it reported **`amt` missing**, relay the guidance: the fastest path is

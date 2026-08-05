@@ -54,23 +54,53 @@ and installs `sirius`.
 
 **The whole suite (Sothis).** Sirius is the foreman of **Sothis** — the
 local-first suite of Sirius, Hayvenhurst, Ametrite, and Catryna Wikinelli
-(plus PingMyBell, the optional bell). The install is **two halves — plugins,
-then CLIs — in this order**, because every other entry point lives inside the
-plugin you haven't installed yet:
+(plus PingMyBell, the optional bell). The install is two halves — the Claude
+Code **plugins**, then the **CLIs** — and only the first rung depends on where
+you are, because every richer entry point lives inside the plugin you haven't
+installed yet:
 
-```
-1. /plugin marketplace add Davidb3l/Sirius-Forester    # works from a cold start
-2. /plugin install sirius@sirius-forester              # unlocks /sirius:* commands
-3. /plugin install hayvenhurst@sirius-forester         # skip any plugin you already
-4. /plugin install catryna@sirius-forester             #   have from its own marketplace
-5. /sirius:install-suite                               # or say "let's Sothis this up"
-```
+**First rung — get the `sirius` plugin (pick ONE):**
 
-Step 5 installs every missing suite CLI via each tool's own installer, detects
-`amt`, checks `bun` for Catryna, ends with `sirius doctor` — and finishes by
-**verifying the plugin half**, so a half-done install says so loudly instead of
-looking finished. `sirius doctor` also reports the plugin half as an advisory
-check, with the exact commands to fix whatever is missing.
+- **Desktop app, zero terminal:** click **+** next to the prompt box →
+  **Plugins** → **Add plugin** → add the `Davidb3l/Sirius-Forester`
+  marketplace and install `sirius`.
+- **Any shell** (or just ask Claude to run it — it's non-interactive,
+  Claude Code ≥ 2.1.195):
+
+  ```bash
+  claude plugin marketplace add Davidb3l/Sirius-Forester
+  claude plugin install sirius@sirius-forester
+  ```
+
+- **Terminal session:** the interactive `/plugin` dialog, same two steps.
+
+**Everything else — one sentence:** say **"let's Sothis this up"** (or run
+`/sirius:install-suite`). It installs every missing suite CLI via each tool's
+own installer, detects `amt`, checks `bun` for Catryna, runs `sirius doctor`,
+**auto-installs any missing plugins** via the non-interactive `claude plugin`
+CLI, and verifies the result — a half-done install says `YOU ARE NOT DONE`
+loudly instead of looking finished. `sirius doctor` reports the plugin half as
+an advisory check with exact fix commands, and plugins are per-machine, so one
+install covers the app, the terminal, and every repo.
+
+**Team repos:** commit this to the repo's `.claude/settings.json` and everyone
+who opens the folder gets a trust prompt that installs the suite plugins for
+them — no commands at all:
+
+```json
+{
+  "extraKnownMarketplaces": {
+    "sirius-forester": {
+      "source": { "source": "github", "repo": "Davidb3l/Sirius-Forester" }
+    }
+  },
+  "enabledPlugins": {
+    "sirius@sirius-forester": true,
+    "hayvenhurst@sirius-forester": true,
+    "catryna@sirius-forester": true
+  }
+}
+```
 
 ### Verifying what you downloaded
 
@@ -164,7 +194,7 @@ sirius doctor                    # verifies the integration contracts, live
 
 `sirius doctor` checks the five facts Sirius depends on — plus an advisory
 `plugin_handoff` check that warns (never fails) when the Claude Code plugin
-half of the suite is missing, naming the exact `/plugin` commands to finish.
+half of the suite is missing, naming the exact `claude plugin` commands to finish.
 It tells you exactly
 what is missing:
 

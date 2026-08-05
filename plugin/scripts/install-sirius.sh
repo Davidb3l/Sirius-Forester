@@ -120,8 +120,8 @@ suite_hint() {
   log "fleet suite: missing:$s_missing. Sirius is the foreman; for full fleet control install the whole suite (one-shot: /sirius:install-suite):"
   # Anyone running this script has the sirius plugin, hence the sirius-forester
   # marketplace: the Sothis bundle entries install with no extra marketplace add.
-  case "$s_missing" in *Hayvenhurst*) log "  Hayvenhurst (code graph): /plugin install hayvenhurst@sirius-forester, then /hayvenhurst:install-binary" ;; esac
-  case "$s_missing" in *Catryna*)     log "  Catryna Wikinelli (code wiki): /plugin install catryna@sirius-forester" ;; esac
+  case "$s_missing" in *Hayvenhurst*) log "  Hayvenhurst (code graph): claude plugin install hayvenhurst@sirius-forester, then /hayvenhurst:install-binary" ;; esac
+  case "$s_missing" in *Catryna*)     log "  Catryna Wikinelli (code wiki): claude plugin install catryna@sirius-forester" ;; esac
   case "$s_missing" in *Ametrite*)    log "  Ametrite (task board): ask Claude to \"ametrite this repo\" (the skill bootstraps the amt CLI)" ;; esac
 }
 

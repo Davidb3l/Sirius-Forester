@@ -1,0 +1,12 @@
+{
+  "extraKnownMarketplaces": {
+    "sirius-forester": {
+      "source": { "source": "github", "repo": "Davidb3l/Sirius-Forester" }
+    }
+  },
+  "enabledPlugins": {
+    "sirius@sirius-forester": true,
+    "hayvenhurst@sirius-forester": true,
+    "catryna@sirius-forester": true
+  }
+}
