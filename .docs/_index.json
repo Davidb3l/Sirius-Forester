@@ -20,8 +20,8 @@
       "refs": [],
       "verifiedCommit": "2a803a44d146b7540a83d2b6c50a1de95c538a9a",
       "verifiedAt": "2026-08-11T23:08:32.682Z",
-      "driftSuspectSince": "",
-      "driftSuspectReason": "",
+      "driftSuspectSince": "2026-08-11T23:09:21.465Z",
+      "driftSuspectReason": "code.changed touched src/main.rs, src/cli.rs",
       "createdAt": 1785915503544,
       "updatedAt": 1785915503544,
       "createdBy": "claude-code"
@@ -49,8 +49,8 @@
       "refs": [],
       "verifiedCommit": "2a803a44d146b7540a83d2b6c50a1de95c538a9a",
       "verifiedAt": "2026-08-11T23:08:32.537Z",
-      "driftSuspectSince": "",
-      "driftSuspectReason": "",
+      "driftSuspectSince": "2026-08-11T23:09:21.465Z",
+      "driftSuspectReason": "code.changed touched src/gate.rs",
       "createdAt": 1785915503544,
       "updatedAt": 1785915503544,
       "createdBy": "claude-code"
@@ -73,8 +73,8 @@
       "refs": [],
       "verifiedCommit": "2a803a44d146b7540a83d2b6c50a1de95c538a9a",
       "verifiedAt": "2026-08-11T23:08:32.614Z",
-      "driftSuspectSince": "",
-      "driftSuspectReason": "",
+      "driftSuspectSince": "2026-08-11T23:09:21.465Z",
+      "driftSuspectReason": "code.changed touched src/ledger.rs",
       "createdAt": 1785915503544,
       "updatedAt": 1785915503544,
       "createdBy": "claude-code"
@@ -102,8 +102,8 @@
       "refs": [],
       "verifiedCommit": "2a803a44d146b7540a83d2b6c50a1de95c538a9a",
       "verifiedAt": "2026-08-11T23:08:32.579Z",
-      "driftSuspectSince": "",
-      "driftSuspectReason": "",
+      "driftSuspectSince": "2026-08-11T23:09:21.465Z",
+      "driftSuspectReason": "code.changed touched src/ledger.rs, src/run.rs",
       "createdAt": 1785915503544,
       "updatedAt": 1785916461329,
       "createdBy": "claude-code"
@@ -148,8 +148,8 @@
       "refs": [],
       "verifiedCommit": "2a803a44d146b7540a83d2b6c50a1de95c538a9a",
       "verifiedAt": "2026-08-11T23:08:32.649Z",
-      "driftSuspectSince": "",
-      "driftSuspectReason": "",
+      "driftSuspectSince": "2026-08-11T23:09:21.465Z",
+      "driftSuspectReason": "code.changed touched src/bridge.rs",
       "createdAt": 1785915503544,
       "updatedAt": 1785915503544,
       "createdBy": "claude-code"
@@ -214,5 +214,5 @@
       "createdBy": "claude-code"
     }
   ],
-  "lastUpdated": 1786489712684
+  "lastUpdated": 1786489761467
 }

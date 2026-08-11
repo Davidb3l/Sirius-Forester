@@ -9,8 +9,8 @@ evidence: []
 refs: []
 verifiedCommit: "2a803a44d146b7540a83d2b6c50a1de95c538a9a"
 verifiedAt: "2026-08-11T23:08:32.614Z"
-driftSuspectSince: ""
-driftSuspectReason: ""
+driftSuspectSince: "2026-08-11T23:09:21.465Z"
+driftSuspectReason: "code.changed touched src/ledger.rs"
 createdAt: 1785915503544
 updatedAt: 1785915503544
 createdBy: "claude-code"
@@ -23,6 +23,8 @@ createdBy: "claude-code"
 It is an **audit log, not a second brain** — delete it and no work is lost, only the trail of how it happened. It is git-ignored and branch-invariant, because the ledger is a fact about work, not a code snapshot.
 
 The authoritative schema DDL is [`CONTRACTS.md` §1](../../CONTRACTS.md); `apply_schema` in `src/ledger.rs` is what actually runs.
+
+Parallel fleet workers each hold their own connection; WAL plus a 5-second `busy_timeout` (installed before the pragmas) serialize the concurrent writers.
 
 `Ledger::open` refuses a missing **or uninitialized** db: it opens without SQLite's CREATE flag and probes `meta.schema_version` before handing the connection out. A zero-byte or never-init'ed file used to "open" fine and then fail every write — each failure swallowed at its call site, which is how a fleet once ran for hours against a permanently-empty ledger with zero diagnostics. Failed ledger writes in the loop now also warn on stderr (`ledger_warn` in `src/run.rs`).
 

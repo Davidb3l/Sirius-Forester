@@ -26,7 +26,7 @@ use config::Config;
 use hayven::Hayven;
 use ledger::Ledger;
 use serde_json::{json, Value};
-use shell::RealRunner;
+use shell::{RealRunner, Runner};
 use std::io::Write;
 use std::process::ExitCode;
 use workspace::Workspace;
@@ -35,7 +35,7 @@ const SIRIUS_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let runner = RealRunner;
+    let runner = RealRunner::default();
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let ws = Workspace::discover(&cwd);
 
@@ -491,109 +491,241 @@ fn cmd_run(
     from: Option<String>,
     max_iterations: u32,
 ) -> u8 {
-    let ledger = match open_ledger(ws) {
-        Ok(l) => l,
+    // Validate the ledger up front for the friendly "run `sirius init` first"
+    // message; workers open their OWN connections (rusqlite Connection is not
+    // Sync — WAL + busy_timeout serialize the concurrent writers).
+    match open_ledger(ws) {
+        Ok(l) => drop(l),
         Err(c) => return c,
-    };
+    }
     let cfg = match load_config(ws) {
         Ok(c) => c,
         Err(c) => return c,
     };
-    let amt = Amt::new(runner);
-    let hv = Hayven::new(runner);
-    let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
+    let _ = runner; // workers construct their own (RealRunner is a unit type)
     let spine = spine::Spine::new(&ws.root);
 
-    // v1 runs workers sequentially in one foreground process (a killable loop,
-    // ROADMAP §"A daemon" rationale); concurrency cap bounds the roster names.
+    // Workers run as REAL parallel threads. The old v1 loop ran them
+    // sequentially in one process, so "--workers 3" gave three roster names
+    // and ZERO parallelism — a fleet whose agents run one at a time is slower
+    // than any orchestrator that fans out, which defeated the point of a
+    // foreman (field-observed: the fleet was killed for being slower than
+    // hand-run subagents). Claim atomicity (amt), entity locks (hayven), and
+    // per-worker ledger connections make concurrent iterations safe.
     let n = workers.max(1).min(cfg.worker_concurrency.max(1));
     let names: Vec<String> = tree_names(n);
 
     // Sanity: every phase name we emit is in the documented set (CONTRACTS §2).
     debug_assert!(run::PHASES.contains(&"claim") && run::PHASES.contains(&"release"));
 
-    let mut iterations = 0u32;
-    let mut idle_rounds = 0u32;
-    let mut consecutive_overlaps = 0u32;
-    // Persistent operational errors (amt missing, broken db) used to hot-loop
-    // forever: the Error arm set any_work=true with no sleep and no budget.
-    let mut consecutive_errors = 0u32;
-    const ERROR_BUDGET: u32 = 5;
-    loop {
-        let mut any_work = false;
+    // An unconfigured gate fails EVERY iteration closed (by design), so the
+    // loop would burn a full agent run per issue and advance NOTHING —
+    // observed in the field. Refuse to start rather than letting the operator
+    // discover it one expensive agent run at a time. (pass-with-warning is
+    // the one fallback that can advance without a test_cmd.)
+    if cfg.gate.test_cmd.is_none() && cfg.gate.fallback != config::GateFallback::PassWithWarning {
+        eprint_err(
+            "gate.test_cmd is not set — every gate would fail closed and no issue could \
+             advance; set gate.test_cmd in .sirius/config.json (or gate.fallback to \
+             \"pass-with-warning\" to advance ungated) and rerun",
+        );
+        return 1;
+    }
+
+    let iterations = std::sync::atomic::AtomicU32::new(0);
+    let any_failed = std::sync::atomic::AtomicBool::new(false);
+    let ledger_path = ws.ledger_path();
+    std::thread::scope(|s| {
         for name in &names {
-            if max_iterations > 0 && iterations >= max_iterations {
-                let _ = lock.flush();
-                return 0;
-            }
-            let outcome = run::run_iteration(
-                &amt,
-                &hv,
-                &ledger,
-                &cfg,
-                runner,
-                name,
-                from.as_deref(),
-                agent_cmd,
-                &mut lock,
-                Some(&spine),
-            );
-            iterations += 1;
-            match outcome {
-                run::IterationOutcome::NoWork { .. } => {
-                    // amt answered — the pipeline works, only the board is dry.
-                    consecutive_errors = 0;
-                }
-                run::IterationOutcome::ReleasedOverlap => {
-                    // Contention backoff (config-driven, exponential + clamped).
-                    let delay = cfg.backoff_delay_ms(consecutive_overlaps);
-                    consecutive_overlaps = consecutive_overlaps.saturating_add(1);
-                    consecutive_errors = 0;
-                    if let Err(e) = ledger.log_policy_event(
-                        None,
-                        "retry_budget",
-                        &serde_json::json!({"backoff_ms": delay}),
-                    ) {
-                        eprint_err(&format!("ledger write failed (log_policy_event): {e}"));
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(delay));
-                    any_work = true;
-                }
-                run::IterationOutcome::Error(e) => {
-                    eprint_err(&format!("{name}: {e}"));
-                    consecutive_errors = consecutive_errors.saturating_add(1);
-                    if consecutive_errors >= ERROR_BUDGET {
-                        eprint_err(&format!(
-                            "{consecutive_errors} consecutive errors — stopping (fix the cause and rerun)"
+            s.spawn(|| {
+                worker_loop(
+                    name,
+                    &ledger_path,
+                    &cfg,
+                    agent_cmd,
+                    from.as_deref(),
+                    max_iterations,
+                    &iterations,
+                    &any_failed,
+                    &spine,
+                );
+            });
+        }
+    });
+    u8::from(any_failed.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// One worker's whole run: claim-and-work until the board is dry, the shared
+/// iteration budget is spent, or the per-worker error budget trips.
+#[allow(clippy::too_many_arguments)]
+fn worker_loop(
+    name: &str,
+    ledger_path: &std::path::Path,
+    cfg: &Config,
+    agent_cmd: &str,
+    from: Option<&str>,
+    max_iterations: u32,
+    iterations: &std::sync::atomic::AtomicU32,
+    any_failed: &std::sync::atomic::AtomicBool,
+    spine: &spine::Spine,
+) {
+    use std::sync::atomic::Ordering;
+    const ERROR_BUDGET: u32 = 5;
+    // How many consecutive "board momentarily empty" probes (retry_after set —
+    // issues exist but are leased) a worker waits through before giving up.
+    const NOWORK_PROBES: u32 = 3;
+    const NOWORK_WAIT_CAP_SECS: u64 = 30;
+
+    // amt/hayven speak to the REPO (process cwd); the agent, git, and the
+    // gate's test run are scoped to this worker's PRIVATE worktree. Parallel
+    // agents in one shared checkout would cross-contaminate every baseline
+    // diff (worker A's gate would test worker B's half-written code) and race
+    // on git's index.lock — isolation is what makes the parallel fleet sound.
+    let repo_runner = RealRunner::default();
+    let base = match crate::gitrange::head_rev(&repo_runner) {
+        Ok(b) => b,
+        Err(e) => {
+            eprint_err(&format!("{name}: cannot resolve fleet base commit: {e}"));
+            any_failed.store(true, Ordering::SeqCst);
+            return;
+        }
+    };
+    let wt_path = ledger_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("worktrees")
+        .join(name.replace('/', "-"));
+    let wt_str = wt_path.to_string_lossy().to_string();
+    // Clear any stale worktree left by a killed run, then create fresh.
+    let _ = repo_runner.run("git", &["worktree", "remove", "--force", &wt_str]);
+    let _ = repo_runner.run("git", &["worktree", "prune"]);
+    let _ = std::fs::remove_dir_all(&wt_path);
+    match repo_runner.run("git", &["worktree", "add", "--detach", &wt_str, &base]) {
+        Ok(o) if o.success() => {}
+        other => {
+            let detail = match other {
+                Ok(o) => o.stderr.trim().to_string(),
+                Err(e) => e.to_string(),
+            };
+            // NO silent fallback to the shared checkout — that would be the
+            // unsound configuration this design exists to prevent.
+            eprint_err(&format!(
+                "{name}: cannot create worktree {wt_str}: {detail}"
+            ));
+            any_failed.store(true, Ordering::SeqCst);
+            return;
+        }
+    }
+    let agent_runner = RealRunner {
+        cwd: Some(wt_path.clone()),
+    };
+
+    let ledger = match Ledger::open(ledger_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprint_err(&format!("{name}: cannot open ledger: {e}"));
+            any_failed.store(true, Ordering::SeqCst);
+            return;
+        }
+    };
+    let amt = Amt::new(&repo_runner);
+    let hv = Hayven::new(&repo_runner);
+    let mut out = StdoutLineWriter;
+    let mut consecutive_overlaps = 0u32;
+    let mut consecutive_errors = 0u32;
+    let mut nowork_probes = 0u32;
+    loop {
+        // Reserve an iteration slot from the SHARED budget before claiming.
+        if max_iterations > 0 && iterations.fetch_add(1, Ordering::SeqCst) >= max_iterations {
+            break;
+        }
+        let outcome = run::run_iteration(
+            &amt,
+            &hv,
+            &ledger,
+            cfg,
+            &agent_runner,
+            name,
+            from,
+            agent_cmd,
+            &mut out,
+            Some(spine),
+            Some(&base),
+        );
+        match outcome {
+            run::IterationOutcome::NoWork { retry_after } => {
+                // retry_after set means issues EXIST but are leased right now
+                // (e.g. by sibling workers) — wait briefly and re-probe before
+                // giving up, so the pool doesn't drain while work can still
+                // come back to the board. A bare NoWork means truly dry: done.
+                match retry_after {
+                    Some(secs) if nowork_probes < NOWORK_PROBES => {
+                        nowork_probes += 1;
+                        std::thread::sleep(std::time::Duration::from_secs(
+                            secs.min(NOWORK_WAIT_CAP_SECS),
                         ));
-                        let _ = lock.flush();
-                        return 1;
                     }
-                    // Same clamped backoff as contention: a persistent error
-                    // must not spin the loop hot.
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        cfg.backoff_delay_ms(consecutive_errors),
+                    _ => break,
+                }
+            }
+            run::IterationOutcome::ReleasedOverlap => {
+                // Contention backoff (config-driven, exponential + clamped).
+                let delay = cfg.backoff_delay_ms(consecutive_overlaps);
+                consecutive_overlaps = consecutive_overlaps.saturating_add(1);
+                consecutive_errors = 0;
+                nowork_probes = 0;
+                if let Err(e) = ledger.log_policy_event(
+                    None,
+                    "retry_budget",
+                    &serde_json::json!({"backoff_ms": delay, "worker": name}),
+                ) {
+                    eprint_err(&format!("ledger write failed (log_policy_event): {e}"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
+            run::IterationOutcome::Error(e) => {
+                eprint_err(&format!("{name}: {e}"));
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                nowork_probes = 0;
+                if consecutive_errors >= ERROR_BUDGET {
+                    eprint_err(&format!(
+                        "{name}: {consecutive_errors} consecutive errors — stopping this worker (fix the cause and rerun)"
                     ));
-                    any_work = true;
+                    any_failed.store(true, Ordering::SeqCst);
+                    break;
                 }
-                _ => {
-                    consecutive_overlaps = 0;
-                    consecutive_errors = 0;
-                    any_work = true;
-                }
+                // Same clamped backoff as contention: a persistent error must
+                // not spin the loop hot.
+                std::thread::sleep(std::time::Duration::from_millis(
+                    cfg.backoff_delay_ms(consecutive_errors),
+                ));
+            }
+            _ => {
+                consecutive_overlaps = 0;
+                consecutive_errors = 0;
+                nowork_probes = 0;
             }
         }
-        if any_work {
-            idle_rounds = 0;
-        } else {
-            idle_rounds += 1;
-            // No work across a full round of workers → stop (v1 foreground loop).
-            if idle_rounds >= 1 {
-                let _ = lock.flush();
-                return 0;
-            }
-        }
+    }
+    // Tear the worktree down; completed work is safe — each issue's commits
+    // live on its `sirius/<issue>` branch in the SHARED .git, and abandoned
+    // failed-iteration leftovers are already recorded as deadends.
+    let _ = repo_runner.run("git", &["worktree", "remove", "--force", &wt_str]);
+}
+
+/// `Write` adapter that locks stdout PER WRITE. `emit_event` sends each NDJSON
+/// event as one `write_all`, so lines from parallel workers never interleave.
+struct StdoutLineWriter;
+
+impl Write for StdoutLineWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut h = std::io::stdout().lock();
+        h.write_all(buf)?;
+        h.flush()?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stdout().lock().flush()
     }
 }
 

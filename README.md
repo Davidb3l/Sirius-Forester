@@ -260,8 +260,10 @@ sirius run --workers 3 --agent-cmd 'claude -p "fix the claimed issue"' --from to
 # {"event":"iteration","worker":"sirius/oak","phase":"release","issue":"AMT-12","status":"in_review","advanced":true}
 ```
 
-v1 runs workers sequentially in one killable foreground process and exits when
-a full round finds no work. Policies (claim mode, 409 backoff, retry budget,
+Workers run as parallel threads in one killable foreground process, each in
+its own private git worktree (`.sirius/worktrees/<worker>`) with each issue's
+work on its own `sirius/<issue>` branch; a worker exits when the board is dry
+and the process exits when all workers have. Policies (claim mode, 409 backoff, retry budget,
 timeouts) live in `.sirius/config.json`; `sirius init` writes the defaults.
 
 ## Console and benchmarks

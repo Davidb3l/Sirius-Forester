@@ -99,11 +99,21 @@ pub trait Runner: Send + Sync {
 
 /// Spawns real subprocesses.
 #[derive(Debug, Default, Clone)]
-pub struct RealRunner;
+pub struct RealRunner {
+    /// Working directory for every spawned command. `None` inherits the
+    /// process cwd. Fleet workers set this to their isolated git worktree so
+    /// agents, git, and test runs never touch the shared checkout.
+    pub cwd: Option<std::path::PathBuf>,
+}
 
 impl Runner for RealRunner {
     fn run(&self, program: &str, args: &[&str]) -> std::io::Result<CmdOutput> {
-        let out = Command::new(program).args(args).output()?;
+        let mut cmd = Command::new(program);
+        cmd.args(args);
+        if let Some(d) = &self.cwd {
+            cmd.current_dir(d);
+        }
+        let out = cmd.output()?;
         Ok(CmdOutput {
             code: out.status.code(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -143,11 +153,12 @@ impl Runner for RealRunner {
             None => (Stdio::null(), Stdio::null()),
         };
 
-        let mut child = Command::new(program)
-            .args(args)
-            .stdout(stdout_cfg)
-            .stderr(stderr_cfg)
-            .spawn()?;
+        let mut cmd = Command::new(program);
+        cmd.args(args).stdout(stdout_cfg).stderr(stderr_cfg);
+        if let Some(d) = &self.cwd {
+            cmd.current_dir(d);
+        }
+        let mut child = cmd.spawn()?;
 
         // Poll on a tick short enough to stay responsive to the timeout, but
         // never longer than the heartbeat interval.
@@ -470,7 +481,7 @@ mod tests {
         // SIRF-7: a real hung command must be killed at the timeout, not waited
         // on forever, and the heartbeat must have fired at least once. Uses a
         // sub-second timeout so the test stays fast.
-        let r = RealRunner;
+        let r = RealRunner::default();
         let opts = AgentRunOpts {
             timeout: Duration::from_millis(200),
             heartbeat_interval: Duration::from_millis(50),
@@ -495,7 +506,7 @@ mod tests {
         // durable log (previously the output vanished on the success path).
         // Output now streams straight to the file, so the AgentOutcome carries
         // only the exit code — the log is the source of truth.
-        let r = RealRunner;
+        let r = RealRunner::default();
         let log = std::env::temp_dir().join(format!("sirius-agentlog-{}.log", std::process::id()));
         let _ = std::fs::remove_file(&log);
         let opts = AgentRunOpts {
@@ -522,7 +533,7 @@ mod tests {
         // deadlocked here — the child blocked on a full pipe, never exited, and
         // the poll loop spun until the timeout. The generous 15s timeout means a
         // regression surfaces as a TimedOut assertion failure, not a hung suite.
-        let r = RealRunner;
+        let r = RealRunner::default();
         let log = std::env::temp_dir().join(format!("sirius-biglog-{}.log", std::process::id()));
         let _ = std::fs::remove_file(&log);
         let opts = AgentRunOpts {

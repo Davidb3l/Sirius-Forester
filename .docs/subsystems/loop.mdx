@@ -9,8 +9,8 @@ evidence: []
 refs: []
 verifiedCommit: "2a803a44d146b7540a83d2b6c50a1de95c538a9a"
 verifiedAt: "2026-08-11T23:08:32.579Z"
-driftSuspectSince: ""
-driftSuspectReason: ""
+driftSuspectSince: "2026-08-11T23:09:21.465Z"
+driftSuspectReason: "code.changed touched src/ledger.rs, src/run.rs"
 createdAt: 1785915503544
 updatedAt: 1785916461329
 createdBy: "claude-code"
@@ -24,7 +24,17 @@ createdBy: "claude-code"
 claim → map → lock → brief → work → gate → receipt → release
 ```
 
-Those eight strings are the `PHASES` constant and appear verbatim in the NDJSON `phase` field. `sirius run --json` streams one JSON object per line to stdout.
+Those eight strings are the `PHASES` constant and appear verbatim in the NDJSON `phase` field. `sirius run --json` streams one JSON object per line to stdout (each event is a single atomic `write_all`, so parallel workers never interleave a line).
+
+## Parallel workers in isolated worktrees
+
+`cmd_run` spawns each worker as a real OS thread (`worker_loop` in `src/main.rs`) — the old v1 loop ran them sequentially, so `--workers 3` gave three roster names and zero parallelism. Each worker gets:
+
+- its **own git worktree** at `.sirius/worktrees/<worker>` (created from the fleet base commit, removed at exit). Agents, git diffs, and gate test runs all execute inside it — parallel agents in one shared checkout would cross-contaminate every baseline diff and race on git's `index.lock`. A worker whose worktree cannot be created **stops**; there is deliberately no fallback to the shared checkout.
+- its **own ledger connection** (WAL + a 5s busy timeout serialize concurrent writers) and its own `amt`/`hayven` adapters, which run against the repo, not the worktree.
+- a per-issue branch: each iteration hard-resets the worktree to the fleet base and does `git checkout -B sirius/<issue>`, so completed work survives on its branch after the worktree is torn down, and one iteration's leftovers can never poison the next issue's gate.
+
+Workers share an atomic iteration budget (`--max-iterations`) and a failure flag (exit code 1 if any worker trips its 5-consecutive-error budget). A worker whose `NoWork` answer carries `retry_after` (issues exist but are leased) waits briefly — capped at 30s, three probes — before giving up, so the pool doesn't drain while siblings may still release work back to the board. `sirius run` also **refuses to start** when `gate.test_cmd` is unset (unless `gate.fallback` is `pass-with-warning`): every gate would fail closed, burning a full agent run per issue while advancing nothing.
 
 ## Claim order is law
 
@@ -58,7 +68,7 @@ Adaptive counts recent `backoff_409` policy events: **2 or more** within the las
 
 ## Iteration outcomes
 
-`IterationOutcome` is one of `NoWork { retry_after }`, `Completed`, `ReleasedOverlap`, `Deadend` (retry budget exhausted, deadend note filed), or `Error(String)`. Each pass writes exactly one `iterations` row.
+`IterationOutcome` is one of `NoWork { retry_after }`, `Completed`, `ReleasedOverlap`, `Deadend` (gate failed for good — retry budget exhausted, or a structurally-unpassable gate such as an unconfigured `test_cmd` that skips retries entirely; deadend note filed), or `Error(String)`. Each pass writes exactly one `iterations` row.
 
 ## Two output streams, deliberately separate
 

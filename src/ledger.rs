@@ -60,6 +60,12 @@ impl Ledger {
                 | OpenFlags::SQLITE_OPEN_URI
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        // Parallel workers each hold their own connection; WAL serializes the
+        // writers, and the busy timeout turns a brief writer collision into a
+        // short wait instead of an SQLITE_BUSY error. Installed BEFORE the
+        // pragmas so even the journal_mode statement (itself a write when the
+        // db isn't WAL yet) waits instead of failing on a sibling's write.
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // Affirmative schema probe. A db that exists but was never init'ed

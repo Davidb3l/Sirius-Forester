@@ -44,7 +44,9 @@ pub fn emit_event(
             }
         }
     }
-    let _ = writeln!(out, "{obj}");
+    // ONE write_all per event: `writeln!` may issue several write() calls for
+    // a single line, which interleaves lines when workers share stdout.
+    let _ = out.write_all(format!("{obj}\n").as_bytes());
 }
 
 /// The decision an adaptive claimer makes for an iteration.
@@ -360,6 +362,11 @@ pub fn run_iteration(
     agent_cmd: &str,
     out: &mut dyn Write,
     spine: Option<&crate::spine::Spine>,
+    // When Some(base): `runner` is scoped to this worker's PRIVATE git
+    // worktree, and the iteration may safely hard-reset it to `base` and put
+    // each issue's work on its own branch. NEVER pass Some for a runner that
+    // targets the user's own checkout — the reset would destroy their work.
+    isolate_base: Option<&str>,
 ) -> IterationOutcome {
     ledger_warn("upsert_worker", ledger.upsert_worker(worker, "working"));
 
@@ -408,6 +415,48 @@ pub fn run_iteration(
             return IterationOutcome::Error(e);
         }
     };
+    // ISOLATED WORKSPACE (parallel fleet): reset the private worktree to the
+    // fleet base and put this issue's work on its own branch. Safe ONLY
+    // because the worktree belongs to this worker alone — leftovers being
+    // discarded here are a prior failed iteration's abandoned changes, whose
+    // deadend note already records what happened. This is also what keeps one
+    // iteration's leftovers from poisoning the next issue's gate.
+    if let Some(base) = isolate_base {
+        if let Some(i) = issue_id(&issue_val) {
+            let branch = format!("sirius/{}", i.to_lowercase());
+            let prep: [(&str, Vec<&str>); 3] = [
+                ("git", vec!["reset", "--hard", base]),
+                ("git", vec!["clean", "-fd"]),
+                ("git", vec!["checkout", "-B", &branch, base]),
+            ];
+            for (prog, args) in prep {
+                match runner.run(prog, &args) {
+                    Ok(o) if o.success() => {}
+                    other => {
+                        // A worktree we cannot reset is a workspace we cannot
+                        // trust — fail the iteration rather than gate over an
+                        // unknown baseline.
+                        let detail = match other {
+                            Ok(o) => o.stderr.trim().to_string(),
+                            Err(e) => e.to_string(),
+                        };
+                        release_issue_checked(
+                            amt,
+                            ledger,
+                            &i,
+                            worker,
+                            Some("todo"),
+                            Some("sirius: released — worktree preparation failed"),
+                        );
+                        return IterationOutcome::Error(format!(
+                            "worktree prep failed ({prog} {}): {detail}",
+                            args.join(" ")
+                        ));
+                    }
+                }
+            }
+        }
+    }
     let issue = match issue_id(&issue_val) {
         Some(i) => i,
         None => return IterationOutcome::Error("claim returned no issue id".into()),
@@ -645,11 +694,20 @@ pub fn run_iteration(
     // and a worktree-vs-HEAD diff over a committed change is empty, which used
     // to skip the gate and advance the issue with zero tests run. Best-effort:
     // if HEAD is unresolvable (fresh repo), the gate falls back to the old diff.
-    let pre_head = crate::gitrange::head_rev(runner).ok();
-    // Snapshot the untracked files that ALREADY exist — pre-existing scratch
-    // files are not the agent's change, and counting them would make every
-    // iteration gate (and potentially advance) over work nobody did.
-    let pre_untracked = crate::gitrange::untracked_files(runner).unwrap_or_default();
+    // In an isolated worktree the baseline IS the fleet base (the reset above
+    // guarantees it), and the post-clean tree has no pre-existing untracked
+    // files to snapshot.
+    let (pre_head, pre_untracked) = match isolate_base {
+        Some(base) => (Some(base.to_string()), Vec::new()),
+        None => (
+            crate::gitrange::head_rev(runner).ok(),
+            // Snapshot the untracked files that ALREADY exist — pre-existing
+            // scratch files are not the agent's change, and counting them
+            // would make every iteration gate (and potentially advance) over
+            // work nobody did.
+            crate::gitrange::untracked_files(runner).unwrap_or_default(),
+        ),
+    };
     loop {
         // WORK: spawn the agent command under supervision (SIRF-7). One beat
         //    fires before the spawn, and then a periodic heartbeat renews BOTH
@@ -812,7 +870,20 @@ pub fn run_iteration(
         // Retry decision (SIRF-9): only a FAIL is retryable, and only while the
         // budget has attempts left. Each retry is recorded as a policy event so
         // the ledger shows the honest attempt history.
-        if gate_result == "fail" && attempt + 1 < max_attempts {
+        //
+        // An `unconfigured` fail is STRUCTURAL — no test_cmd exists, so a
+        // fresh agent attempt cannot change the verdict, and retrying re-runs
+        // the whole (expensive) agent against a gate that can never pass
+        // (observed in the field as a fleet burning 3× agent time per issue
+        // and completing nothing). Everything else stays retryable: a blocked
+        // selection or a test-runner spawn failure can be transient (daemon
+        // restarting, fork pressure), and a fresh attempt produces a fresh
+        // diff that may map cleanly.
+        let gate_retryable = verdict
+            .as_ref()
+            .map(|v| v.plan != "unconfigured")
+            .unwrap_or(false);
+        if gate_result == "fail" && gate_retryable && attempt + 1 < max_attempts {
             ledger_warn(
                 "log_policy_event",
                 ledger.log_policy_event(
@@ -1158,6 +1229,7 @@ mod tests {
             "true",
             &mut out,
             None,
+            None,
         );
         assert_eq!(
             o,
@@ -1240,6 +1312,7 @@ mod tests {
             Some("todo"),
             "true",
             &mut out,
+            None,
             None,
         );
         assert_eq!(o, IterationOutcome::Completed);
@@ -1324,6 +1397,7 @@ mod tests {
             Some("todo"),
             "true",
             &mut out,
+            None,
             None,
         );
         // A failed gate ends the iteration as a deadend, not a completion.
@@ -1414,6 +1488,7 @@ mod tests {
             "sleep 999",
             &mut out,
             None,
+            None,
         );
         assert_eq!(o, IterationOutcome::Deadend);
 
@@ -1494,6 +1569,7 @@ mod tests {
             Some("todo"),
             "long-cmd",
             &mut out,
+            None,
             None,
         );
 
@@ -1689,6 +1765,7 @@ mod tests {
             "true",
             &mut out,
             None,
+            None,
         );
         assert_eq!(o, IterationOutcome::Completed);
         // The gate diffed against the pinned baseline, not bare HEAD.
@@ -1707,6 +1784,185 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, "completed");
         assert_eq!(gate, "pass", "the gate must RUN, not skip");
+    }
+
+    // Isolated iterations (parallel fleet) reset the private worktree to the
+    // fleet base, branch per issue, and diff against the base — no rev-parse,
+    // no pre-untracked snapshot (the clean guarantees a pristine tree).
+    #[test]
+    fn isolated_iteration_resets_branches_and_diffs_the_base() {
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-40");
+        // Worktree prep: reset → clean → checkout -B, all vs the fleet base.
+        m.expect(&["git", "reset"], 0, "");
+        m.expect(&["git", "clean"], 0, "");
+        m.expect(&["git", "checkout"], 0, "");
+        m.expect(&["sh", "-c"], 0, ""); // agent
+        m.expect(&["git", "diff", "--name-only", "base999"], 0, "src/x.rs\n");
+        m.expect(
+            &["hayven", "affected-tests"],
+            0,
+            r#"{"roots":["x"],"note":"","tests":[]}"#,
+        );
+        m.expect(&["sh", "-c"], 0, "ok"); // full suite passes
+        m.expect(
+            &["amt", "--json", "issue", "update"],
+            0,
+            r#"{"id":"AMT-40"}"#,
+        );
+        m.expect(
+            &["amt", "--json", "decide"],
+            0,
+            r#"{"id":"D-2","resolves":"AMT-40"}"#,
+        );
+        m.expect(
+            &["amt", "--json", "decision", "show"],
+            0,
+            r#"{"id":"D-2","resolves":"AMT-40"}"#,
+        );
+        m.expect(&["hayven", "remember"], 0, r#"{"id":"mem"}"#);
+        m.expect(&["hayven", "release"], 0, "ok");
+        m.expect(&["amt", "--json", "release"], 0, r#"{"id":"AMT-40"}"#);
+
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &cfg(),
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
+            None,
+            Some("base999"),
+        );
+        assert_eq!(o, IterationOutcome::Completed);
+        let calls = m.recorded();
+        assert!(
+            calls.iter().any(|c| c == "git reset --hard base999"),
+            "{calls:?}"
+        );
+        assert!(calls.iter().any(|c| c == "git clean -fd"), "{calls:?}");
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "git checkout -B sirius/amt-40 base999"),
+            "{calls:?}"
+        );
+        // The baseline is the fleet base — no rev-parse, no pre-untracked scan
+        // before the agent ran.
+        assert!(
+            !calls.iter().any(|c| c.starts_with("git rev-parse")),
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == "git diff --name-only base999"),
+            "{calls:?}"
+        );
+    }
+
+    // A worktree that cannot be reset is a workspace that cannot be trusted:
+    // the iteration must fail (releasing the issue), never gate over an
+    // unknown baseline.
+    #[test]
+    fn isolated_iteration_fails_when_worktree_prep_fails() {
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-41");
+        m.push(MockResponse::new(
+            &["git", "reset"],
+            128,
+            "",
+            "fatal: unable to write index",
+        ));
+        m.expect(&["amt", "--json", "release"], 0, r#"{"id":"AMT-41"}"#);
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &cfg(),
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
+            None,
+            Some("base999"),
+        );
+        match o {
+            IterationOutcome::Error(e) => assert!(e.contains("worktree prep"), "{e}"),
+            other => panic!("prep failure must be an error, got {other:?}"),
+        }
+        // The agent never ran.
+        assert!(
+            !m.recorded().iter().any(|c| c == "sh -c true"),
+            "{:?}",
+            m.recorded()
+        );
+    }
+
+    // A STRUCTURAL gate failure (no tests ran: unconfigured test_cmd, blocked
+    // policy) must not consume the retry budget — a fresh agent attempt cannot
+    // change it, and the old behavior re-ran the whole agent retry_budget
+    // times per issue against a gate that could never pass (field-observed as
+    // a fleet burning 3× agent time and completing nothing).
+    #[test]
+    fn unconfigured_gate_does_not_burn_agent_retries() {
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-33");
+        m.expect(&["git", "rev-parse"], 0, "base123\n");
+        m.expect(&["sh", "-c"], 0, ""); // agent, ONCE
+        m.expect(&["git", "diff", "--name-only", "base123"], 0, "src/x.rs\n");
+        m.expect(
+            &["hayven", "affected-tests"],
+            0,
+            r#"{"roots":["x"],"note":"","tests":[]}"#,
+        );
+        // No sh -c test run is programmed: test_cmd is None (unconfigured).
+        m.expect(&["hayven", "release"], 0, "ok");
+        m.expect(&["amt", "--json", "release"], 0, r#"{"id":"AMT-33"}"#);
+
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let mut out = Vec::new();
+        let c = Config {
+            retry_budget: 3,
+            gate: crate::config::GateConfig {
+                test_cmd: None, // fail-closed, structurally unpassable
+                fallback: crate::config::GateFallback::FullSuite,
+            },
+            ..cfg()
+        };
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &c,
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
+            None,
+            None,
+        );
+        assert_eq!(o, IterationOutcome::Deadend);
+        // ONE agent run, despite retry_budget=3.
+        let agent_runs = m.recorded().iter().filter(|c| **c == "sh -c true").count();
+        assert_eq!(
+            agent_runs, 1,
+            "a structurally-unpassable gate must not re-run the agent"
+        );
+        assert_eq!(led.count_policy_events("retry_budget", 100).unwrap(), 0);
     }
 
     // A failed agent must NEVER advance the issue — even if a leftover or
@@ -1743,6 +1999,7 @@ mod tests {
             Some("todo"),
             "broken-agent",
             &mut out,
+            None,
             None,
         );
         assert!(
@@ -1804,6 +2061,7 @@ mod tests {
             Some("todo"),
             "true",
             &mut out,
+            None,
             None,
         );
         // Gate FAILED (not skipped): deadend, released un-advanced.
@@ -1881,6 +2139,7 @@ mod tests {
             Some("todo"),
             "true",
             &mut out,
+            None,
             None,
         );
         assert_eq!(o, IterationOutcome::Completed);
@@ -1964,6 +2223,7 @@ mod tests {
             "true",
             &mut out,
             None,
+            None,
         );
         assert_eq!(o, IterationOutcome::Deadend);
 
@@ -2023,6 +2283,7 @@ mod tests {
             Some("todo"),
             "sleep 999",
             &mut out,
+            None,
             None,
         );
         assert_eq!(o, IterationOutcome::Deadend);
@@ -2091,6 +2352,7 @@ mod tests {
             "true",
             &mut out,
             None,
+            None,
         );
         assert_eq!(o, IterationOutcome::Completed);
         // The stored oracle_verdicts JSON reflects the FORCE, not "registered".
@@ -2134,6 +2396,7 @@ mod tests {
             Some("todo"),
             "true",
             &mut out,
+            None,
             None,
         );
         assert_eq!(o, IterationOutcome::ReleasedOverlap);
