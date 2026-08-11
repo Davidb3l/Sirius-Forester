@@ -101,7 +101,19 @@ impl<'r> Amt<'r> {
     /// `amt --json claim --issue <id> --agent <agent>` — re-claim your own
     /// issue id to renew its lease (heartbeat). Same agent + id is a refresh.
     pub fn heartbeat(&self, issue: &str, agent: &str) -> Result<(), String> {
-        self.json_ok(&["--json", "claim", "--issue", issue, "--agent", agent])
+        let v = self.json(&["--json", "claim", "--issue", issue, "--agent", agent])?;
+        // amt signals a REFUSED refresh (lease lapsed, another agent claimed)
+        // as exit 0 + `{"claimed": false, ...}` — the same shape as claim's
+        // no-work answer. Checking only the exit code read that as success,
+        // so a lost lease looked renewed and two agents could share an issue.
+        if v.get("claimed").and_then(Value::as_bool) == Some(false) {
+            let reason = v
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("lease not held by this agent");
+            return Err(format!("lease refresh refused: {reason}"));
+        }
+        Ok(())
     }
 
     /// `amt --json issue show <id>`
@@ -237,6 +249,26 @@ mod tests {
             }
             other => panic!("expected NoWork, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn heartbeat_detects_a_refused_refresh() {
+        // amt signals a refused refresh as exit 0 + claimed:false — the exit
+        // code alone read that as success, so a lapsed lease looked renewed
+        // and two agents could end up working the same issue.
+        let m = MockRunner::new();
+        m.expect(
+            &["amt", "--json", "claim"],
+            0,
+            r#"{"claimed":false,"reason":"lease held by sirius/rowan"}"#,
+        );
+        let amt = Amt::new(&m);
+        let err = amt.heartbeat("AMT-7", "sirius/oak").unwrap_err();
+        assert!(err.contains("refused"), "{err}");
+        assert!(err.contains("sirius/rowan"), "{err}");
+        // A healthy refresh (the issue object back) is Ok.
+        m.expect(&["amt", "--json", "claim"], 0, r#"{"id":"AMT-7"}"#);
+        assert!(amt.heartbeat("AMT-7", "sirius/oak").is_ok());
     }
 
     #[test]

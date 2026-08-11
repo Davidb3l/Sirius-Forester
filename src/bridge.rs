@@ -158,7 +158,12 @@ pub struct WhySymbol {
 }
 
 pub fn why_symbol(amt: &Amt, hv: &Hayven, symbol: &str) -> Result<WhySymbol, String> {
-    let recall = hv.recall_node(symbol).unwrap_or(Value::Null);
+    // A recall failure (daemon down / wrong project) must ERROR, not read as
+    // "no provenance recorded" — for a provenance tool a confident empty
+    // answer is a WRONG answer, not a degraded one.
+    let recall = hv
+        .recall_node(symbol)
+        .map_err(|e| format!("recall failed for {symbol}: {e}"))?;
     let text = collect_note_text(&recall);
     let (issue_refs, decision_refs) = extract_refs(&text);
 

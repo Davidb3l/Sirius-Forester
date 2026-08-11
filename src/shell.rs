@@ -25,11 +25,6 @@ impl CmdOutput {
     pub fn success(&self) -> bool {
         self.code == Some(0)
     }
-
-    /// The exit code, defaulting to 1 when the process was signal-killed.
-    pub fn code_or_err(&self) -> i32 {
-        self.code.unwrap_or(1)
-    }
 }
 
 /// How to supervise a long-running agent command (SIRF-7). Passed to

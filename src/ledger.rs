@@ -51,9 +51,27 @@ pub struct Ledger {
 impl Ledger {
     /// Open (must already exist). Enables WAL and foreign keys.
     pub fn open(path: &Path) -> rusqlite::Result<Ledger> {
-        let conn = Connection::open(path)?;
+        use rusqlite::OpenFlags;
+        // No CREATE flag: a missing db must be an error here, never a fresh
+        // silent file — `sirius init` is the only creator.
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Affirmative schema probe. A db that exists but was never init'ed
+        // (zero-byte file, crashed init, foreign tool) used to "open" fine and
+        // then fail EVERY later write — each failure swallowed at its call
+        // site, producing the field-observed permanently-empty ledger with
+        // zero diagnostics. Fail here, loudly, instead.
+        conn.query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |r| r.get::<_, String>(0),
+        )?;
         Ok(Ledger { conn })
     }
 
@@ -211,12 +229,17 @@ impl Ledger {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Count recent policy events of a kind — used by adaptive claiming (M5)
-    /// to read contention from history.
+    /// Count how many of the LAST `limit` policy events (of any kind) are of
+    /// `kind` — used by adaptive claiming (M5) to read contention from recent
+    /// history. The filter must apply AFTER the window: the old form filtered
+    /// `WHERE kind` before `LIMIT`, which counted all-time occurrences (capped
+    /// at `limit`) — so two 409s EVER latched adaptive mode into pre-claiming
+    /// forever, with no decay as calmer events arrived.
     pub fn count_policy_events(&self, kind: &str, limit: i64) -> rusqlite::Result<i64> {
         self.conn.query_row(
-            "SELECT COUNT(*) FROM (SELECT id FROM policy_events
-             WHERE kind = ?1 ORDER BY id DESC LIMIT ?2)",
+            "SELECT COUNT(*) FROM (SELECT kind FROM policy_events
+             ORDER BY id DESC LIMIT ?2)
+             WHERE kind = ?1",
             params![kind, limit],
             |r| r.get(0),
         )
@@ -296,6 +319,42 @@ fn apply_schema(conn: &Connection, sirius_version: &str) -> rusqlite::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_rejects_a_missing_or_uninitialized_db() {
+        let dir = std::env::temp_dir().join(format!("sirius-ledger-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Missing file: must NOT be silently created — `sirius init` is the
+        // only creator.
+        assert!(Ledger::open(&dir.join("absent.db")).is_err());
+        // Present but schema-less (crashed init, zero-byte file, foreign
+        // tool): must error HERE, loudly, not fail every later write silently
+        // (the field-observed permanently-empty ledger).
+        let empty = dir.join("empty.db");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(Ledger::open(&empty).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn count_policy_events_is_a_recent_window_not_all_time() {
+        let led = Ledger::open_in_memory().unwrap();
+        led.log_policy_event(None, "backoff_409", &serde_json::json!({}))
+            .unwrap();
+        led.log_policy_event(None, "backoff_409", &serde_json::json!({}))
+            .unwrap();
+        assert_eq!(led.count_policy_events("backoff_409", 20).unwrap(), 2);
+        // Twenty calmer events push the 409s out of the sampled window —
+        // contention must DECAY. The old filter-before-limit form counted
+        // all-time occurrences, so two 409s ever latched adaptive mode into
+        // pre-claiming forever.
+        for _ in 0..20 {
+            led.log_policy_event(None, "concurrency", &serde_json::json!({}))
+                .unwrap();
+        }
+        assert_eq!(led.count_policy_events("backoff_409", 20).unwrap(), 0);
+    }
 
     #[test]
     fn iso8601_epoch_zero() {

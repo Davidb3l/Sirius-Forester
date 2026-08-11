@@ -1,6 +1,6 @@
 [package]
 name = "sirius"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Sirius Forester — a local-first fleet foreman for AI coding agents"
 license = "MIT"

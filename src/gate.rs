@@ -164,13 +164,27 @@ pub fn decide_plan(sel: &Selection, changed_files: &[String], fallback: GateFall
     if let Some(f) = changed_files.iter().find(|f| is_global_impact(f)) {
         return GatePlan::Full(format!("global-impact file changed ({f})"));
     }
-    let trustworthy =
-        sel.ok && sel.roots > 0 && !sel.runnables.is_empty() && !note_is_suspect(&sel.note);
+    // EVERY changed file must have resolved to an indexed entity — a partial
+    // mapping (roots < changed) means the unmapped files contributed nothing
+    // to the selection, which is exactly the "missed a test" hole the module
+    // header forbids. `roots > 0` alone blessed a 1-of-4 mapping.
+    //
+    // KNOWN RESIDUAL: `roots` is the daemon's root-entity count, not a
+    // per-file mapping — one file resolving to several entities can mask
+    // another file resolving to none. Closing that fully needs a per-file
+    // answer from `hayven affected-tests`; until then this cardinality check
+    // is strictly tighter than the old bar, never looser.
+    let fully_mapped = sel.roots >= changed_files.len();
+    // Runnable ids come from daemon JSON. A dash-leading id survives
+    // shell_quote's allowlist and reaches the test runner AS A FLAG
+    // (`pytest -q --co` exits 0 running nothing) — refuse to trust any.
+    let ids_sane = !sel.runnables.is_empty() && sel.runnables.iter().all(|r| !r.starts_with('-'));
+    let trustworthy = sel.ok && fully_mapped && ids_sane && !note_is_suspect(&sel.note);
     if trustworthy {
         let reason = format!("{} affected test(s) selected", sel.runnables.len());
         return GatePlan::Subset(sel.runnables.clone(), reason);
     }
-    let reason = doubt_reason(sel);
+    let reason = doubt_reason(sel, changed_files.len());
     match fallback {
         GateFallback::FullSuite => GatePlan::Full(reason),
         GateFallback::Fail => GatePlan::Block(reason),
@@ -179,7 +193,7 @@ pub fn decide_plan(sel: &Selection, changed_files: &[String], fallback: GateFall
 }
 
 /// A human reason the selection wasn't trusted, most-specific first.
-fn doubt_reason(sel: &Selection) -> String {
+fn doubt_reason(sel: &Selection, changed: usize) -> String {
     if !sel.ok {
         format!(
             "selector failed or returned no JSON ({})",
@@ -187,10 +201,18 @@ fn doubt_reason(sel: &Selection) -> String {
         )
     } else if sel.roots == 0 {
         "no changed file mapped to an indexed entity (roots=0)".into()
+    } else if sel.roots < changed {
+        format!(
+            "only {} of {changed} changed file(s) mapped to indexed entities",
+            sel.roots
+        )
     } else if note_is_suspect(&sel.note) {
         format!("selector may under-report (note: {})", sel.note)
     } else if sel.runnables.is_empty() {
         "selector produced no runnable test ids".into()
+    } else if sel.runnables.iter().any(|r| r.starts_with('-')) {
+        "selector returned flag-like runnable id(s) — refusing to pass them to the test runner"
+            .into()
     } else {
         "selection not trustworthy".into()
     }
@@ -303,6 +325,20 @@ pub fn evaluate(
 ) -> GateVerdict {
     let sel = select(hv, changed_files);
     let plan = decide_plan(&sel, changed_files, gate.fallback);
+    execute_plan(runner, gate.test_cmd.as_deref(), plan)
+}
+
+/// Gate under maximal doubt — the changed-file set itself is UNKNOWN (e.g. git
+/// failed), so no selection is possible and no narrow run can be trusted. Goes
+/// straight to the fallback policy. SIRF-11: the loop used to fold a git error
+/// into "nothing changed" and skip the gate entirely — fail-open; this is the
+/// fail-closed replacement.
+pub fn evaluate_doubt(runner: &dyn Runner, gate: &GateConfig, reason: &str) -> GateVerdict {
+    let plan = match gate.fallback {
+        GateFallback::FullSuite => GatePlan::Full(reason.to_string()),
+        GateFallback::Fail => GatePlan::Block(reason.to_string()),
+        GateFallback::PassWithWarning => GatePlan::WarnPass(reason.to_string()),
+    };
     execute_plan(runner, gate.test_cmd.as_deref(), plan)
 }
 
@@ -448,6 +484,74 @@ mod tests {
         ));
         let hv = Hayven::new(&m);
         select(&hv, &["src/a.rs".into()])
+    }
+
+    // A partially-mapped change set (roots < changed files) means the unmapped
+    // files contributed NOTHING to the selection — that is doubt, never a
+    // trusted narrow run. `roots > 0` used to bless a 1-of-2 mapping.
+    #[test]
+    fn partial_root_mapping_is_doubt() {
+        let sel = Selection {
+            ok: true,
+            roots: 1,
+            runnables: vec!["t::a".into()],
+            ..Default::default()
+        };
+        let changed = vec!["src/a.rs".to_string(), "queries/report.sql".to_string()];
+        match decide_plan(&sel, &changed, GateFallback::FullSuite) {
+            GatePlan::Full(reason) => assert!(reason.contains("only 1 of 2"), "{reason}"),
+            other => panic!("partial mapping must not run a narrow subset: {other:?}"),
+        }
+    }
+
+    // A dash-leading runnable id from the daemon would reach the test runner
+    // as a FLAG (`pytest -q --co` exits 0 running nothing) — never trust one.
+    #[test]
+    fn flag_like_runnable_id_is_doubt() {
+        let sel = Selection {
+            ok: true,
+            roots: 1,
+            runnables: vec!["--co".into()],
+            ..Default::default()
+        };
+        let changed = vec!["src/a.py".to_string()];
+        match decide_plan(&sel, &changed, GateFallback::FullSuite) {
+            GatePlan::Full(reason) => assert!(reason.contains("flag-like"), "{reason}"),
+            other => panic!("flag-like id must be doubt: {other:?}"),
+        }
+    }
+
+    // SIRF-11: when the changed-file set is UNKNOWN (git failed), the gate goes
+    // straight to the fallback policy — never a skip, never a narrow subset.
+    #[test]
+    fn evaluate_doubt_fails_closed_per_policy() {
+        // full-suite fallback: the suite actually runs and its verdict rules.
+        let m = MockRunner::new();
+        m.expect(&["sh", "-c"], 0, "ok");
+        let g = GateConfig {
+            test_cmd: Some("run-suite".into()),
+            fallback: GateFallback::FullSuite,
+        };
+        let v = evaluate_doubt(&m, &g, "cannot determine changed files: boom");
+        assert!(v.ran_tests && v.passed);
+        assert_eq!(v.plan, "full-suite");
+
+        // fail fallback: blocked without running anything.
+        let g2 = GateConfig {
+            test_cmd: Some("run-suite".into()),
+            fallback: GateFallback::Fail,
+        };
+        let v2 = evaluate_doubt(&MockRunner::new(), &g2, "boom");
+        assert!(!v2.passed && !v2.ran_tests);
+
+        // unconfigured test_cmd under full-suite doubt: fail-closed.
+        let g3 = GateConfig {
+            test_cmd: None,
+            fallback: GateFallback::FullSuite,
+        };
+        let v3 = evaluate_doubt(&MockRunner::new(), &g3, "boom");
+        assert!(!v3.passed);
+        assert_eq!(v3.plan, "unconfigured");
     }
 
     #[test]

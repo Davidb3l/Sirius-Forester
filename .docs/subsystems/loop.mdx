@@ -32,7 +32,7 @@ Those eight strings are the `PHASES` constant and appear verbatim in the NDJSON 
 
 On a hard entity overlap (409), the issue is released back with a comment naming the blocker. Sirius never holds an issue while spinning on a code lock — that is the rule that keeps a stuck worker from parking work nobody else can take.
 
-`lock_entities` walks the entity list in order, accumulating `acquired` claim ids. On any failure it returns without releasing anything; the caller unwinds. `LockResult` carries three shapes: `Locked { claim_ids, verdicts }`, `Overlap { blocker, acquired }`, and `OracleBackoff { detail, acquired }`.
+`lock_entities` walks the entity list in order, accumulating `acquired` claim ids. On any failure it returns without releasing anything; the caller unwinds. `LockResult` carries four shapes: `Locked { claim_ids, verdicts }`, `Overlap { blocker, acquired }`, `OracleBackoff { detail, acquired }`, and `Failed { detail, acquired }` — the last is an *operational* claim failure (daemon unreachable, wrong project, crashed CLI) that surfaces as `IterationOutcome::Error` so the run loop's error budget applies, instead of masquerading as contention and retrying forever.
 
 The `verdicts` vector is parallel to `claim_ids` and records how each claim was actually obtained — `"registered"` (clean) or `"forced"` (oracle-conflicted, then forced under `Oracle202::ForceWithBudget`). It is written to the ledger verbatim rather than fabricating a uniform `"registered"` vector.
 

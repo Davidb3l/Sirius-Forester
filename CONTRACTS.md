@@ -236,8 +236,10 @@ ever shells the parents directly (it should only shell `sirius --json`).
   `tests` is empty, and there are no `--gate` / `--gate-tier` flags in 0.0.5. **Sirius owns
   the run-the-tests half itself.** The gate (`src/gate.rs`): (1) resolves changed files from
   a git range, (2) calls `hayven affected-tests --changed <csv> --json` to *select*, (3)
-  trusts a narrow selection **only** when the command succeeded, `roots > 0`, there are
-  runnable ids, the `note` raises no under-report/stale flag, and no global-impact file
+  trusts a narrow selection **only** when the command succeeded, every changed file mapped
+  (`roots >= changed files` — `roots > 0` alone blessed partial mappings), there are
+  runnable ids (none dash-leading — a flag-like id would reach the test runner as a flag),
+  the `note` raises no under-report/stale flag, and no global-impact file
   (Cargo.toml, package.json, `.github/`, …) changed — otherwise it **falls back to the full
   suite**, (4) runs the chosen tests via the configurable **`gate.test_cmd`** (e.g.
   `cargo test`), and (5) takes the verdict from the **test runner's** exit code. The

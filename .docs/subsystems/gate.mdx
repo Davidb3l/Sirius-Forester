@@ -39,8 +39,10 @@ The governing rule is *"ran too much, never missed a test."*
 `decide_plan` is pure and unit-tested. A narrow (subset) run requires **all** of:
 
 - the selector command succeeded and its stdout parsed as JSON (`sel.ok`)
-- at least one changed file mapped to an indexed entity (`roots > 0`)
-- there is at least one runnable test id
+- **every** changed file mapped to an indexed entity (`roots >= changed files` — a partial
+  mapping means the unmapped files contributed nothing to the selection)
+- there is at least one runnable test id, and none is dash-leading (a flag-like id from the
+  daemon would reach the test runner as a *flag* — `pytest -q --co` exits 0 running nothing)
 - the selector's own `note` raises no under-reporting flag
 - **no global-impact file changed**
 

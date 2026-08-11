@@ -108,8 +108,8 @@ impl<'r> Hayven<'r> {
             }
         };
         let detail = combined(&out).trim().to_string();
-        match out.code_or_err() {
-            0 => {
+        match out.code {
+            Some(0) => {
                 // Try to lift a claim id out of any JSON on stdout.
                 let claim_id = serde_json::from_str::<Value>(&out.stdout)
                     .ok()
@@ -122,8 +122,18 @@ impl<'r> Hayven<'r> {
                     });
                 ClaimVerdict::Registered { claim_id }
             }
-            1 => ClaimVerdict::Overlap { detail },
-            3 => ClaimVerdict::OracleConflict { detail },
+            // Exit 1 is OVERLOADED upstream: a genuine 409 overlap, but also
+            // "daemon serves a DIFFERENT project" and daemon-unreachable
+            // errors. Treating those as Overlap sent the loop into endless
+            // 409 backoff against a daemon that would never answer (the
+            // shared-daemon-on-:7777 topology is the NORM in the field).
+            // Disambiguate by the message; only a real overlap backs off.
+            Some(1) if looks_like_non_overlap_failure(&detail) => ClaimVerdict::Error { detail },
+            Some(1) => ClaimVerdict::Overlap { detail },
+            Some(3) => ClaimVerdict::OracleConflict { detail },
+            // Signal-killed (code None) or any other exit: an ERROR, not an
+            // overlap — a None→1 exit-code default used to fold a crashed
+            // CLI into "another worker holds the claim".
             _ => ClaimVerdict::Error { detail },
         }
     }
@@ -214,6 +224,29 @@ impl<'r> Hayven<'r> {
     }
 }
 
+/// Does an exit-1 `hayven claim` message describe an OPERATIONAL failure
+/// rather than a genuine 409 overlap? Upstream overloads exit 1 for both (see
+/// the module header: "serves a DIFFERENT project" is also exit 1), and a
+/// daemon-unreachable CLI errors the same way. Message-sniffing is fragile by
+/// nature, but the failure mode it prevents — endless 409 backoff against a
+/// daemon that will never answer — is worse than an occasional miss (which
+/// merely restores the old behavior for that message).
+fn looks_like_non_overlap_failure(detail: &str) -> bool {
+    let d = detail.to_ascii_lowercase();
+    [
+        "different project",
+        "not serving",
+        "connection refused",
+        "econnrefused",
+        "daemon not running",
+        "no daemon",
+        "failed to connect",
+        "connect error",
+    ]
+    .iter()
+    .any(|k| d.contains(k))
+}
+
 /// Combine stdout+stderr for human-readable error/detail text (hayven prints
 /// errors on either stream depending on the path).
 fn combined(out: &CmdOutput) -> String {
@@ -262,6 +295,42 @@ mod tests {
             ClaimVerdict::Overlap { detail } => assert!(detail.contains("409")),
             other => panic!("expected Overlap, got {other:?}"),
         }
+    }
+
+    // Exit 1 is overloaded upstream: also "serves a DIFFERENT project" and
+    // daemon-unreachable. Those are OPERATIONAL errors — mapping them to
+    // Overlap sent the loop into endless 409 backoff against a daemon that
+    // would never answer (the shared-daemon topology is the field norm).
+    #[test]
+    fn claim_exit1_wrong_project_is_error_not_overlap() {
+        let m = MockRunner::new();
+        m.push(MockResponse::new(
+            &["hayven", "claim"],
+            1,
+            "",
+            "workspace error: daemon on :7777 serves a DIFFERENT project (/other/repo)",
+        ));
+        let h = Hayven::new(&m);
+        match h.claim(&["a".into()], "i", false) {
+            ClaimVerdict::Error { detail } => assert!(detail.contains("DIFFERENT")),
+            other => panic!("wrong-project exit 1 must be an Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claim_exit1_connection_refused_is_error_not_overlap() {
+        let m = MockRunner::new();
+        m.push(MockResponse::new(
+            &["hayven", "claim"],
+            1,
+            "",
+            "error: connection refused (is the daemon running on :7777?)",
+        ));
+        let h = Hayven::new(&m);
+        assert!(matches!(
+            h.claim(&["a".into()], "i", false),
+            ClaimVerdict::Error { .. }
+        ));
     }
 
     #[test]

@@ -63,16 +63,8 @@ fn main() -> ExitCode {
             agent_cmd,
             from,
             max_iterations,
-            json,
-        } => cmd_run(
-            &ws,
-            &runner,
-            workers,
-            &agent_cmd,
-            from,
-            max_iterations,
-            json,
-        ),
+            json: _, // contract-compat no-op: run always streams NDJSON
+        } => cmd_run(&ws, &runner, workers, &agent_cmd, from, max_iterations),
     };
     ExitCode::from(code)
 }
@@ -498,7 +490,6 @@ fn cmd_run(
     agent_cmd: &str,
     from: Option<String>,
     max_iterations: u32,
-    _json: bool,
 ) -> u8 {
     let ledger = match open_ledger(ws) {
         Ok(l) => l,
@@ -525,6 +516,10 @@ fn cmd_run(
     let mut iterations = 0u32;
     let mut idle_rounds = 0u32;
     let mut consecutive_overlaps = 0u32;
+    // Persistent operational errors (amt missing, broken db) used to hot-loop
+    // forever: the Error arm set any_work=true with no sleep and no budget.
+    let mut consecutive_errors = 0u32;
+    const ERROR_BUDGET: u32 = 5;
     loop {
         let mut any_work = false;
         for name in &names {
@@ -546,27 +541,45 @@ fn cmd_run(
             );
             iterations += 1;
             match outcome {
-                run::IterationOutcome::NoWork { .. } => {}
+                run::IterationOutcome::NoWork { .. } => {
+                    // amt answered — the pipeline works, only the board is dry.
+                    consecutive_errors = 0;
+                }
                 run::IterationOutcome::ReleasedOverlap => {
                     // Contention backoff (config-driven, exponential + clamped).
                     let delay = cfg.backoff_delay_ms(consecutive_overlaps);
                     consecutive_overlaps = consecutive_overlaps.saturating_add(1);
-                    ledger
-                        .log_policy_event(
-                            None,
-                            "retry_budget",
-                            &serde_json::json!({"backoff_ms": delay}),
-                        )
-                        .ok();
+                    consecutive_errors = 0;
+                    if let Err(e) = ledger.log_policy_event(
+                        None,
+                        "retry_budget",
+                        &serde_json::json!({"backoff_ms": delay}),
+                    ) {
+                        eprint_err(&format!("ledger write failed (log_policy_event): {e}"));
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(delay));
                     any_work = true;
                 }
                 run::IterationOutcome::Error(e) => {
                     eprint_err(&format!("{name}: {e}"));
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    if consecutive_errors >= ERROR_BUDGET {
+                        eprint_err(&format!(
+                            "{consecutive_errors} consecutive errors — stopping (fix the cause and rerun)"
+                        ));
+                        let _ = lock.flush();
+                        return 1;
+                    }
+                    // Same clamped backoff as contention: a persistent error
+                    // must not spin the loop hot.
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        cfg.backoff_delay_ms(consecutive_errors),
+                    ));
                     any_work = true;
                 }
                 _ => {
                     consecutive_overlaps = 0;
+                    consecutive_errors = 0;
                     any_work = true;
                 }
             }
@@ -590,7 +603,13 @@ fn tree_names(n: u32) -> Vec<String> {
         "oak", "rowan", "birch", "ash", "elm", "cedar", "maple", "pine",
     ];
     (0..n as usize)
-        .map(|i| format!("sirius/{}", TREES.get(i).copied().unwrap_or("oak")))
+        .map(|i| match TREES.get(i) {
+            Some(t) => format!("sirius/{t}"),
+            // Past the named roster, stay UNIQUE — the old fallback named every
+            // extra worker "sirius/oak", colliding with worker 1's identity in
+            // amt claims, heartbeats, and releases.
+            None => format!("sirius/tree{}", i + 1),
+        })
         .collect()
 }
 
@@ -603,6 +622,19 @@ mod tests {
         assert_eq!(
             tree_names(3),
             vec!["sirius/oak", "sirius/rowan", "sirius/birch"]
+        );
+    }
+
+    #[test]
+    fn tree_names_stay_unique_past_the_roster() {
+        // The old fallback named every worker past the 8-name roster
+        // "sirius/oak" — a duplicate agent identity in claims/heartbeats.
+        let names = tree_names(12);
+        let unique: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "duplicate worker names: {names:?}"
         );
     }
 

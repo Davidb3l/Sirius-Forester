@@ -79,6 +79,20 @@ pub fn claim_decision(mode: ClaimMode, ledger: &Ledger) -> ClaimDecision {
     }
 }
 
+/// Ledger writes are best-effort — the loop must not die on telemetry — but
+/// never SILENT: a field audit found fleets that ran for hours against a
+/// broken ledger with zero diagnostics (every failure was `.ok()`-swallowed).
+/// Any failed write now says so on stderr.
+fn ledger_warn<T>(what: &str, r: rusqlite::Result<T>) -> Option<T> {
+    match r {
+        Ok(v) => Some(v),
+        Err(e) => {
+            eprintln!("sirius: ledger write failed ({what}): {e}");
+            None
+        }
+    }
+}
+
 /// Extract the issue id from an `amt claim` success object.
 pub fn issue_id(v: &Value) -> Option<String> {
     v.get("id").and_then(Value::as_str).map(String::from)
@@ -115,6 +129,15 @@ pub enum LockResult {
         detail: String,
         acquired: Vec<String>,
     },
+    /// OPERATIONAL failure (daemon unreachable, wrong project, crashed CLI) —
+    /// not contention. Kept distinct from OracleBackoff so the caller returns
+    /// `IterationOutcome::Error` and the run loop's error budget can trip;
+    /// folding this into the backoff path made a wrong-project daemon retry
+    /// forever with the error counter reset on every pass.
+    Failed {
+        detail: String,
+        acquired: Vec<String>,
+    },
 }
 
 /// Attempt to claim every entity for an issue, in order, honoring the oracle-202
@@ -146,13 +169,11 @@ pub fn lock_entities(
                         verdicts.push("registered");
                     }
                     None => {
-                        ledger
-                            .log_policy_event(
+                        ledger_warn("log_policy_event", ledger.log_policy_event(
                                 None,
-                                "backoff_409",
+                                "claim_anomaly",
                                 &json!({"issue": issue, "entity": ent, "detail": "claim registered without a claim id — cannot manage lease"}),
-                            )
-                            .ok();
+                            ));
                         return LockResult::Overlap {
                             blocker: format!("{ent}: claim registered without a claim id"),
                             acquired,
@@ -161,22 +182,21 @@ pub fn lock_entities(
                 }
             }
             ClaimVerdict::Overlap { detail } => {
-                ledger
-                    .log_policy_event(
+                ledger_warn(
+                    "log_policy_event",
+                    ledger.log_policy_event(
                         None,
                         "backoff_409",
                         &json!({"issue": issue, "entity": ent, "detail": detail}),
-                    )
-                    .ok();
+                    ),
+                );
                 return LockResult::Overlap {
                     blocker: format!("{ent}: {detail}"),
                     acquired,
                 };
             }
             ClaimVerdict::OracleConflict { detail } => {
-                ledger
-                    .log_policy_event(None, "oracle_202", &json!({"issue": issue, "entity": ent, "policy": format!("{:?}", config.oracle_202)}))
-                    .ok();
+                ledger_warn("log_policy_event", ledger.log_policy_event(None, "oracle_202", &json!({"issue": issue, "entity": ent, "policy": format!("{:?}", config.oracle_202)})));
                 match config.oracle_202 {
                     Oracle202::BackOff => {
                         return LockResult::OracleBackoff { detail, acquired };
@@ -192,13 +212,11 @@ pub fn lock_entities(
                                 verdicts.push("forced");
                             }
                             ClaimVerdict::Registered { claim_id: None } => {
-                                ledger
-                                    .log_policy_event(
+                                ledger_warn("log_policy_event", ledger.log_policy_event(
                                         None,
-                                        "backoff_409",
+                                        "claim_anomaly",
                                         &json!({"issue": issue, "entity": ent, "detail": "forced claim registered without a claim id — cannot manage lease"}),
-                                    )
-                                    .ok();
+                                    ));
                                 return LockResult::Overlap {
                                     blocker: format!(
                                         "{ent}: forced claim registered without a claim id"
@@ -217,7 +235,7 @@ pub fn lock_entities(
                 }
             }
             ClaimVerdict::Error { detail } => {
-                return LockResult::OracleBackoff { detail, acquired };
+                return LockResult::Failed { detail, acquired };
             }
         }
     }
@@ -253,13 +271,14 @@ fn release_entity_checked(hv: &Hayven, ledger: &Ledger, issue: &str, claim_id: &
                 // Final failure: shout to stderr AND record a ledger event so a
                 // leaked lock is never silent.
                 eprintln!("sirius: FAILED to release hayven claim {claim_id} for {issue}: {e}");
-                ledger
-                    .log_policy_event(
+                ledger_warn(
+                    "log_policy_event",
+                    ledger.log_policy_event(
                         None,
                         "release_failure",
                         &json!({"issue": issue, "claim_id": claim_id, "error": e}),
-                    )
-                    .ok();
+                    ),
+                );
                 return false;
             }
         }
@@ -298,13 +317,14 @@ fn release_issue_checked(
                     continue;
                 }
                 eprintln!("sirius: FAILED to release amt issue {issue}: {e}");
-                ledger
-                    .log_policy_event(
+                ledger_warn(
+                    "log_policy_event",
+                    ledger.log_policy_event(
                         None,
                         "release_failure",
                         &json!({"issue": issue, "claim_id": issue, "worker": worker, "error": e}),
-                    )
-                    .ok();
+                    ),
+                );
                 return;
             }
         }
@@ -341,7 +361,7 @@ pub fn run_iteration(
     out: &mut dyn Write,
     spine: Option<&crate::spine::Spine>,
 ) -> IterationOutcome {
-    ledger.upsert_worker(worker, "working").ok();
+    ledger_warn("upsert_worker", ledger.upsert_worker(worker, "working"));
 
     // Suite spine (§2): past-tense job/gate/receipt facts to <root>/.suite/.
     // Best-effort and optional (None disables it, e.g. in tests). `out` is the
@@ -380,7 +400,7 @@ pub fn run_iteration(
                 "claim",
                 json!({"claimed": false, "reason": reason, "retry_after": retry_after}),
             );
-            ledger.upsert_worker(worker, "idle").ok();
+            ledger_warn("upsert_worker", ledger.upsert_worker(worker, "idle"));
             return IterationOutcome::NoWork { retry_after };
         }
         ClaimResult::Error(e) => {
@@ -393,7 +413,15 @@ pub fn run_iteration(
         None => return IterationOutcome::Error("claim returned no issue id".into()),
     };
     let title = issue_title(&issue_val);
-    let iter_id = ledger.start_iteration(worker, Some(&issue)).unwrap_or(-1);
+    // A failed start_iteration is warned (not fatal) and leaves iter_id = -1;
+    // `iter_ref` keeps that sentinel OUT of policy_events rows, whose FK on
+    // iterations(id) would reject -1 — another formerly-silent write failure.
+    let iter_id = ledger_warn(
+        "start_iteration",
+        ledger.start_iteration(worker, Some(&issue)),
+    )
+    .unwrap_or(-1);
+    let iter_ref = (iter_id >= 0).then_some(iter_id);
     let start = std::time::Instant::now();
     emit_event(
         out,
@@ -427,9 +455,7 @@ pub fn run_iteration(
 
     // Adaptive: decide whether to pre-claim.
     let decision = claim_decision(config.claim_mode, ledger);
-    ledger
-        .log_policy_event(Some(iter_id), "concurrency", &json!({"claim_mode": format!("{:?}", config.claim_mode), "decision": format!("{:?}", decision)}))
-        .ok();
+    ledger_warn("log_policy_event", ledger.log_policy_event(iter_ref, "concurrency", &json!({"claim_mode": format!("{:?}", config.claim_mode), "decision": format!("{:?}", decision)})));
 
     // 3. LOCK entities (Hayvenhurst second) — unless policy says rely on gate.
     let mut claim_ids: Vec<String> = Vec::new();
@@ -473,8 +499,9 @@ pub fn run_iteration(
                     "release",
                     json!({"reason": "entity_overlap", "blocker": blocker}),
                 );
-                ledger
-                    .finish_iteration(
+                ledger_warn(
+                    "finish_iteration",
+                    ledger.finish_iteration(
                         iter_id,
                         &entities,
                         "released",
@@ -483,9 +510,9 @@ pub fn run_iteration(
                         None,
                         Some(start.elapsed().as_millis() as i64),
                         None,
-                    )
-                    .ok();
-                ledger.upsert_worker(worker, "idle").ok();
+                    ),
+                );
+                ledger_warn("upsert_worker", ledger.upsert_worker(worker, "idle"));
                 emit_job("job.blocked", &issue);
                 return IterationOutcome::ReleasedOverlap;
             }
@@ -508,8 +535,9 @@ pub fn run_iteration(
                     "release",
                     json!({"reason": "oracle_backoff", "detail": detail}),
                 );
-                ledger
-                    .finish_iteration(
+                ledger_warn(
+                    "finish_iteration",
+                    ledger.finish_iteration(
                         iter_id,
                         &entities,
                         "released",
@@ -520,11 +548,49 @@ pub fn run_iteration(
                         None,
                         Some(start.elapsed().as_millis() as i64),
                         None,
-                    )
-                    .ok();
-                ledger.upsert_worker(worker, "idle").ok();
+                    ),
+                );
+                ledger_warn("upsert_worker", ledger.upsert_worker(worker, "idle"));
                 emit_job("job.blocked", &issue);
                 return IterationOutcome::ReleasedOverlap;
+            }
+            LockResult::Failed { detail, acquired } => {
+                // Operational failure — release what we hold, hand the issue
+                // back, and surface an ERROR so the run loop's budget/backoff
+                // applies (a wrong-project daemon must not masquerade as
+                // contention and retry forever).
+                release_entities(hv, ledger, &issue, &acquired);
+                release_issue_checked(
+                    amt,
+                    ledger,
+                    &issue,
+                    worker,
+                    Some("todo"),
+                    Some(&format!("sirius: released — hayven claim error: {detail}")),
+                );
+                emit_event(
+                    out,
+                    worker,
+                    Some(&issue),
+                    "release",
+                    json!({"reason": "claim_error", "detail": detail}),
+                );
+                ledger_warn(
+                    "finish_iteration",
+                    ledger.finish_iteration(
+                        iter_id,
+                        &entities,
+                        "error",
+                        None,
+                        &["error".into()],
+                        None,
+                        Some(start.elapsed().as_millis() as i64),
+                        None,
+                    ),
+                );
+                ledger_warn("upsert_worker", ledger.upsert_worker(worker, "idle"));
+                emit_job("job.blocked", &issue);
+                return IterationOutcome::Error(format!("hayven claim failed: {detail}"));
             }
         }
     }
@@ -574,6 +640,16 @@ pub fn run_iteration(
     let mut work_ok;
     let mut gate_result;
     let mut attempt: u32 = 0;
+    // SIRF-11: pin the pre-work baseline BEFORE the agent runs. The gate diffs
+    // against this commit, not bare HEAD — agents routinely COMMIT their work,
+    // and a worktree-vs-HEAD diff over a committed change is empty, which used
+    // to skip the gate and advance the issue with zero tests run. Best-effort:
+    // if HEAD is unresolvable (fresh repo), the gate falls back to the old diff.
+    let pre_head = crate::gitrange::head_rev(runner).ok();
+    // Snapshot the untracked files that ALREADY exist — pre-existing scratch
+    // files are not the agent's change, and counting them would make every
+    // iteration gate (and potentially advance) over work nobody did.
+    let pre_untracked = crate::gitrange::untracked_files(runner).unwrap_or_default();
     loop {
         // WORK: spawn the agent command under supervision (SIRF-7). One beat
         //    fires before the spawn, and then a periodic heartbeat renews BOTH
@@ -584,10 +660,17 @@ pub fn run_iteration(
         //    kills a hung/runaway agent; on expiry the iteration FAILS (released
         //    without advancing, plus a deadend note). The agent's output is
         //    captured to a durable log so it no longer vanishes on success.
-        let _ = amt.heartbeat(&issue, worker);
+        // A refused refresh (lease lapsed, another agent claimed) is amt's
+        // exit-0 `claimed:false` answer — heartbeat() now detects it; we can't
+        // abort a running agent from here, but we can stop being silent.
+        if let Err(e) = amt.heartbeat(&issue, worker) {
+            eprintln!("sirius: lease refresh failed for {issue}: {e}");
+        }
         let mut heartbeat = || {
             // Renew the Ametrite issue lease.
-            let _ = amt.heartbeat(&issue, worker);
+            if let Err(e) = amt.heartbeat(&issue, worker) {
+                eprintln!("sirius: lease refresh failed for {issue}: {e}");
+            }
             // Renew each held Hayvenhurst entity claim (re-claim = refresh).
             if !held_entities.is_empty() {
                 let _ = hv.claim(&held_entities, &lock_intent, false);
@@ -603,12 +686,16 @@ pub fn run_iteration(
         work_ok = work.as_ref().map(AgentOutcome::success).unwrap_or(false);
         // Agent exit code, from the captured output (durably logged by the runner).
         let agent_code = work.as_ref().ok().and_then(|w| w.output().code);
+        // A spawn-level failure (sh missing, fork failure) used to be dropped
+        // entirely — the event now carries it so "the agent never ran" is
+        // distinguishable from "the agent ran and failed".
+        let spawn_err = work.as_ref().err().map(|e| e.to_string());
         emit_event(
             out,
             worker,
             Some(&issue),
             "work",
-            json!({"agent_ok": work_ok, "timed_out": timed_out, "exit": agent_code, "attempt": attempt + 1}),
+            json!({"agent_ok": work_ok, "timed_out": timed_out, "exit": agent_code, "attempt": attempt + 1, "spawn_error": spawn_err}),
         );
 
         // On a timeout the agent was killed. The iteration must FAIL immediately:
@@ -637,8 +724,9 @@ pub fn run_iteration(
                 "release",
                 json!({"reason": "agent_timeout", "advanced": false}),
             );
-            ledger
-                .finish_iteration(
+            ledger_warn(
+                "finish_iteration",
+                ledger.finish_iteration(
                     iter_id,
                     &entities,
                     "agent_timeout",
@@ -647,9 +735,9 @@ pub fn run_iteration(
                     None,
                     Some(start.elapsed().as_millis() as i64),
                     None,
-                )
-                .ok();
-            ledger.upsert_worker(worker, "idle").ok();
+                ),
+            );
+            ledger_warn("upsert_worker", ledger.upsert_worker(worker, "idle"));
             file_deadend(hv, &entities, &issue, "agent timed out");
             emit_job("job.blocked", &issue);
             return IterationOutcome::Deadend;
@@ -659,21 +747,29 @@ pub fn run_iteration(
         //    the verdict from the test runner (never from the selector's exit
         //    code). `hayven affected-tests` only selects; on any doubt the gate
         //    runs the full suite. See gate.rs / SIRF-5 / D-3.
-        let changed_files = crate::gitrange::changed_files(runner, None).unwrap_or_default();
-        let verdict = if changed_files.is_empty() {
-            // The agent changed nothing → there is nothing to gate.
-            None
-        } else {
-            Some(crate::gate::evaluate(
-                hv,
-                runner,
-                &config.gate,
-                &changed_files,
-            ))
-        };
+        let verdict =
+            match crate::gitrange::changed_since(runner, pre_head.as_deref(), &pre_untracked) {
+                // A git failure means the changed-file set is UNKNOWN. That is
+                // doubt, not "nothing changed" — the old `unwrap_or_default()`
+                // folded it into an empty list and skipped the gate (fail-open).
+                Err(e) => Some(crate::gate::evaluate_doubt(
+                    runner,
+                    &config.gate,
+                    &format!("cannot determine changed files: {e}"),
+                )),
+                // Genuinely nothing changed (committed, staged, unstaged, or
+                // untracked) since the pre-work baseline → nothing to gate.
+                Ok(files) if files.is_empty() => None,
+                Ok(files) => Some(crate::gate::evaluate(hv, runner, &config.gate, &files)),
+            };
         gate_result = match &verdict {
             Some(v) if v.passed => {
-                let _ = amt.update_status(&issue, &config.target_status);
+                // Advance requires the AGENT to have succeeded too: a passing
+                // suite over changes a failed/never-spawned agent didn't make
+                // (leftovers, pre-existing state) is not completed work.
+                if work_ok {
+                    let _ = amt.update_status(&issue, &config.target_status);
+                }
                 "pass"
             }
             Some(v) => {
@@ -717,13 +813,14 @@ pub fn run_iteration(
         // budget has attempts left. Each retry is recorded as a policy event so
         // the ledger shows the honest attempt history.
         if gate_result == "fail" && attempt + 1 < max_attempts {
-            ledger
-                .log_policy_event(
-                    Some(iter_id),
+            ledger_warn(
+                "log_policy_event",
+                ledger.log_policy_event(
+                    iter_ref,
                     "retry_budget",
                     &json!({"issue": issue, "attempt": attempt + 1, "max_attempts": max_attempts}),
-                )
-                .ok();
+                ),
+            );
             emit_event(
                 out,
                 worker,
@@ -739,7 +836,7 @@ pub fn run_iteration(
 
     // 7. RECEIPT: decide + two-way link (only on a passing/complete iteration).
     let mut receipt_id: Option<i64> = None;
-    if gate_result == "pass" || (gate_result == "skipped" && work_ok) {
+    if work_ok && (gate_result == "pass" || gate_result == "skipped") {
         if let Ok(decision_ref) = amt.decide(
             &issue,
             &format!("Resolved {issue} via sirius"),
@@ -780,12 +877,14 @@ pub fn run_iteration(
     // 8. RELEASE: entities first (reverse), then close out the issue.
     //    A failed gate must NOT advance the issue — holding a failing change back
     //    is the gate's whole purpose (gate.rs contract: "fail files a comment and
-    //    leaves status untouched"). Only a passing gate — or a skipped gate over a
-    //    successful agent run — releases to `target_status`. Otherwise the issue
-    //    returns to `todo`: re-claimable, but un-promoted (matching the entity-
-    //    overlap release path above). (SIRF-6)
+    //    leaves status untouched"). Advancing requires BOTH a successful agent
+    //    run and a non-failing gate: a passing suite over changes the agent
+    //    didn't make (it failed or never spawned) is not completed work, and
+    //    advancing on it let a broken agent command "complete" real issues.
+    //    Otherwise the issue returns to `todo`: re-claimable, but un-promoted
+    //    (matching the entity-overlap release path above). (SIRF-6)
     release_entities(hv, ledger, &issue, &claim_ids);
-    let advanced = gate_result == "pass" || (gate_result == "skipped" && work_ok);
+    let advanced = work_ok && (gate_result == "pass" || gate_result == "skipped");
     let (release_status, release_comment): (&str, Option<&str>) = if advanced {
         (config.target_status.as_str(), None)
     } else {
@@ -815,13 +914,13 @@ pub fn run_iteration(
     } else if advanced {
         "completed"
     } else {
-        // Gate was skipped (the agent produced nothing to gate) AND the run did
-        // not succeed — nothing advanced, so record the honest failure rather
-        // than claiming completion. (review fix)
+        // The agent run failed (or never spawned) and nothing advanced —
+        // record the honest failure rather than claiming completion.
         "error"
     };
-    ledger
-        .finish_iteration(
+    ledger_warn(
+        "finish_iteration",
+        ledger.finish_iteration(
             iter_id,
             &entities,
             outcome,
@@ -830,9 +929,9 @@ pub fn run_iteration(
             None,
             Some(start.elapsed().as_millis() as i64),
             receipt_id,
-        )
-        .ok();
-    ledger.upsert_worker(worker, "idle").ok();
+        ),
+    );
+    ledger_warn("upsert_worker", ledger.upsert_worker(worker, "idle"));
 
     // Durable: the terminal finish_iteration above. "completed" ⇔ advanced;
     // gate_failed / error are non-completing → blocked.
@@ -847,6 +946,12 @@ pub fn run_iteration(
         // re-derive it (PRD §F3 retry-budget exhaustion behavior).
         file_deadend(hv, &entities, &issue, "gate failed (affected-tests)");
         IterationOutcome::Deadend
+    } else if outcome == "error" {
+        // A failed agent with nothing advanced is an OPERATIONAL error: it
+        // must reach the run loop's error budget/backoff. Returning Completed
+        // here (the old behavior) made a broken `--agent-cmd` hot-loop the
+        // whole board: claim → instant failure → release → re-claim, forever.
+        IterationOutcome::Error("agent run failed and nothing advanced".into())
     } else {
         IterationOutcome::Completed
     }
@@ -1509,8 +1614,11 @@ mod tests {
             }
             other => panic!("expected Overlap on missing id, got {other:?}"),
         }
-        // The failure was recorded, not swallowed.
-        assert_eq!(led.count_policy_events("backoff_409", 100).unwrap(), 1);
+        // The failure was recorded, not swallowed — as an ANOMALY, not a 409:
+        // a daemon protocol defect is not contention, and counting it as one
+        // helped latch adaptive mode into pre-claiming.
+        assert_eq!(led.count_policy_events("claim_anomaly", 100).unwrap(), 1);
+        assert_eq!(led.count_policy_events("backoff_409", 100).unwrap(), 0);
     }
 
     // ---- SIRF-9: retry_budget reruns the WORK+GATE sequence -------------
@@ -1528,6 +1636,181 @@ mod tests {
         m.expect(&["hayven", "claim"], 0, r#"{"id":"c1"}"#);
         m.expect(&["hayven", "context"], 0, r#"{"pack":true}"#);
         m.expect(&["hayven", "recall"], 0, r#"{"notes":[]}"#);
+    }
+
+    // SIRF-11: the agent COMMITS its work, so a worktree-vs-HEAD diff is
+    // empty. The gate must diff against the pre-work baseline and still run
+    // tests — the old behavior skipped the gate and advanced untested.
+    #[test]
+    fn committed_agent_work_still_gates() {
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-30");
+        m.expect(&["git", "rev-parse"], 0, "base123\n");
+        m.expect(&["sh", "-c"], 0, ""); // agent (commits its work)
+                                        // Diff vs the BASELINE sees the committed change; bare HEAD would not.
+        m.expect(&["git", "diff", "--name-only", "base123"], 0, "src/x.rs\n");
+        m.expect(
+            &["hayven", "affected-tests"],
+            0,
+            r#"{"roots":["x"],"note":"","tests":[]}"#,
+        );
+        m.expect(&["sh", "-c"], 0, "test result: ok"); // full suite (no runnables → doubt)
+        m.expect(
+            &["amt", "--json", "issue", "update"],
+            0,
+            r#"{"id":"AMT-30"}"#,
+        );
+        m.expect(
+            &["amt", "--json", "decide"],
+            0,
+            r#"{"id":"D-9","resolves":"AMT-30"}"#,
+        );
+        m.expect(
+            &["amt", "--json", "decision", "show"],
+            0,
+            r#"{"id":"D-9","resolves":"AMT-30"}"#,
+        );
+        m.expect(&["hayven", "remember"], 0, r#"{"id":"mem"}"#);
+        m.expect(&["hayven", "release"], 0, "ok");
+        m.expect(&["amt", "--json", "release"], 0, r#"{"id":"AMT-30"}"#);
+
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &cfg(),
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
+            None,
+        );
+        assert_eq!(o, IterationOutcome::Completed);
+        // The gate diffed against the pinned baseline, not bare HEAD.
+        assert!(
+            m.recorded()
+                .iter()
+                .any(|c| c == "git diff --name-only base123"),
+            "calls: {:?}",
+            m.recorded()
+        );
+        let (outcome, gate): (String, String) = led
+            .conn
+            .query_row("SELECT outcome, gate_result FROM iterations", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(outcome, "completed");
+        assert_eq!(gate, "pass", "the gate must RUN, not skip");
+    }
+
+    // A failed agent must NEVER advance the issue — even if a leftover or
+    // pre-existing change would pass the suite — and it must surface as an
+    // ERROR so the run loop's budget/backoff applies. The old behavior
+    // returned Completed, letting a broken --agent-cmd hot-loop the board
+    // (and, with a pre-existing untracked file, silently "complete" issues).
+    #[test]
+    fn failed_agent_never_advances_and_surfaces_an_error() {
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-32");
+        m.expect(&["git", "rev-parse"], 0, "base123\n");
+        // Baseline untracked snapshot: TODO.txt existed before the agent ran.
+        m.expect(&["git", "ls-files"], 0, "TODO.txt\n");
+        m.push(MockResponse::new(&["sh", "-c"], 1, "", "boom")); // agent FAILS
+        m.expect(&["git", "diff", "--name-only", "base123"], 0, "");
+        // Post-work untracked list is identical → the agent changed NOTHING;
+        // the pre-existing scratch file must not read as a change.
+        m.expect(&["git", "ls-files"], 0, "TODO.txt\n");
+        m.expect(&["hayven", "release"], 0, "ok");
+        m.expect(&["amt", "--json", "release"], 0, r#"{"id":"AMT-32"}"#);
+
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &cfg(),
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "broken-agent",
+            &mut out,
+            None,
+        );
+        assert!(
+            matches!(o, IterationOutcome::Error(_)),
+            "failed agent must be an operational error, got {o:?}"
+        );
+        // No advance, no decision, no receipt.
+        let calls = m.recorded();
+        assert!(
+            !calls.iter().any(|c| c.contains("issue update")),
+            "must not advance: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("--json decide")),
+            "must not file a decision: {calls:?}"
+        );
+        let outcome: String = led
+            .conn
+            .query_row("SELECT outcome FROM iterations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(outcome, "error");
+    }
+
+    // SIRF-11: a git failure means the changed-file set is UNKNOWN — doubt,
+    // not "nothing changed". The gate must run (fallback policy), and its
+    // verdict must rule; the old fold skipped the gate and advanced.
+    #[test]
+    fn git_failure_fails_closed_not_skipped() {
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-31");
+        m.expect(&["git", "rev-parse"], 0, "base123\n");
+        m.expect(&["sh", "-c"], 0, ""); // agent
+        m.push(MockResponse::new(
+            &["git", "diff"],
+            128,
+            "",
+            "fatal: bad object base123",
+        ));
+        // Doubt → full suite: make it FAIL to prove the verdict rules.
+        m.push(MockResponse::new(&["sh", "-c"], 101, "FAILED", ""));
+        m.expect(&["hayven", "release"], 0, "ok");
+        m.expect(&["amt", "--json", "release"], 0, r#"{"id":"AMT-31"}"#);
+
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let mut out = Vec::new();
+        let c = Config {
+            retry_budget: 1,
+            ..cfg()
+        };
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &c,
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
+            None,
+        );
+        // Gate FAILED (not skipped): deadend, released un-advanced.
+        assert_eq!(o, IterationOutcome::Deadend);
+        let ndjson = String::from_utf8(out).unwrap();
+        assert!(ndjson.contains("\"result\":\"fail\""), "{ndjson}");
+        assert!(!ndjson.contains("\"result\":\"skipped\""), "{ndjson}");
     }
 
     #[test]
