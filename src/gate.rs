@@ -184,7 +184,13 @@ pub fn decide_plan(sel: &Selection, changed_files: &[String], fallback: GateFall
         let reason = format!("{} affected test(s) selected", sel.runnables.len());
         return GatePlan::Subset(sel.runnables.clone(), reason);
     }
-    let reason = doubt_reason(sel, changed_files.len());
+    fallback_plan(fallback, doubt_reason(sel, changed_files.len()))
+}
+
+/// The ONE fallback-policy → plan mapping, shared by `decide_plan` and
+/// `evaluate_doubt` so the doubt path and the normal path can never diverge
+/// on what a fallback policy means.
+fn fallback_plan(fallback: GateFallback, reason: String) -> GatePlan {
     match fallback {
         GateFallback::FullSuite => GatePlan::Full(reason),
         GateFallback::Fail => GatePlan::Block(reason),
@@ -233,6 +239,10 @@ pub struct GateVerdict {
     /// a full-suite run (the runner picks) or when no tests ran.
     pub test_ids: Vec<String>,
     pub detail: String,
+    /// TRUE when the verdict cannot change on a fresh attempt (today: an
+    /// unconfigured `test_cmd`). Typed here — at the source of the verdict —
+    /// so retry policy never string-matches the human-facing `plan` label.
+    pub structural: bool,
 }
 
 /// Execute a plan against the configured `test_cmd`. Fail-closed: if a run is
@@ -241,6 +251,7 @@ pub fn execute_plan(runner: &dyn Runner, test_cmd: Option<&str>, plan: GatePlan)
     match plan {
         GatePlan::Block(reason) => GateVerdict {
             passed: false,
+            structural: false,
             plan: "blocked".into(),
             reason,
             ran_tests: false,
@@ -250,6 +261,7 @@ pub fn execute_plan(runner: &dyn Runner, test_cmd: Option<&str>, plan: GatePlan)
         },
         GatePlan::WarnPass(reason) => GateVerdict {
             passed: true,
+            structural: false,
             plan: "pass-with-warning".into(),
             reason,
             ran_tests: false,
@@ -277,6 +289,9 @@ fn run_cmd(
     let Some(cmd) = test_cmd else {
         return GateVerdict {
             passed: false,
+            // The one STRUCTURAL verdict: no test_cmd exists, so no fresh
+            // attempt can change this — retry policy reads this field.
+            structural: true,
             plan: "unconfigured".into(),
             reason: "gate.test_cmd is not set — cannot run tests, refusing to pass".into(),
             ran_tests: false,
@@ -293,6 +308,7 @@ fn run_cmd(
     match runner.run("sh", &["-c", &full]) {
         Ok(out) => GateVerdict {
             passed: out.success(),
+            structural: false,
             plan: plan_label.to_string(),
             reason,
             ran_tests: true,
@@ -302,6 +318,7 @@ fn run_cmd(
         },
         Err(e) => GateVerdict {
             passed: false,
+            structural: false,
             plan: plan_label.to_string(),
             reason,
             ran_tests: false,
@@ -334,11 +351,7 @@ pub fn evaluate(
 /// into "nothing changed" and skip the gate entirely — fail-open; this is the
 /// fail-closed replacement.
 pub fn evaluate_doubt(runner: &dyn Runner, gate: &GateConfig, reason: &str) -> GateVerdict {
-    let plan = match gate.fallback {
-        GateFallback::FullSuite => GatePlan::Full(reason.to_string()),
-        GateFallback::Fail => GatePlan::Block(reason.to_string()),
-        GateFallback::PassWithWarning => GatePlan::WarnPass(reason.to_string()),
-    };
+    let plan = fallback_plan(gate.fallback, reason.to_string());
     execute_plan(runner, gate.test_cmd.as_deref(), plan)
 }
 

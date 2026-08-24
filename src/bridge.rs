@@ -158,12 +158,19 @@ pub struct WhySymbol {
 }
 
 pub fn why_symbol(amt: &Amt, hv: &Hayven, symbol: &str) -> Result<WhySymbol, String> {
-    // A recall failure (daemon down / wrong project) must ERROR, not read as
-    // "no provenance recorded" — for a provenance tool a confident empty
-    // answer is a WRONG answer, not a degraded one.
-    let recall = hv
-        .recall_node(symbol)
-        .map_err(|e| format!("recall failed for {symbol}: {e}"))?;
+    // A recall failure splits two ways. Daemon down / wrong project must
+    // ERROR — for a provenance tool a confident empty answer is a WRONG
+    // answer. But a node the daemon simply has no memory of (any symbol never
+    // `hayven remember`ed — the COMMON case) is a legitimate empty answer,
+    // not an outage; hard-erroring on it made `sirius why` unusable on every
+    // un-annotated symbol.
+    let recall = match hv.recall_node(symbol) {
+        Ok(v) => v,
+        Err(e) if crate::hayven::looks_like_connectivity_failure(&e) => {
+            return Err(format!("recall failed for {symbol}: {e}"));
+        }
+        Err(_) => Value::Null,
+    };
     let text = collect_note_text(&recall);
     let (issue_refs, decision_refs) = extract_refs(&text);
 

@@ -28,6 +28,40 @@ pub enum ClaimResult {
     Error(String),
 }
 
+/// How a lease refresh failed — see [`Amt::heartbeat`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum HeartbeatError {
+    /// amt answered `claimed:false`: the lease is NOT held by this agent.
+    Refused(String),
+    /// amt could not be asked (unreachable, non-JSON) — possibly transient.
+    Failed(String),
+}
+
+impl std::fmt::Display for HeartbeatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HeartbeatError::Refused(r) => write!(f, "lease refresh refused: {r}"),
+            HeartbeatError::Failed(e) => write!(f, "lease refresh failed: {e}"),
+        }
+    }
+}
+
+/// Decode amt's refusal shape (`{"claimed": false, "reason": ...}`) — the ONE
+/// decoder for this upstream contract, shared by `claim` and `heartbeat` so a
+/// reshape upstream cannot be fixed in one and silently missed in the other.
+fn claim_refused(v: &Value, default_reason: &str) -> Option<String> {
+    if v.get("claimed").and_then(Value::as_bool) == Some(false) {
+        Some(
+            v.get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or(default_reason)
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
 pub struct Amt<'r> {
     runner: &'r dyn Runner,
 }
@@ -78,13 +112,8 @@ impl<'r> Amt<'r> {
             }
         };
         // No-work shape: {"claimed": false, "retry_after": N, ...}
-        if v.get("claimed").and_then(Value::as_bool) == Some(false) {
+        if let Some(reason) = claim_refused(&v, "no claimable work") {
             let retry_after = v.get("retry_after").and_then(Value::as_u64);
-            let reason = v
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("no claimable work")
-                .to_string();
             return ClaimResult::NoWork {
                 retry_after,
                 reason,
@@ -100,18 +129,20 @@ impl<'r> Amt<'r> {
 
     /// `amt --json claim --issue <id> --agent <agent>` — re-claim your own
     /// issue id to renew its lease (heartbeat). Same agent + id is a refresh.
-    pub fn heartbeat(&self, issue: &str, agent: &str) -> Result<(), String> {
-        let v = self.json(&["--json", "claim", "--issue", issue, "--agent", agent])?;
-        // amt signals a REFUSED refresh (lease lapsed, another agent claimed)
-        // as exit 0 + `{"claimed": false, ...}` — the same shape as claim's
-        // no-work answer. Checking only the exit code read that as success,
-        // so a lost lease looked renewed and two agents could share an issue.
-        if v.get("claimed").and_then(Value::as_bool) == Some(false) {
-            let reason = v
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("lease not held by this agent");
-            return Err(format!("lease refresh refused: {reason}"));
+    ///
+    /// The two failure shapes are TYPED because callers must react
+    /// differently: `Refused` (exit 0 + `claimed:false` — the lease lapsed
+    /// and someone else may hold the issue) means STOP working the issue;
+    /// `Failed` (amt unreachable / non-JSON) is a transient plumbing error a
+    /// long-running agent should survive. Checking only the exit code used to
+    /// read a refusal as success, so a lost lease looked renewed and two
+    /// agents could share an issue.
+    pub fn heartbeat(&self, issue: &str, agent: &str) -> Result<(), HeartbeatError> {
+        let v = self
+            .json(&["--json", "claim", "--issue", issue, "--agent", agent])
+            .map_err(HeartbeatError::Failed)?;
+        if let Some(reason) = claim_refused(&v, "lease not held by this agent") {
+            return Err(HeartbeatError::Refused(reason));
         }
         Ok(())
     }
@@ -264,8 +295,11 @@ mod tests {
         );
         let amt = Amt::new(&m);
         let err = amt.heartbeat("AMT-7", "sirius/oak").unwrap_err();
-        assert!(err.contains("refused"), "{err}");
-        assert!(err.contains("sirius/rowan"), "{err}");
+        assert!(
+            matches!(&err, HeartbeatError::Refused(r) if r.contains("sirius/rowan")),
+            "{err}"
+        );
+        assert!(err.to_string().contains("refused"), "{err}");
         // A healthy refresh (the issue object back) is Ok.
         m.expect(&["amt", "--json", "claim"], 0, r#"{"id":"AMT-7"}"#);
         assert!(amt.heartbeat("AMT-7", "sirius/oak").is_ok());

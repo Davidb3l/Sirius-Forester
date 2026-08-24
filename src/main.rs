@@ -64,7 +64,7 @@ fn main() -> ExitCode {
             from,
             max_iterations,
             json: _, // contract-compat no-op: run always streams NDJSON
-        } => cmd_run(&ws, &runner, workers, &agent_cmd, from, max_iterations),
+        } => cmd_run(&ws, workers, &agent_cmd, from, max_iterations),
     };
     ExitCode::from(code)
 }
@@ -485,7 +485,6 @@ fn cmd_gate(
 #[allow(clippy::too_many_arguments)]
 fn cmd_run(
     ws: &Workspace,
-    runner: &RealRunner,
     workers: u32,
     agent_cmd: &str,
     from: Option<String>,
@@ -502,7 +501,6 @@ fn cmd_run(
         Ok(c) => c,
         Err(c) => return c,
     };
-    let _ = runner; // workers construct their own (RealRunner is a unit type)
     let spine = spine::Spine::new(&ws.root);
 
     // Workers run as REAL parallel threads. The old v1 loop ran them
@@ -532,14 +530,73 @@ fn cmd_run(
         return 1;
     }
 
+    // One fleet per repo: a second `sirius run` would force-remove the first
+    // fleet's LIVE worktrees out from under its agents. A pidfile guard —
+    // stale entries (dead pid) are taken over, a live one refuses.
+    let lock_path = ws.sirius_dir().join("run.pid");
+    if let Ok(prev) = std::fs::read_to_string(&lock_path) {
+        let prev = prev.trim();
+        if let Ok(pid) = prev.parse::<i32>() {
+            let alive = libc_kill_probe(pid);
+            if alive {
+                eprint_err(&format!(
+                    "another `sirius run` appears active in this repo (pid {pid}, {}) — one fleet per repo; stop it first or remove the file if it is stale",
+                    lock_path.display()
+                ));
+                return 1;
+            }
+        }
+    }
+    if let Err(e) = std::fs::write(&lock_path, std::process::id().to_string()) {
+        eprint_err(&format!("cannot write {}: {e}", lock_path.display()));
+        return 1;
+    }
+
+    // Resolve the fleet base ONCE and build every worktree serially, before
+    // any thread exists: concurrent `git worktree add/prune` contend on .git
+    // admin locks (intermittent startup failures), and per-worker rev-parse
+    // could hand workers divergent baselines if HEAD moved mid-startup.
+    let repo_runner = RealRunner::default();
+    let base = match gitrange::head_rev(&repo_runner) {
+        Ok(b) => b,
+        Err(e) => {
+            eprint_err(&format!("cannot resolve fleet base commit: {e}"));
+            let _ = std::fs::remove_file(&lock_path);
+            return 1;
+        }
+    };
+    let worktrees_root = ws.sirius_dir().join("worktrees");
+    let _ = repo_runner.run("git", &["worktree", "prune"]);
+    let mut assignments: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for name in &names {
+        let wt_path = worktrees_root.join(name.replace('/', "-"));
+        let wt_str = wt_path.to_string_lossy().to_string();
+        // Clear any stale worktree left by a killed run, then create fresh.
+        let _ = repo_runner.run("git", &["worktree", "remove", "--force", &wt_str]);
+        let _ = std::fs::remove_dir_all(&wt_path);
+        // NO silent fallback to the shared checkout — that would be the
+        // unsound configuration the isolation design exists to prevent.
+        if let Err(e) = gitrange::run_git(
+            &repo_runner,
+            &["worktree", "add", "--detach", &wt_str, &base],
+        ) {
+            eprint_err(&format!("{name}: cannot create worktree {wt_str}: {e}"));
+            let _ = std::fs::remove_file(&lock_path);
+            return 1;
+        }
+        assignments.push((name.clone(), wt_path));
+    }
+
     let iterations = std::sync::atomic::AtomicU32::new(0);
     let any_failed = std::sync::atomic::AtomicBool::new(false);
     let ledger_path = ws.ledger_path();
     std::thread::scope(|s| {
-        for name in &names {
+        for (name, wt_path) in &assignments {
             s.spawn(|| {
                 worker_loop(
                     name,
+                    wt_path,
+                    &base,
                     &ledger_path,
                     &cfg,
                     agent_cmd,
@@ -552,7 +609,24 @@ fn cmd_run(
             });
         }
     });
+    // Tear the worktrees down; completed work is safe — each issue's commits
+    // live on its `sirius/<issue>` branch in the SHARED .git.
+    for (_, wt_path) in &assignments {
+        let wt_str = wt_path.to_string_lossy().to_string();
+        let _ = repo_runner.run("git", &["worktree", "remove", "--force", &wt_str]);
+    }
+    let _ = std::fs::remove_file(&lock_path);
     u8::from(any_failed.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// Best-effort "is this pid alive" via `kill -0` semantics, without a libc
+/// dependency: `ps -p <pid>` exit status. Only used to detect a stale fleet
+/// pidfile, so a false "alive" merely makes the operator remove the file.
+fn libc_kill_probe(pid: i32) -> bool {
+    RealRunner::default()
+        .run("ps", &["-p", &pid.to_string()])
+        .map(|o| o.success())
+        .unwrap_or(false)
 }
 
 /// One worker's whole run: claim-and-work until the board is dry, the shared
@@ -560,6 +634,8 @@ fn cmd_run(
 #[allow(clippy::too_many_arguments)]
 fn worker_loop(
     name: &str,
+    wt_path: &std::path::Path,
+    base: &str,
     ledger_path: &std::path::Path,
     cfg: &Config,
     agent_cmd: &str,
@@ -577,47 +653,14 @@ fn worker_loop(
     const NOWORK_WAIT_CAP_SECS: u64 = 30;
 
     // amt/hayven speak to the REPO (process cwd); the agent, git, and the
-    // gate's test run are scoped to this worker's PRIVATE worktree. Parallel
-    // agents in one shared checkout would cross-contaminate every baseline
-    // diff (worker A's gate would test worker B's half-written code) and race
-    // on git's index.lock — isolation is what makes the parallel fleet sound.
+    // gate's test run are scoped to this worker's PRIVATE worktree (created
+    // serially by cmd_run before any thread spawned). Parallel agents in one
+    // shared checkout would cross-contaminate every baseline diff (worker A's
+    // gate would test worker B's half-written code) and race on git's
+    // index.lock — isolation is what makes the parallel fleet sound.
     let repo_runner = RealRunner::default();
-    let base = match crate::gitrange::head_rev(&repo_runner) {
-        Ok(b) => b,
-        Err(e) => {
-            eprint_err(&format!("{name}: cannot resolve fleet base commit: {e}"));
-            any_failed.store(true, Ordering::SeqCst);
-            return;
-        }
-    };
-    let wt_path = ledger_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("worktrees")
-        .join(name.replace('/', "-"));
-    let wt_str = wt_path.to_string_lossy().to_string();
-    // Clear any stale worktree left by a killed run, then create fresh.
-    let _ = repo_runner.run("git", &["worktree", "remove", "--force", &wt_str]);
-    let _ = repo_runner.run("git", &["worktree", "prune"]);
-    let _ = std::fs::remove_dir_all(&wt_path);
-    match repo_runner.run("git", &["worktree", "add", "--detach", &wt_str, &base]) {
-        Ok(o) if o.success() => {}
-        other => {
-            let detail = match other {
-                Ok(o) => o.stderr.trim().to_string(),
-                Err(e) => e.to_string(),
-            };
-            // NO silent fallback to the shared checkout — that would be the
-            // unsound configuration this design exists to prevent.
-            eprint_err(&format!(
-                "{name}: cannot create worktree {wt_str}: {detail}"
-            ));
-            any_failed.store(true, Ordering::SeqCst);
-            return;
-        }
-    }
     let agent_runner = RealRunner {
-        cwd: Some(wt_path.clone()),
+        cwd: Some(wt_path.to_path_buf()),
     };
 
     let ledger = match Ledger::open(ledger_path) {
@@ -650,10 +693,15 @@ fn worker_loop(
             agent_cmd,
             &mut out,
             Some(spine),
-            Some(&base),
+            Some(base),
         );
         match outcome {
             run::IterationOutcome::NoWork { retry_after } => {
+                // An idle probe did no work — refund its budget slot so
+                // --max-iterations counts real iterations, not empty probes.
+                if max_iterations > 0 {
+                    iterations.fetch_sub(1, Ordering::SeqCst);
+                }
                 // retry_after set means issues EXIST but are leased right now
                 // (e.g. by sibling workers) — wait briefly and re-probe before
                 // giving up, so the pool doesn't drain while work can still
@@ -674,13 +722,14 @@ fn worker_loop(
                 consecutive_overlaps = consecutive_overlaps.saturating_add(1);
                 consecutive_errors = 0;
                 nowork_probes = 0;
-                if let Err(e) = ledger.log_policy_event(
-                    None,
-                    "retry_budget",
-                    &serde_json::json!({"backoff_ms": delay, "worker": name}),
-                ) {
-                    eprint_err(&format!("ledger write failed (log_policy_event): {e}"));
-                }
+                run::ledger_warn(
+                    "log_policy_event",
+                    ledger.log_policy_event(
+                        None,
+                        "retry_budget",
+                        &serde_json::json!({"backoff_ms": delay, "worker": name}),
+                    ),
+                );
                 std::thread::sleep(std::time::Duration::from_millis(delay));
             }
             run::IterationOutcome::Error(e) => {
@@ -707,10 +756,6 @@ fn worker_loop(
             }
         }
     }
-    // Tear the worktree down; completed work is safe — each issue's commits
-    // live on its `sirius/<issue>` branch in the SHARED .git, and abandoned
-    // failed-iteration leftovers are already recorded as deadends.
-    let _ = repo_runner.run("git", &["worktree", "remove", "--force", &wt_str]);
 }
 
 /// `Write` adapter that locks stdout PER WRITE. `emit_event` sends each NDJSON

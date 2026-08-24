@@ -7,44 +7,46 @@ use crate::hayven::Hayven;
 use crate::shell::Runner;
 use serde_json::Value;
 
-/// List files changed in a git range (default: working tree vs HEAD).
-pub fn changed_files(runner: &dyn Runner, range: Option<&str>) -> Result<Vec<String>, String> {
-    // `git diff --name-only <range>`; with no range, diff HEAD (staged+unstaged).
-    let mut args: Vec<&str> = vec!["diff", "--name-only"];
-    match range {
-        Some(r) => args.push(r),
-        None => args.push("HEAD"),
-    }
-    let out = runner.run("git", &args).map_err(|e| e.to_string())?;
+/// Run one git command, mapping every failure mode (spawn error, non-zero
+/// exit) to a single `Err(detail)`. THE one home for the run-git-or-explain
+/// idiom — hand-rolled copies of this drift on error formatting.
+pub fn run_git(runner: &dyn Runner, args: &[&str]) -> Result<crate::shell::CmdOutput, String> {
+    let out = runner.run("git", args).map_err(|e| e.to_string())?;
     if !out.success() {
-        return Err(if out.stderr.trim().is_empty() {
-            "git diff failed".into()
+        let stderr = out.stderr.trim();
+        return Err(if stderr.is_empty() {
+            format!("git {} failed", args.join(" "))
         } else {
-            out.stderr.trim().to_string()
+            stderr.to_string()
         });
     }
-    Ok(out
-        .stdout
+    Ok(out)
+}
+
+/// Split command stdout into trimmed, non-empty lines.
+fn stdout_lines(out: &crate::shell::CmdOutput) -> Vec<String> {
+    out.stdout
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .map(|l| l.to_string())
-        .collect())
+        .collect()
+}
+
+/// List files changed in a git range (default: working tree vs HEAD).
+pub fn changed_files(runner: &dyn Runner, range: Option<&str>) -> Result<Vec<String>, String> {
+    // `git diff --name-only <range>`; with no range, diff HEAD (staged+unstaged).
+    let out = run_git(runner, &["diff", "--name-only", range.unwrap_or("HEAD")])?;
+    Ok(stdout_lines(&out))
 }
 
 /// The current HEAD commit id — captured BEFORE an agent runs so the gate can
 /// diff against a fixed baseline instead of whatever HEAD means afterwards.
 pub fn head_rev(runner: &dyn Runner) -> Result<String, String> {
-    let out = runner
-        .run("git", &["rev-parse", "HEAD"])
-        .map_err(|e| e.to_string())?;
+    let out = run_git(runner, &["rev-parse", "HEAD"])?;
     let rev = out.stdout.trim().to_string();
-    if !out.success() || rev.is_empty() {
-        return Err(if out.stderr.trim().is_empty() {
-            "git rev-parse HEAD failed".into()
-        } else {
-            out.stderr.trim().to_string()
-        });
+    if rev.is_empty() {
+        return Err("git rev-parse HEAD produced no output".into());
     }
     Ok(rev)
 }
@@ -52,23 +54,8 @@ pub fn head_rev(runner: &dyn Runner) -> Result<String, String> {
 /// Untracked (never-`git add`ed) files. `git diff` cannot see these, but a new
 /// module or test file is as real a change as an edit.
 pub fn untracked_files(runner: &dyn Runner) -> Result<Vec<String>, String> {
-    let out = runner
-        .run("git", &["ls-files", "--others", "--exclude-standard"])
-        .map_err(|e| e.to_string())?;
-    if !out.success() {
-        return Err(if out.stderr.trim().is_empty() {
-            "git ls-files failed".into()
-        } else {
-            out.stderr.trim().to_string()
-        });
-    }
-    Ok(out
-        .stdout
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(|l| l.to_string())
-        .collect())
+    let out = run_git(runner, &["ls-files", "--others", "--exclude-standard"])?;
+    Ok(stdout_lines(&out))
 }
 
 /// Everything changed since `base` (a commit id captured before the work):
@@ -89,8 +76,12 @@ pub fn changed_since(
     pre_untracked: &[String],
 ) -> Result<Vec<String>, String> {
     let mut files = changed_files(runner, base)?;
+    // HashSets: on repos with thousands of un-ignored untracked files, the
+    // naive Vec::contains scans are O(U x (P + C)) per gate evaluation.
+    let pre: std::collections::HashSet<&str> = pre_untracked.iter().map(String::as_str).collect();
+    let seen: std::collections::HashSet<String> = files.iter().cloned().collect();
     for f in untracked_files(runner)? {
-        if !pre_untracked.contains(&f) && !files.contains(&f) {
+        if !pre.contains(f.as_str()) && !seen.contains(&f) {
             files.push(f);
         }
     }

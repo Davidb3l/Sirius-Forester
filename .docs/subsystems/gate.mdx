@@ -46,7 +46,7 @@ The governing rule is *"ran too much, never missed a test."*
 - the selector's own `note` raises no under-reporting flag
 - **no global-impact file changed**
 
-Anything short of all of that is *doubt*, and doubt defers to `gate.fallback`.
+Anything short of all of that is *doubt*, and doubt defers to `gate.fallback`. Fleet iterations in isolated worktrees are ALWAYS doubt (the daemon's graph reflects the main checkout, not the worktree), and a `fail` verdict whose plan is `unconfigured` is marked `structural` — the retry budget skips it, since no fresh agent attempt can change it.
 
 `note_is_suspect` matches the selector's self-reported caveats: `stale`, `cold`, `under-report`, `under report`, `under_report`, `no traces`, `may under`. This matters in practice — an untraced index emits `"no traces yet — static only, may UNDER-report"`, and that alone forces the full suite even when the selection looks narrow and healthy.
 

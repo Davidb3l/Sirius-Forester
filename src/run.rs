@@ -85,7 +85,7 @@ pub fn claim_decision(mode: ClaimMode, ledger: &Ledger) -> ClaimDecision {
 /// never SILENT: a field audit found fleets that ran for hours against a
 /// broken ledger with zero diagnostics (every failure was `.ok()`-swallowed).
 /// Any failed write now says so on stderr.
-fn ledger_warn<T>(what: &str, r: rusqlite::Result<T>) -> Option<T> {
+pub(crate) fn ledger_warn<T>(what: &str, r: rusqlite::Result<T>) -> Option<T> {
     match r {
         Ok(v) => Some(v),
         Err(e) => {
@@ -415,48 +415,6 @@ pub fn run_iteration(
             return IterationOutcome::Error(e);
         }
     };
-    // ISOLATED WORKSPACE (parallel fleet): reset the private worktree to the
-    // fleet base and put this issue's work on its own branch. Safe ONLY
-    // because the worktree belongs to this worker alone — leftovers being
-    // discarded here are a prior failed iteration's abandoned changes, whose
-    // deadend note already records what happened. This is also what keeps one
-    // iteration's leftovers from poisoning the next issue's gate.
-    if let Some(base) = isolate_base {
-        if let Some(i) = issue_id(&issue_val) {
-            let branch = format!("sirius/{}", i.to_lowercase());
-            let prep: [(&str, Vec<&str>); 3] = [
-                ("git", vec!["reset", "--hard", base]),
-                ("git", vec!["clean", "-fd"]),
-                ("git", vec!["checkout", "-B", &branch, base]),
-            ];
-            for (prog, args) in prep {
-                match runner.run(prog, &args) {
-                    Ok(o) if o.success() => {}
-                    other => {
-                        // A worktree we cannot reset is a workspace we cannot
-                        // trust — fail the iteration rather than gate over an
-                        // unknown baseline.
-                        let detail = match other {
-                            Ok(o) => o.stderr.trim().to_string(),
-                            Err(e) => e.to_string(),
-                        };
-                        release_issue_checked(
-                            amt,
-                            ledger,
-                            &i,
-                            worker,
-                            Some("todo"),
-                            Some("sirius: released — worktree preparation failed"),
-                        );
-                        return IterationOutcome::Error(format!(
-                            "worktree prep failed ({prog} {}): {detail}",
-                            args.join(" ")
-                        ));
-                    }
-                }
-            }
-        }
-    }
     let issue = match issue_id(&issue_val) {
         Some(i) => i,
         None => return IterationOutcome::Error("claim returned no issue id".into()),
@@ -481,6 +439,64 @@ pub fn run_iteration(
     );
     // Durable: the Ametrite claim + ledger.start_iteration above.
     emit_job("job.dispatched", &issue);
+
+    // ISOLATED WORKSPACE (parallel fleet): reset the private worktree to the
+    // fleet base, DETACHED. Detached is load-bearing: working on a named
+    // branch parks it "checked out" in this worktree, and git then refuses
+    // the same branch in a sibling worktree — a re-claimed issue would
+    // ping-pong as spurious errors between workers. The per-issue branch is
+    // stamped at completion instead (see the preserve step). Resetting is
+    // safe ONLY because the worktree belongs to this worker alone; abandoned
+    // leftovers being discarded were already recorded as deadends. Runs AFTER
+    // start_iteration + the claim event so even a prep failure leaves the
+    // documented one-iterations-row-per-pass audit trail and a visible
+    // release on the NDJSON stream.
+    if let Some(base) = isolate_base {
+        for args in [
+            &["reset", "--hard", base][..],
+            &["clean", "-fd"][..],
+            &["checkout", "--detach", base][..],
+        ] {
+            if let Err(detail) = crate::gitrange::run_git(runner, args) {
+                // A worktree we cannot reset is a workspace we cannot trust —
+                // fail the iteration rather than gate over an unknown baseline.
+                release_issue_checked(
+                    amt,
+                    ledger,
+                    &issue,
+                    worker,
+                    Some("todo"),
+                    Some("sirius: released — worktree preparation failed"),
+                );
+                emit_event(
+                    out,
+                    worker,
+                    Some(&issue),
+                    "release",
+                    json!({"reason": "worktree_prep_failed", "detail": detail}),
+                );
+                ledger_warn(
+                    "finish_iteration",
+                    ledger.finish_iteration(
+                        iter_id,
+                        &[],
+                        "error",
+                        None,
+                        &[],
+                        None,
+                        Some(start.elapsed().as_millis() as i64),
+                        None,
+                    ),
+                );
+                ledger_warn("upsert_worker", ledger.upsert_worker(worker, "idle"));
+                emit_job("job.blocked", &issue);
+                return IterationOutcome::Error(format!(
+                    "worktree prep failed (git {}): {detail}",
+                    args.join(" ")
+                ));
+            }
+        }
+    }
 
     // 2. MAP issue → symbols (Hayvenhurst query + impact for blast radius).
     let mut entities: Vec<String> = Vec::new();
@@ -697,16 +713,35 @@ pub fn run_iteration(
     // In an isolated worktree the baseline IS the fleet base (the reset above
     // guarantees it), and the post-clean tree has no pre-existing untracked
     // files to snapshot.
+    // A baseline that cannot be captured is DOUBT, not "empty" — a silently
+    // empty untracked snapshot would attribute every pre-existing scratch
+    // file to the agent, and a silently missing head would fall back to the
+    // HEAD-blind diff SIRF-11 exists to prevent. `baseline_err` forces the
+    // gate through the doubt path below.
+    let mut baseline_err: Option<String> = None;
     let (pre_head, pre_untracked) = match isolate_base {
         Some(base) => (Some(base.to_string()), Vec::new()),
-        None => (
-            crate::gitrange::head_rev(runner).ok(),
+        None => {
+            let head = match crate::gitrange::head_rev(runner) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    baseline_err = Some(format!("cannot resolve pre-work HEAD: {e}"));
+                    None
+                }
+            };
             // Snapshot the untracked files that ALREADY exist — pre-existing
             // scratch files are not the agent's change, and counting them
             // would make every iteration gate (and potentially advance) over
             // work nobody did.
-            crate::gitrange::untracked_files(runner).unwrap_or_default(),
-        ),
+            let untracked = match crate::gitrange::untracked_files(runner) {
+                Ok(u) => u,
+                Err(e) => {
+                    baseline_err = Some(format!("cannot snapshot untracked files: {e}"));
+                    Vec::new()
+                }
+            };
+            (head, untracked)
+        }
     };
     loop {
         // WORK: spawn the agent command under supervision (SIRF-7). One beat
@@ -718,20 +753,60 @@ pub fn run_iteration(
         //    kills a hung/runaway agent; on expiry the iteration FAILS (released
         //    without advancing, plus a deadend note). The agent's output is
         //    captured to a durable log so it no longer vanishes on success.
-        // A refused refresh (lease lapsed, another agent claimed) is amt's
-        // exit-0 `claimed:false` answer — heartbeat() now detects it; we can't
-        // abort a running agent from here, but we can stop being silent.
-        if let Err(e) = amt.heartbeat(&issue, worker) {
-            eprintln!("sirius: lease refresh failed for {issue}: {e}");
+        // Pre-spawn lease check: a REFUSED refresh (amt's exit-0
+        // `claimed:false` answer — the lease lapsed and someone else may hold
+        // the issue) must ABORT before the expensive agent spawns; warning
+        // and spawning anyway (the old behavior) put two agents on one issue.
+        // A transient `Failed` (amt hiccup) only warns — the lease may well
+        // still be ours.
+        match amt.heartbeat(&issue, worker) {
+            Ok(()) => {}
+            Err(crate::amt::HeartbeatError::Refused(reason)) => {
+                release_entities(hv, ledger, &issue, &claim_ids);
+                emit_event(
+                    out,
+                    worker,
+                    Some(&issue),
+                    "release",
+                    json!({"reason": "lease_lost", "detail": reason}),
+                );
+                ledger_warn(
+                    "finish_iteration",
+                    ledger.finish_iteration(
+                        iter_id,
+                        &entities,
+                        "error",
+                        None,
+                        &oracle_verdicts,
+                        None,
+                        Some(start.elapsed().as_millis() as i64),
+                        None,
+                    ),
+                );
+                ledger_warn("upsert_worker", ledger.upsert_worker(worker, "idle"));
+                emit_job("job.blocked", &issue);
+                // Deliberately NO amt release: the lease is not ours to release.
+                return IterationOutcome::Error(format!(
+                    "lease on {issue} lost before agent spawn: {reason}"
+                ));
+            }
+            Err(e) => eprintln!("sirius: {e} for {issue} (continuing — may be transient)"),
         }
         let mut heartbeat = || {
-            // Renew the Ametrite issue lease.
+            // Renew the Ametrite issue lease. Mid-run we cannot abort the
+            // child from here, but a refusal is never silent.
             if let Err(e) = amt.heartbeat(&issue, worker) {
-                eprintln!("sirius: lease refresh failed for {issue}: {e}");
+                eprintln!("sirius: {e} for {issue} (agent still running)");
             }
-            // Renew each held Hayvenhurst entity claim (re-claim = refresh).
+            // Renew each held Hayvenhurst entity claim (re-claim = refresh) —
+            // and say so when the renewal comes back as anything but ours.
             if !held_entities.is_empty() {
-                let _ = hv.claim(&held_entities, &lock_intent, false);
+                match hv.claim(&held_entities, &lock_intent, false) {
+                    crate::hayven::ClaimVerdict::Registered { .. } => {}
+                    other => eprintln!(
+                        "sirius: entity lease renewal for {issue} returned {other:?} (agent still running)"
+                    ),
+                }
             }
         };
         let opts = AgentRunOpts {
@@ -806,10 +881,14 @@ pub fn run_iteration(
         //    code). `hayven affected-tests` only selects; on any doubt the gate
         //    runs the full suite. See gate.rs / SIRF-5 / D-3.
         let verdict =
-            match crate::gitrange::changed_since(runner, pre_head.as_deref(), &pre_untracked) {
-                // A git failure means the changed-file set is UNKNOWN. That is
-                // doubt, not "nothing changed" — the old `unwrap_or_default()`
-                // folded it into an empty list and skipped the gate (fail-open).
+            match baseline_err.clone().map_or_else(
+                || crate::gitrange::changed_since(runner, pre_head.as_deref(), &pre_untracked),
+                Err,
+            ) {
+                // A git failure — at baseline time or now — means the
+                // changed-file set is UNKNOWN. That is doubt, not "nothing
+                // changed": the old `unwrap_or_default()` folded it into an
+                // empty list and skipped the gate (fail-open).
                 Err(e) => Some(crate::gate::evaluate_doubt(
                     runner,
                     &config.gate,
@@ -818,6 +897,19 @@ pub fn run_iteration(
                 // Genuinely nothing changed (committed, staged, unstaged, or
                 // untracked) since the pre-work baseline → nothing to gate.
                 Ok(files) if files.is_empty() => None,
+                // Isolated worktrees are INVISIBLE to the code-graph daemon
+                // (it watches the main checkout), so `affected-tests` would
+                // select from a graph of the PRE-change code — a narrow
+                // subset it blesses can miss tests the change newly affects.
+                // Fleet mode therefore always takes the doubt path (full
+                // suite under the default fallback); narrow selection remains
+                // for the serial `sirius gate` CLI, which runs where the
+                // daemon watches.
+                Ok(_) if isolate_base.is_some() => Some(crate::gate::evaluate_doubt(
+                    runner,
+                    &config.gate,
+                    "isolated worktree is not visible to the code-graph daemon — selection cannot be trusted",
+                )),
                 Ok(files) => Some(crate::gate::evaluate(hv, runner, &config.gate, &files)),
             };
         gate_result = match &verdict {
@@ -879,10 +971,7 @@ pub fn run_iteration(
         // selection or a test-runner spawn failure can be transient (daemon
         // restarting, fork pressure), and a fresh attempt produces a fresh
         // diff that may map cleanly.
-        let gate_retryable = verdict
-            .as_ref()
-            .map(|v| v.plan != "unconfigured")
-            .unwrap_or(false);
+        let gate_retryable = verdict.as_ref().map(|v| !v.structural).unwrap_or(false);
         if gate_result == "fail" && gate_retryable && attempt + 1 < max_attempts {
             ledger_warn(
                 "log_policy_event",
@@ -955,7 +1044,47 @@ pub fn run_iteration(
     //    Otherwise the issue returns to `todo`: re-claimable, but un-promoted
     //    (matching the entity-overlap release path above). (SIRF-6)
     release_entities(hv, ledger, &issue, &claim_ids);
-    let advanced = work_ok && (gate_result == "pass" || gate_result == "skipped");
+    let mut advanced = work_ok && (gate_result == "pass" || gate_result == "skipped");
+    // PRESERVE the completed work before anything can reset the worktree
+    // (isolated fleets hard-reset between issues and tear worktrees down at
+    // exit). Non-committing agents are common — without this, a gated,
+    // advanced, receipted issue's actual code could be deleted with the
+    // worktree, completed-on-the-board but existing nowhere. Auto-commit
+    // whatever is uncommitted, then stamp the per-issue branch (branch -f is
+    // safe: detached worktrees never hold the branch checked out).
+    if advanced && isolate_base.is_some() {
+        let _ = crate::gitrange::run_git(runner, &["add", "-A"]);
+        // May legitimately fail with "nothing to commit" when the agent
+        // committed its own work — that is fine, HEAD already has it. What is
+        // NOT fine is a dirty tree after the attempt (e.g. commit refused for
+        // a missing git identity): stamping HEAD then would silently drop the
+        // uncommitted half, so verify cleanliness below.
+        let _ = crate::gitrange::run_git(
+            runner,
+            &["commit", "-m", &format!("sirius: complete {issue}")],
+        );
+        let clean = crate::gitrange::run_git(runner, &["status", "--porcelain"])
+            .map(|o| o.stdout.trim().is_empty())
+            .unwrap_or(false);
+        let branch = format!("sirius/{}", issue.to_lowercase());
+        let stamp = if clean {
+            crate::gitrange::run_git(runner, &["branch", "-f", &branch, "HEAD"]).map(|_| ())
+        } else {
+            Err("worktree still dirty after auto-commit (missing git identity?)".to_string())
+        };
+        if let Err(e) = stamp {
+            // Without the branch the commits die with the worktree — do NOT
+            // report completion over work that is about to vanish.
+            eprintln!(
+                "sirius: FAILED to stamp {branch} for {issue}: {e} — work retained in the worktree; NOT advancing"
+            );
+            let _ = amt.comment(
+                &issue,
+                &format!("sirius: gate passed but preserving the work failed ({e}) — released without advancing"),
+            );
+            advanced = false;
+        }
+    }
     let (release_status, release_comment): (&str, Option<&str>) = if advanced {
         (config.target_status.as_str(), None)
     } else {
@@ -1787,29 +1916,32 @@ mod tests {
     }
 
     // Isolated iterations (parallel fleet) reset the private worktree to the
-    // fleet base, branch per issue, and diff against the base — no rev-parse,
-    // no pre-untracked snapshot (the clean guarantees a pristine tree).
+    // fleet base DETACHED (a parked branch would block siblings re-claiming
+    // the issue), diff against the base, take the doubt path (the daemon
+    // cannot see the worktree), and PRESERVE completed work by auto-commit +
+    // stamping the per-issue branch.
     #[test]
-    fn isolated_iteration_resets_branches_and_diffs_the_base() {
+    fn isolated_iteration_detaches_gates_and_preserves() {
         let m = MockRunner::new();
         program_prefix(&m, "AMT-40");
-        // Worktree prep: reset → clean → checkout -B, all vs the fleet base.
+        // Worktree prep: reset → clean → DETACHED checkout, all vs the base.
         m.expect(&["git", "reset"], 0, "");
         m.expect(&["git", "clean"], 0, "");
         m.expect(&["git", "checkout"], 0, "");
         m.expect(&["sh", "-c"], 0, ""); // agent
         m.expect(&["git", "diff", "--name-only", "base999"], 0, "src/x.rs\n");
-        m.expect(
-            &["hayven", "affected-tests"],
-            0,
-            r#"{"roots":["x"],"note":"","tests":[]}"#,
-        );
-        m.expect(&["sh", "-c"], 0, "ok"); // full suite passes
+        m.expect(&["sh", "-c"], 0, "ok"); // full suite (doubt path) passes
         m.expect(
             &["amt", "--json", "issue", "update"],
             0,
             r#"{"id":"AMT-40"}"#,
         );
+        m.expect(&["hayven", "release"], 0, "ok");
+        // Preserve: add → commit → clean check → branch stamp.
+        m.expect(&["git", "add"], 0, "");
+        m.expect(&["git", "commit"], 0, "");
+        m.expect(&["git", "status"], 0, "");
+        m.expect(&["git", "branch"], 0, "");
         m.expect(
             &["amt", "--json", "decide"],
             0,
@@ -1821,7 +1953,6 @@ mod tests {
             r#"{"id":"D-2","resolves":"AMT-40"}"#,
         );
         m.expect(&["hayven", "remember"], 0, r#"{"id":"mem"}"#);
-        m.expect(&["hayven", "release"], 0, "ok");
         m.expect(&["amt", "--json", "release"], 0, r#"{"id":"AMT-40"}"#);
 
         let amt = Amt::new(&m);
@@ -1848,20 +1979,77 @@ mod tests {
             "{calls:?}"
         );
         assert!(calls.iter().any(|c| c == "git clean -fd"), "{calls:?}");
+        // DETACHED — never a named branch at prep time.
         assert!(
-            calls
-                .iter()
-                .any(|c| c == "git checkout -B sirius/amt-40 base999"),
+            calls.iter().any(|c| c == "git checkout --detach base999"),
             "{calls:?}"
         );
-        // The baseline is the fleet base — no rev-parse, no pre-untracked scan
-        // before the agent ran.
+        assert!(
+            !calls.iter().any(|c| c.starts_with("git checkout -B")),
+            "{calls:?}"
+        );
+        // The baseline is the fleet base — no rev-parse before the agent ran.
         assert!(
             !calls.iter().any(|c| c.starts_with("git rev-parse")),
             "{calls:?}"
         );
         assert!(
             calls.iter().any(|c| c == "git diff --name-only base999"),
+            "{calls:?}"
+        );
+        // Isolated mode NEVER consults the (stale-graph) selector.
+        assert!(
+            !calls.iter().any(|c| c.starts_with("hayven affected-tests")),
+            "{calls:?}"
+        );
+        // Completed work is preserved on the per-issue branch.
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "git branch -f sirius/amt-40 HEAD"),
+            "{calls:?}"
+        );
+    }
+
+    // A lease REFUSAL at the pre-spawn check must abort before the expensive
+    // agent runs — warning and spawning anyway put two agents on one issue.
+    #[test]
+    fn lost_lease_aborts_before_agent_spawn() {
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-42");
+        // The pre-spawn heartbeat (amt claim --issue …) is REFUSED.
+        m.expect(
+            &["amt", "--json", "claim", "--issue"],
+            0,
+            r#"{"claimed":false,"reason":"lease held by sirius/rowan"}"#,
+        );
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &cfg(),
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
+            None,
+            None,
+        );
+        match o {
+            IterationOutcome::Error(e) => assert!(e.contains("lease"), "{e}"),
+            other => panic!("lost lease must abort as an error, got {other:?}"),
+        }
+        let calls = m.recorded();
+        // The agent never spawned, and the issue was NOT amt-released (the
+        // lease is not ours to release).
+        assert!(!calls.iter().any(|c| c == "sh -c true"), "{calls:?}");
+        assert!(
+            !calls.iter().any(|c| c.starts_with("amt --json release")),
             "{calls:?}"
         );
     }

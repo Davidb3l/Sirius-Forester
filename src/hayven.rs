@@ -127,9 +127,13 @@ impl<'r> Hayven<'r> {
             // errors. Treating those as Overlap sent the loop into endless
             // 409 backoff against a daemon that would never answer (the
             // shared-daemon-on-:7777 topology is the NORM in the field).
-            // Disambiguate by the message; only a real overlap backs off.
-            Some(1) if looks_like_non_overlap_failure(&detail) => ClaimVerdict::Error { detail },
-            Some(1) => ClaimVerdict::Overlap { detail },
+            // POSITIVE-match the overlap vocabulary and default everything
+            // else to Error: an unrecognized operational failure then hits
+            // the loop's error budget (visible, bounded) instead of backing
+            // off forever (silent, unbounded). A rewording upstream degrades
+            // to visible errors, never to silent spin.
+            Some(1) if looks_like_overlap(&detail) => ClaimVerdict::Overlap { detail },
+            Some(1) => ClaimVerdict::Error { detail },
             Some(3) => ClaimVerdict::OracleConflict { detail },
             // Signal-killed (code None) or any other exit: an ERROR, not an
             // overlap — a None→1 exit-code default used to fold a crashed
@@ -224,14 +228,26 @@ impl<'r> Hayven<'r> {
     }
 }
 
-/// Does an exit-1 `hayven claim` message describe an OPERATIONAL failure
-/// rather than a genuine 409 overlap? Upstream overloads exit 1 for both (see
-/// the module header: "serves a DIFFERENT project" is also exit 1), and a
-/// daemon-unreachable CLI errors the same way. Message-sniffing is fragile by
-/// nature, but the failure mode it prevents — endless 409 backoff against a
-/// daemon that will never answer — is worse than an occasional miss (which
-/// merely restores the old behavior for that message).
-fn looks_like_non_overlap_failure(detail: &str) -> bool {
+/// Does an exit-1 `hayven claim` message describe a genuine 409 overlap?
+/// Upstream overloads exit 1 (see the module header: "serves a DIFFERENT
+/// project" is also exit 1, as is a daemon-unreachable CLI). We POSITIVE-match
+/// the overlap vocabulary rather than blocklisting failures: a blocklist
+/// missed any unlisted operational message and silently spun the 409 backoff
+/// forever, and a genuine overlap's detail echoes the HOLDER'S intent text
+/// (an issue title containing "connection refused" would have misread as an
+/// error). Positive matching keys on the daemon's own framing instead.
+fn looks_like_overlap(detail: &str) -> bool {
+    let d = detail.to_ascii_lowercase();
+    ["overlap", "held by", "409", "already claimed", "claimed by"]
+        .iter()
+        .any(|k| d.contains(k))
+}
+
+/// Does a hayven failure message describe a CONNECTIVITY/scope problem (daemon
+/// down or bound to another repo) rather than a normal "nothing found" answer?
+/// Used by `sirius why` to distinguish "no provenance recorded" (a valid empty
+/// answer) from "the daemon could not be asked" (an error).
+pub(crate) fn looks_like_connectivity_failure(detail: &str) -> bool {
     let d = detail.to_ascii_lowercase();
     [
         "different project",
