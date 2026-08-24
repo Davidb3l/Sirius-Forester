@@ -117,8 +117,13 @@ jobs:
           echo "checksum=${tarball}.sha256" >> "$GITHUB_OUTPUT"
 
       # ---- Sign with Sigstore (keyless OIDC) ----
+      # v3.0.0's bundled TUF trust root predates a Sigstore root rotation and
+      # dies with "root was signed by 0/3 keys" (v0.1.1's first build failed
+      # on all 5 platforms exactly there). Track the v3 line's latest — the
+      # bundle format (`<tarball>.sigstore.json`) is unchanged, which is what
+      # install-sirius.sh verifies.
       - name: Sign tarball with Sigstore
-        uses: sigstore/gh-action-sigstore-python@v3.0.0
+        uses: sigstore/gh-action-sigstore-python@v3.5.0
         with:
           inputs: ${{ steps.bundle.outputs.tarball }}
 
