@@ -43,7 +43,7 @@ sirius link AMT-7 --changed [--range <git-range>] --json
 sirius link --decision D-3 --symbols ... --json
 ```
 
-`--changed` resolves the symbols from a git range instead of an explicit list (default: working tree vs HEAD). `LinkKind` distinguishes `issue` from `decision`; both produce a `LinkReceipt` and a `receipts` row.
+`--changed` resolves the symbols from a git range instead of an explicit list (default: working tree vs HEAD — with other agents in the same checkout, pass the issue's own commits). Resolution is by **path**: `gitrange::changed_symbols` takes the `roots` of `hayven affected-tests --changed <files>`, hayven's own path-exact file → entity mapping, so a change to one package's `types.ts` never stamps every other `types` module in a monorepo (the SIRF-20 basename bug: a full-text `hayven query <file stem>`). Unindexed files (lockfiles, configs, docs) contribute nothing, and a daemon that cannot answer fails the link instead of stamping nothing. The output reports "N symbols from M changed file(s)" (`changed_files` in `--json`). `LinkKind` distinguishes `issue` from `decision`; both produce a `LinkReceipt` and a `receipts` row.
 
 ## `sirius why`
 
@@ -51,5 +51,7 @@ Two shapes, dispatched on the target:
 
 - **`sirius why <symbol>`** — recalls fleet memory for that node and resolves the `AMT-n` / `D-n` references it finds, returning the issues and decisions behind the code.
 - **`sirius why AMT-n`** — reads the issue activity and returns the symbols and decisions attached to it, plus the issue's review rounds from the ledger (`review` in `--json`).
+
+Dispatch (`regex_is_issue`): any amt key — `[A-Za-z][A-Za-z0-9]*-\d+`, e.g. `AMT-7`, `GRA-12`, `X-1` — is an issue, except `D-n` (a decision ref). Unknown issues exit 1. A symbol whose recall resolves nothing is existence-checked with `hayven context`: an exact id answers `resolved: null` and is a valid empty answer (exit 0); a fuzzy re-resolve or an exit-1 "No node with id" means it is not a node, so `why` exits 1 — with a "did you mean `<id>`?" only when the index has a node whose NAME exactly matches the arg's last segment. A connectivity failure is inconclusive and keeps the empty answer. (SIRF-15: custom-prefix issues used to fall to the symbol path and return a silent empty, making correct stamps look like failed writes.)
 
 `extract_refs` parses `AMT-n` / `D-n` out of note text and `extract_symbols_from_comment` recovers entity ids from the forward comment, so `why` works off what was actually written rather than requiring a side index.
