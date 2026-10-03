@@ -120,15 +120,6 @@ fn cmd_init(ws: &Workspace, json: bool) -> u8 {
             return 1;
         }
     }
-    // The default reviewer prompt (SIRF-23), only if absent — the operator's
-    // edits are never overwritten.
-    let prompt_path = dir.join("review-prompt.md");
-    if !prompt_path.exists() {
-        if let Err(e) = std::fs::write(&prompt_path, review::DEFAULT_PROMPT) {
-            eprint_err(&format!("cannot write review-prompt.md: {e}"));
-            return 1;
-        }
-    }
     let ledger_path = ws.ledger_path();
     match Ledger::create(&ledger_path, SIRIUS_VERSION) {
         Ok(_) => {
@@ -721,27 +712,27 @@ fn cmd_run(
     u8::from(any_failed.load(std::sync::atomic::Ordering::SeqCst))
 }
 
-/// The reviewer prompt template (SIRF-23). A configured-but-missing prompt
-/// file is materialized from the built-in default so the operator has a real
-/// file to edit; only an UNREADABLE existing file is an error. With the review
-/// stage off this is never needed, so nothing is written.
+/// The reviewer prompt template (SIRF-23): the BUILT-IN default unless a
+/// file exists at `review.prompt_file`, which then overrides it. Nothing is
+/// written: a materialized copy of the default would pin the repo to that
+/// release's wording forever, and every later prompt fix would silently miss
+/// it. Only an UNREADABLE existing file is an error.
 fn load_review_prompt(ws: &Workspace, cfg: &Config) -> Result<String, String> {
     if cfg.review.cmd.is_none() {
         return Ok(String::new());
     }
     let path = ws.root.join(&cfg.review.prompt_file);
     match std::fs::read_to_string(&path) {
+        // An untouched copy that an earlier release wrote is not an override.
+        Ok(p) if review::is_stale_shipped_prompt(&p) => {
+            eprint_err(&format!(
+                "{} is an unedited copy of an older built-in review prompt — using the current built-in (delete the file to silence this)",
+                path.display()
+            ));
+            Ok(review::DEFAULT_PROMPT.to_string())
+        }
         Ok(p) => Ok(p),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Err(e) = std::fs::write(&path, review::DEFAULT_PROMPT) {
-                eprint_err(&format!(
-                    "could not write the default review prompt to {}: {e} (using the built-in copy)",
-                    path.display()
-                ));
-            }
             Ok(review::DEFAULT_PROMPT.to_string())
         }
         Err(e) => Err(format!("cannot read review prompt {}: {e}", path.display())),

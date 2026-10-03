@@ -129,9 +129,10 @@ pub struct ReviewConfig {
     /// Overridden by `sirius run --review-cmd`. `None` = stage off.
     #[serde(default)]
     pub cmd: Option<String>,
-    /// The reviewer prompt template. Sirius renders `$SIRIUS_*` placeholders
-    /// per round and hands the rendered file over as `SIRIUS_REVIEW_PROMPT`.
-    /// A missing file is materialized from the built-in default.
+    /// An OVERRIDE for the reviewer prompt template; when the file is absent
+    /// the built-in default is used (and improves with each release). Sirius
+    /// renders `$SIRIUS_*` placeholders per round and hands the rendered file
+    /// over as `SIRIUS_REVIEW_PROMPT`.
     #[serde(default = "default_review_prompt_file")]
     pub prompt_file: String,
     /// Max review runs per issue (fix rounds = max_rounds - 1).

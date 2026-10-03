@@ -93,7 +93,9 @@ jobs:
         run: bun test
 
       - name: Bundle check (server entry must build)
-        run: bun build src/server.ts --target=bun --outdir /tmp/sirius-console-bundle
+        # runner.temp, not /tmp: Bun on Windows rejects the POSIX path (EINVAL),
+        # which kept this job — and main's badge — red since Aug 2026.
+        run: bun build src/server.ts --target=bun --outdir "${{ runner.temp }}/sirius-console-bundle"
 
   # ─────────────────────────────────────────────────────────────────────────
   # Bench smoke: every §8 harness must run to completion in fixture mode and

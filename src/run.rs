@@ -1719,7 +1719,9 @@ fn review_once(
     let opts = AgentRunOpts {
         timeout: Duration::from_secs(rc.timeout_secs),
         heartbeat_interval: Duration::from_secs(cx.config.heartbeat_interval_secs()),
-        log_path: agent_log_path(&format!("{}-review-r{round}", cx.issue)),
+        // Absolute, under the fleet's .sirius/: the reviewer's final message
+        // is read back from here when it could not write $SIRIUS_REVIEW_OUT.
+        log_path: Some(fleet.sirius_dir.join("logs").join(format!("{stem}.log"))),
         env,
     };
     // A FRESH process: the reviewer's only inputs are the issue spec (via
@@ -1759,13 +1761,36 @@ fn review_once(
         Ok(_) => {}
     }
     let exit = ran.as_ref().ok().and_then(|o| o.output().code);
-    let raw = match std::fs::read_to_string(&out_path) {
-        Ok(r) => r,
-        Err(_) => {
+    // The findings file, OR the reviewer's final message: a headless reviewer
+    // is usually NOT allowed to write files (and needs no write tools at all
+    // — the strongest read-only guarantee), so it may print the JSON instead.
+    // The file wins; prose or fences around it are tolerated. Then — only
+    // for a reviewer that EXITED CLEANLY — its final message. A failed
+    // reviewer's log may hold an echoed template or quoted findings; reading
+    // those as its answer would fake a review.
+    let from_file = std::fs::read_to_string(&out_path).ok().map(|r| {
+        if crate::review::parse_review(&r, round).is_ok() {
+            r
+        } else {
+            crate::review::findings_json_in(&r).unwrap_or(r)
+        }
+    });
+    let from_log = || {
+        if exit != Some(0) {
+            return None;
+        }
+        opts.log_path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|log| crate::review::findings_json_in(&log))
+    };
+    let raw = match from_file.or_else(from_log) {
+        Some(r) => r,
+        None => {
             return ReviewOnce::Failed {
                 result: RoundResult::Error,
                 detail: format!(
-                    "reviewer wrote no findings to $SIRIUS_REVIEW_OUT (exit {})",
+                    "reviewer produced no findings JSON — neither $SIRIUS_REVIEW_OUT nor a final message that is one (exit {})",
                     exit.map(|c| c.to_string()).unwrap_or_else(|| "?".into())
                 ),
             }
@@ -3390,6 +3415,27 @@ mod tests {
             .recorded()
             .iter()
             .any(|c| c == "amt --json issue update AMT-52 --remove-label review:open"));
+    }
+
+    #[test]
+    fn reviewer_that_cannot_write_files_answers_in_its_final_message() {
+        // Headless reviewers are usually denied file writes (verified with a
+        // real `claude -p`). Its printed JSON must count as the review.
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-69");
+        checkpoint_heads(&m, &["ck1"]);
+        m.on_phase_stdout(
+            "review",
+            &format!(
+                "Permission to write the file was denied, so here it is:\n```json\n{BUG}\n```\n"
+            ),
+        );
+        let mut c = review_cfg(1);
+        c.review.on_exhausted = crate::config::ReviewEscalation::Release;
+        let (o, led, _nd) = run_fleet(&m, &c);
+        let rounds = led.review_rounds_for_issue("AMT-69").unwrap();
+        assert_eq!(rounds[0].result, "blocking", "the printed bug was read");
+        assert_eq!(o, IterationOutcome::Deadend);
     }
 
     #[test]

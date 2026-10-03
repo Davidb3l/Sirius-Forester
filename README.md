@@ -274,8 +274,14 @@ read-only — a review that edits the tree is discarded. Doc-only diffs
 ```bash
 sirius run --workers 2 --from todo \
   --agent-cmd 'claude -p "work issue {issue} the Sirius way"' \
-  --review-cmd 'claude -p "$(cat "$SIRIUS_REVIEW_PROMPT")"'
+  --review-cmd 'claude -p "$(cat "$SIRIUS_REVIEW_PROMPT")" --allowedTools "Bash(git diff:*)" "Bash(git log:*)" "Bash(git show:*)" "Bash(amt issue show:*)" Read Grep Glob'
 ```
+
+The reviewer needs only **read** tools: it delivers its findings as JSON in its
+final message (headless `claude -p` is not allowed to write files by default —
+and a reviewer that cannot write cannot tamper). The built-in adversarial
+prompt ships with each release; a file at `review.prompt_file`
+(`.sirius/review-prompt.md`) overrides it.
 
 Workers run as parallel threads in one killable foreground process, each in
 its own private git worktree (`.sirius/worktrees/<worker>`) with each issue's

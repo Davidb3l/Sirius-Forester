@@ -52,7 +52,8 @@ they want the foreman working the board on the current repo.
      `SIRIUS_PHASE` and `AMT_AGENT` in its environment.
    - `--review-cmd '<command>'` (recommended) — a FRESH reviewer that checks each
      gated diff before it advances, e.g.
-     `claude -p "$(cat "$SIRIUS_REVIEW_PROMPT")"`. On confirmed bugs, the worker
+     `claude -p "$(cat "$SIRIUS_REVIEW_PROMPT")" --allowedTools "Bash(git diff:*)" "Bash(git log:*)" "Bash(git show:*)" "Bash(amt issue show:*)" Read Grep Glob`
+     — read-only tools are enough (it answers in its final message). On confirmed bugs, the worker
      runs again in fix mode until the review is clean (`review.max_rounds`). The
      gate alone proves only that the existing suite still passes — the first real
      fleet run passed 9/9 gates with 25 confirmed bugs among them.

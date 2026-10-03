@@ -20,22 +20,23 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The default reviewer prompt, shipped as `.sirius/review-prompt.md`. This is
-/// the wording that produced 25 confirmed bugs with very few false positives
-/// on the Gramxy run. `$SIRIUS_*` placeholders are rendered per round.
+/// The built-in reviewer prompt (a file at `review.prompt_file` overrides it).
+/// Its core is the wording that produced 25 confirmed bugs with very few false
+/// positives on the Gramxy run. `$SIRIUS_*` placeholders are rendered per round.
 pub const DEFAULT_PROMPT: &str = r#"Fresh-eyes correctness review. You did not write this code.
 
 Review ONLY the diff `git diff $SIRIUS_DIFF_RANGE` (run it in $SIRIUS_REVIEW_DIR) for issue $SIRIUS_ISSUE. Read the spec and its "Done when" with `amt issue show $SIRIUS_ISSUE`.
 
 Rules:
 - Do NOT edit, stage, or commit any file in $SIRIUS_REVIEW_DIR or $SIRIUS_WORKTREE. Sirius checks the tree before and after; a review that changes it is discarded.
+- You may not be allowed to write files at all. That is expected: your FINAL message is how you deliver the review (see the end).
 - If you need to run the code, use your own scratch copy and your own port, and remove them afterwards.
 
 Focus on: correctness against the spec, regressions in callers of anything the diff changed, interaction with recently merged work, escaping/security, and data safety.
 
 This is review round $SIRIUS_ROUND. If $SIRIUS_REVIEW_FINDINGS names a file, it holds the PREVIOUS round's findings with the worker's response to each ("fixed" or "rebutted"). Verify every one: report it in "previous" as "resolved" (the fix works), "accepted" (the rebuttal is right — it was not a bug), or "unresolved" (still broken, or the rebuttal is wrong — then also list it again in "findings" under its ORIGINAL id, e.g. "R1-1", never a new one). Use new ids (R$SIRIUS_ROUND-n) only for NEW findings.
 
-Write $SIRIUS_REVIEW_OUT as exactly this JSON (nothing else in the file):
+Deliver the review as JSON — your FINAL message must be exactly this JSON object and nothing else (no prose before or after it, no request for permissions). If you are able to write files, also write the same JSON to $SIRIUS_REVIEW_OUT; if not, the final message alone is enough:
 
 { "findings": [
     { "id": "R$SIRIUS_ROUND-1", "kind": "bug|conflict|minor|design", "confidence": "confirmed|uncertain",
@@ -172,6 +173,14 @@ pub fn parse_review(raw: &str, round: u32) -> Result<ReviewReport, String> {
     let mut report: ReviewReport =
         serde_json::from_value(v).map_err(|e| format!("review output is malformed: {e}"))?;
     for (i, f) in report.findings.iter_mut().enumerate() {
+        // An unfilled template ("bug|conflict|minor|design") is never a real
+        // finding — accepting it would read as a clean, non-blocking note.
+        if f.kind.contains('|') || f.confidence.contains('|') {
+            return Err(format!(
+                "review output contains the prompt's template, not findings (kind `{}`)",
+                f.kind
+            ));
+        }
         if f.id.trim().is_empty() {
             f.id = format!("R{round}-{}", i + 1);
         }
@@ -186,6 +195,60 @@ pub fn parse_review(raw: &str, round: u32) -> Result<ReviewReport, String> {
 pub fn parse_fix(raw: Option<&str>) -> FixReport {
     raw.and_then(|r| serde_json::from_str(r.trim()).ok())
         .unwrap_or_default()
+}
+
+/// Find the reviewer's findings JSON in its captured output (the fallback
+/// when it could not write `$SIRIUS_REVIEW_OUT`). Strict on purpose: the
+/// object must be the output's ENDING — only whitespace, a closing ``` fence,
+/// and Sirius's `[sirius] agent exit` trailer may follow it. An object that is
+/// merely the LAST one would let an echoed prompt template, a quoted findings
+/// file, or a fixture from the diff stand in for the review whenever the
+/// reviewer's real answer is missing or malformed — a false clean pass.
+pub fn findings_json_in(log: &str) -> Option<String> {
+    // The final message sits at the end; bounding the scan to the tail keeps
+    // a verbose reviewer's multi-MB log cheap.
+    const TAIL: usize = 256 * 1024;
+    let mut cut = log.len().saturating_sub(TAIL);
+    while !log.is_char_boundary(cut) {
+        cut += 1;
+    }
+    let tail = &log[cut..];
+    let is_ending = |rest: &str| {
+        rest.lines().all(|l| {
+            let l = l.trim();
+            l.is_empty() || l.chars().all(|c| c == '`') || l.starts_with("[sirius] agent exit")
+        })
+    };
+    for (i, _) in tail.match_indices('{') {
+        let mut it = serde_json::Deserializer::from_str(&tail[i..]).into_iter::<Value>();
+        if let Some(Ok(v)) = it.next() {
+            let end = i + it.byte_offset();
+            if v.get("findings").is_some_and(Value::is_array) && is_ending(&tail[end..]) {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// FNV-1a 64 — a dependency-free fingerprint for recognizing shipped prompts.
+pub fn fnv1a(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// Built-in prompts that earlier releases WROTE into `.sirius/review-prompt.md`
+/// (v0.1.2's `init`/`run` materialized the default). A file with exactly such
+/// content is not an operator override — it is a stale copy, so the CURRENT
+/// built-in is used instead. Only ever append to this list.
+pub const SHIPPED_PROMPT_FNV: &[u64] = &[
+    0x5f9f_6624_84de_9fc1, // v0.1.2
+];
+
+/// Is this prompt-file content a stale copy of a shipped default?
+pub fn is_stale_shipped_prompt(content: &str) -> bool {
+    SHIPPED_PROMPT_FNV.contains(&fnv1a(content))
 }
 
 /// The blocking rule: a confirmed finding of a blocking kind.
@@ -704,6 +767,54 @@ mod tests {
         let rec = reconcile(&prev, &report, &block());
         assert_eq!(rec.blocking.len(), 1);
         assert_eq!(rec.fixed, 0, "contradictory output must not count as fixed");
+    }
+
+    #[test]
+    fn an_echoed_template_or_a_trailing_object_is_never_the_review() {
+        // The prompt (with its example JSON) echoed into the log, then the
+        // reviewer failed: there is NO final answer, so no review.
+        let rendered = render_prompt(DEFAULT_PROMPT, &[("SIRIUS_ROUND".into(), "1".into())]);
+        let log = format!("{rendered}\nError: rate limited\n[sirius] agent exit: 1\n");
+        assert!(findings_json_in(&log).is_none(), "template must not count");
+        // A real answer followed by more output is not the ENDING either.
+        assert!(findings_json_in("{\"findings\":[]}\nand then I kept talking").is_none());
+        // A malformed final answer does not let an earlier object win.
+        let log2 = "{\"findings\":[]}\nfinal: {\"findings\":[1,],}\n";
+        assert!(findings_json_in(log2).is_none());
+        // And the template itself is rejected as malformed if it ever arrives.
+        let t = r#"{"findings":[{"kind":"bug|conflict|minor|design","confidence":"confirmed|uncertain"}]}"#;
+        assert!(parse_review(t, 1).unwrap_err().contains("template"));
+    }
+
+    #[test]
+    fn stale_shipped_prompt_copies_are_recognized() {
+        assert!(
+            !is_stale_shipped_prompt(DEFAULT_PROMPT),
+            "the CURRENT default is not stale"
+        );
+        assert!(!is_stale_shipped_prompt("my own reviewer prompt"));
+        // The hash list is non-empty and the hash function is stable.
+        assert_eq!(fnv1a(""), 0xcbf2_9ce4_8422_2325);
+        assert!(!SHIPPED_PROMPT_FNV.is_empty());
+    }
+
+    #[test]
+    fn findings_json_is_recovered_from_a_final_message() {
+        let log = "Reviewing the diff...\nI found one issue.\n\n```json\n{\"findings\":[{\"id\":\"R1-1\",\"kind\":\"bug\",\"confidence\":\"confirmed\",\"summary\":\"x\"}],\"checked\":[\"a\"]}\n```\n\n[sirius] agent exit: 0\n";
+        let raw = findings_json_in(log).unwrap();
+        let r = parse_review(&raw, 1).unwrap();
+        assert_eq!(r.findings.len(), 1);
+        // The LAST findings object wins (an earlier draft is superseded).
+        let two = format!("{{\"findings\":[]}} then later {}", log);
+        assert_eq!(
+            parse_review(&findings_json_in(&two).unwrap(), 1)
+                .unwrap()
+                .findings
+                .len(),
+            1
+        );
+        // No findings object at all ⇒ None (a review error, not "clean").
+        assert!(findings_json_in("all good! {\"ok\":true}").is_none());
     }
 
     #[test]

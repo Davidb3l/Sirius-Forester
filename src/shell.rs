@@ -158,7 +158,13 @@ impl Runner for RealRunner {
         };
 
         let mut cmd = Command::new(program);
-        cmd.args(args).stdout(stdout_cfg).stderr(stderr_cfg);
+        // Agents are non-interactive: an inherited stdin makes CLIs like
+        // `claude -p` wait for piped input (observed: a 3s stall + warning on
+        // every run) or, worse, read the fleet's own terminal.
+        cmd.args(args)
+            .stdin(Stdio::null())
+            .stdout(stdout_cfg)
+            .stderr(stderr_cfg);
         cmd.envs(opts.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         if let Some(d) = &self.cwd {
             cmd.current_dir(d);
@@ -282,6 +288,10 @@ pub struct MockRunner {
     phase_writes: Mutex<std::collections::HashMap<String, VecDeque<(String, String)>>>,
     /// SIRF-23: phases whose NEXT `run_agent` call simulates a timeout kill.
     phase_timeouts: Mutex<Vec<String>>,
+    /// Scripted agent STDOUT per phase, written to `opts.log_path` (what the
+    /// real runner streams there) — how a test plays a reviewer that prints
+    /// its findings instead of writing `$SIRIUS_REVIEW_OUT`.
+    phase_stdout: Mutex<std::collections::HashMap<String, VecDeque<String>>>,
 }
 
 #[cfg(test)]
@@ -345,6 +355,18 @@ impl MockRunner {
             .entry(phase.to_string())
             .or_default()
             .push_back((out_var.to_string(), contents.to_string()));
+        self
+    }
+
+    /// Script the next `run_agent` call in `phase` to print `text` (written
+    /// to its log file, as the real runner captures stdout).
+    pub fn on_phase_stdout(&self, phase: &str, text: &str) -> &Self {
+        self.phase_stdout
+            .lock()
+            .unwrap()
+            .entry(phase.to_string())
+            .or_default()
+            .push_back(text.to_string());
         self
     }
 
@@ -429,6 +451,20 @@ impl Runner for MockRunner {
                 drop(timeouts);
                 let out = self.run(program, args)?;
                 return Ok(AgentOutcome::TimedOut { output: out });
+            }
+        }
+        if let Some(phase) = &phase {
+            let printed = self
+                .phase_stdout
+                .lock()
+                .unwrap()
+                .get_mut(phase)
+                .and_then(VecDeque::pop_front);
+            if let (Some(text), Some(path)) = (printed, opts.log_path.as_ref()) {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(path, text)?;
             }
         }
         if let Some(phase) = phase {

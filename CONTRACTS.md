@@ -182,7 +182,7 @@ other stdout formats.
   "claim_mode": "adaptive",                // "always" | "never" | "adaptive"
   "review": {                              // SIRF-23 — see §3.1
     "cmd": null,                           // or --review-cmd; null = stage off (pre-review loop exactly)
-    "prompt_file": ".sirius/review-prompt.md",
+    "prompt_file": ".sirius/review-prompt.md", // an OVERRIDE; absent = the built-in default
     "max_rounds": 3,
     "block_on": ["bug", "conflict"],
     "against": "current-base-merge",       // | "launch-base"
@@ -213,7 +213,10 @@ After WORK⇄GATE passes, and only in an isolated fleet worktree, Sirius runs:
 3. **Read-only enforcement** — the worker tree's HEAD + porcelain status + diff are
    fingerprinted before/after; any change is discarded (`reset --hard <checkpoint>`
    + `clean -fd`) and the round is `tampered` (a review error).
-4. **Findings** — `$SIRIUS_REVIEW_OUT`:
+4. **Findings** — the reviewer's FINAL message (or `$SIRIUS_REVIEW_OUT`, if it can
+   write files; the file wins when present). A headless reviewer typically has no
+   write permission, so the last JSON object with a `findings` array in its
+   captured output is the review:
    `{"findings":[{"id","kind":"bug|conflict|minor|design","confidence":"confirmed|uncertain","file","line","summary","scenario","fix"}],"previous":[{"id","verdict":"resolved|accepted|unresolved","note"}],"checked":[str]}`.
    Blocking = `kind ∈ block_on` AND `confidence == "confirmed"`; everything else is
    posted as notes. Missing/malformed JSON, a timeout, or tampering is a review
