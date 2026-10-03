@@ -107,9 +107,15 @@ pub fn link(
             .ok()
             .and_then(|v| v.get("resolves").and_then(Value::as_str).map(String::from)),
     };
+    // Attributed to the worker when the loop stamps it (SIRF-22 #5) — a
+    // provenance trail that reads "@<human>" for fleet work defeats itself.
     let forward_ok = if let Some(issue) = issue_for_comment.as_deref() {
-        amt.comment(issue, &forward_comment_body(r#ref, symbols))
-            .is_ok()
+        let body = forward_comment_body(r#ref, symbols);
+        match worker_id {
+            Some(w) => amt.comment_as(issue, &body, w),
+            None => amt.comment(issue, &body),
+        }
+        .is_ok()
     } else {
         false
     };

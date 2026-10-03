@@ -80,6 +80,25 @@ CREATE TABLE policy_events (
 );
 ```
 
+Additive table (SIRF-23) — created on `init` AND on every `Ledger::open`
+(`CREATE TABLE IF NOT EXISTS`), so older ledgers gain it without a re-init and
+older binaries simply never read it; `schema_version` stays 1:
+
+```sql
+CREATE TABLE review_rounds (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  iteration_id INTEGER REFERENCES iterations(id),
+  issue_ref    TEXT NOT NULL,
+  worker_id    TEXT,
+  round        INTEGER NOT NULL,          -- 1-based review round
+  result       TEXT NOT NULL,             -- clean|blocking|error|tampered
+  confirmed    INTEGER NOT NULL DEFAULT 0, -- blocking findings this round
+  notes        INTEGER NOT NULL DEFAULT 0, -- non-blocking findings
+  findings     TEXT,                      -- JSON {findings,notes} (or {error})
+  created_at   TEXT NOT NULL
+);
+```
+
 The Console reads these tables directly (read-only) for the fleet board and history views.
 `data_version` for SSE polling = `PRAGMA data_version` on the ledger connection.
 
@@ -104,7 +123,9 @@ sirius link --decision D-3 --symbols ... --json    # same shape, kind:"decision"
 
 sirius why <symbol> --json  -> {"symbol":str,"issues":[{"ref":"AMT-7","title":str}],
                                 "decisions":[{"ref":"D-3","summary":str}]}
-sirius why AMT-7 --json     -> {"ref":"AMT-7","symbols":[str],"decisions":[str]}
+sirius why AMT-7 --json     -> {"ref":"AMT-7","symbols":[str],"decisions":[str],
+                                "review":[{"round":int,"result":str,"confirmed":int,"notes":int,
+                                           "worker":str,"at":str,"findings":{...}}]}
 
 sirius gate AMT-7 [--tier safe] [--target-status in_review] [--range <git-range>] --json
    -> {"ok":bool,"issue":"AMT-7","tier":"safe","gate":"pass|fail",
@@ -114,10 +135,31 @@ sirius gate AMT-7 [--tier safe] [--target-status in_review] [--range <git-range>
    # Selects affected tests over the changed files, then RUNS them via
    # gate.test_cmd (full suite on any doubt); verdict = the runner's exit code.
 
-sirius run --workers N --agent-cmd "<cmd>" [--from todo] --json
+sirius run --workers N --agent-cmd "<cmd>" [--from todo] [--review-cmd "<cmd>"] --json
    # streams NDJSON iteration events to stdout, one object per line:
-   -> {"event":"iteration","worker":"sirius/oak","issue":"AMT-7","phase":"claim|map|lock|brief|work|gate|receipt|release","...":...}
+   -> {"event":"iteration","worker":"sirius/oak","issue":"AMT-7","phase":"claim|map|lock|brief|work|gate|review|fix|receipt|release","...":...}
+   # review (SIRF-23, only with review.cmd): {"phase":"review","round":N,"result":"clean|blocking|error|tampered|skipped","confirmed":K,"notes":M}
+   # fix:  {"phase":"fix","round":N,"agent_ok":bool,...}  (then a re-gate, as today)
+   # release gains "review":"review: 2 rounds, 4 bugs fixed, 1 rebuttal accepted" when a review ran
 ```
+
+`--agent-cmd` and `--review-cmd` support `{issue}` / `{worker}` templating, and
+every agent/reviewer process gets this environment (SIRF-22 #4/#5, SIRF-23):
+
+| Var | Meaning |
+|---|---|
+| `SIRIUS_ISSUE`, `SIRIUS_WORKER`, `SIRIUS_WORKTREE` | identity + the private worktree |
+| `AMT_AGENT` | `sirius/<tree>` — the agent's own `amt` writes are attributed to the worker |
+| `SIRIUS_PHASE` | `work` \| `review` \| `fix` |
+| `SIRIUS_BASE` | the launch base commit |
+| `SIRIUS_REVIEW_DIR`, `SIRIUS_DIFF_RANGE` | (review, fix) the tree to review, and `git diff $SIRIUS_DIFF_RANGE` |
+| `SIRIUS_ROUND` | (review, fix) 1-based round |
+| `SIRIUS_REVIEW_OUT`, `SIRIUS_REVIEW_PROMPT` | (review) where to write findings; the rendered prompt |
+| `SIRIUS_REVIEW_FINDINGS` | (fix) this round's findings; (review, round > 1) the previous findings WITH the worker's responses |
+| `SIRIUS_FIX_OUT` | (fix) where the worker writes its responses |
+
+Sirius's own board writes (gate/review comments, decisions, forward stamps)
+pass `--author sirius/<tree>`; releases already pass `--agent`.
 
 Console mutations shell out to `sirius <cmd> --json` and parse these shapes. Do not invent
 other stdout formats.
@@ -135,11 +177,71 @@ other stdout formats.
   "target_status": "in_review",
   "retry_budget": 3,
   "worker_concurrency": 3,
-  "claim_mode": "adaptive"                 // "always" | "never" | "adaptive"
+  "claim_mode": "adaptive",                // "always" | "never" | "adaptive"
+  "review": {                              // SIRF-23 — see §3.1
+    "cmd": null,                           // or --review-cmd; null = stage off (pre-review loop exactly)
+    "prompt_file": ".sirius/review-prompt.md",
+    "max_rounds": 3,
+    "block_on": ["bug", "conflict"],
+    "against": "current-base-merge",       // | "launch-base"
+    "base_ref": null,                      // default: the branch HEAD pointed to at launch
+    "timeout_secs": 1500,
+    "on_exhausted": "advance-flagged",     // | "release"
+    "on_review_error": "advance-flagged",  // | "release"
+    "skip_paths": ["**/*.md", "docs/**"]
+  }
 }
 ```
 
 Absent file ⇒ these defaults. `sirius` reads it; Console displays it read-only.
+
+### 3.1 The review stage (SIRF-23)
+
+After WORK⇄GATE passes, and only in an isolated fleet worktree, Sirius runs:
+
+1. **Checkpoint** — commit the worker's uncommitted work (`base..HEAD` is then exact).
+2. **Review** — after renewing both leases (a refused amt lease aborts the
+   iteration without releasing the issue), a FRESH `review.cmd` process
+   (`sh -c 'cd "$SIRIUS_REVIEW_DIR" || exit 1; <cmd>'`)
+   whose only inputs are the issue (via `amt`), the diff, and the repo. With
+   `current-base-merge`, the review tree is a throwaway detached worktree with the
+   checkpoint merged onto the CURRENT tip of `base_ref`; a merge conflict skips the
+   reviewer and becomes blocking `conflict` findings. The tree is removed every round,
+   and its `git worktree add/remove` are serialized across worker threads.
+3. **Read-only enforcement** — the worker tree's HEAD + porcelain status + diff are
+   fingerprinted before/after; any change is discarded (`reset --hard <checkpoint>`
+   + `clean -fd`) and the round is `tampered` (a review error).
+4. **Findings** — `$SIRIUS_REVIEW_OUT`:
+   `{"findings":[{"id","kind":"bug|conflict|minor|design","confidence":"confirmed|uncertain","file","line","summary","scenario","fix"}],"previous":[{"id","verdict":"resolved|accepted|unresolved","note"}],"checked":[str]}`.
+   Blocking = `kind ∈ block_on` AND `confidence == "confirmed"`; everything else is
+   posted as notes. Missing/malformed JSON, a timeout, or tampering is a review
+   error: retried ONCE, then `on_review_error`.
+5. **Fix** — on any blocking finding (and rounds left), the worker re-runs in
+   `SIRIUS_PHASE=fix` with `$SIRIUS_REVIEW_FINDINGS`, writes
+   `{"responses":[{"id","status":"fixed|rebutted","note"}]}` to `$SIRIUS_FIX_OUT`, and
+   is re-gated (gate failures go back to fixing within `retry_budget`). A fix
+   agent failure or timeout, or a gate it cannot repair, REVERTS to the last
+   reviewed checkpoint and escalates — gate-passing work is never traded for a
+   broken fix, nor abandoned to a release.
+6. **Re-review** — sees each previous finding next to its response; a finding is
+   closed by a `resolved`/`accepted` verdict (or, with no verdict, by not being
+   re-reported). An explicit `unresolved`, or re-reporting it under the same
+   id, keeps it open. Reviewers must re-list an open finding under its
+   ORIGINAL id (the default prompt says so).
+7. **Escalation** — `advance-flagged`: advance anyway, label `review:open`, comment
+   every unresolved confirmed finding. `release`: back to `todo` with the findings
+   (ledger outcome `deadend`, deadend note filed). A later clean review clears a
+   stale `review:open` label. An escalation where the review itself never
+   completed reads "review: did not complete after N round(s)" in the receipt —
+   never like a clean review. An empty diff, or one touching only `skip_paths`,
+   skips the stage.
+
+One issue comment per round and per fix (as `sirius/<tree>`), a `review_rounds`
+ledger row per attempt, spine events `review.started` / `review.finding` /
+`review.passed` / `review.flagged` / `review.tampered`, and the receipt's
+decision title carries the summary ("Resolved AMT-7 via sirius · review: 2
+rounds, 4 bugs fixed, 1 rebuttal accepted"). The issue's status changes once,
+at release — a gate pass alone no longer advances it.
 
 ---
 

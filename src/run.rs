@@ -16,10 +16,60 @@ use serde_json::{json, Value};
 use std::io::Write;
 use std::time::Duration;
 
-/// A phase in the iteration, used in NDJSON `phase` fields.
+/// A phase in the iteration, used in NDJSON `phase` fields. `review` and `fix`
+/// appear only when the SIRF-23 review stage is enabled (`review.cmd`).
 pub const PHASES: &[&str] = &[
-    "claim", "map", "lock", "brief", "work", "gate", "receipt", "release",
+    "claim", "map", "lock", "brief", "work", "gate", "review", "fix", "receipt", "release",
 ];
+
+/// What an isolated (fleet) iteration knows about its workspace. `None` in
+/// `run_iteration` means "not isolated" (tests / a user's own checkout): no
+/// resets, no per-issue branches, and no review stage.
+#[derive(Debug, Clone)]
+pub struct Fleet {
+    /// The launch base commit every worktree was reset to.
+    pub base: String,
+    /// The branch HEAD pointed to at launch — the default `review.base_ref`
+    /// for `current-base-merge`. `None` when launched on a detached HEAD.
+    pub base_ref: Option<String>,
+    /// This worker's private worktree (absolute).
+    pub worktree: std::path::PathBuf,
+    /// The repo's `.sirius/` directory (absolute): review files live under
+    /// `reviews/`, throwaway merge trees under `worktrees/`.
+    pub sirius_dir: std::path::PathBuf,
+    /// The reviewer prompt template (`review.prompt_file`, or the default).
+    pub review_prompt: String,
+}
+
+/// Fill `{issue}` / `{worker}` in an agent or reviewer command (SIRF-22 #4).
+/// Issue keys and worker ids are `[A-Za-z0-9/_-]`, so no shell quoting needed.
+pub fn template_cmd(cmd: &str, issue: &str, worker: &str) -> String {
+    cmd.replace("{issue}", issue).replace("{worker}", worker)
+}
+
+/// An owned env pair.
+fn kv(k: &str, v: impl Into<String>) -> (String, String) {
+    (k.to_string(), v.into())
+}
+
+/// The result of the WORK⇄GATE loop (also reused by review fix rounds).
+pub enum WorkGate {
+    /// The loop ran to a verdict. `exit`/`log` describe the LAST agent run, so
+    /// a release comment can say what actually failed (SIRF-22 #8).
+    Done {
+        work_ok: bool,
+        gate_result: &'static str,
+        exit: Option<i32>,
+        log: Option<std::path::PathBuf>,
+        /// The agent was killed by the timeout. Only reported for FIX rounds
+        /// (a timed-out WORK pass is terminal → `Exit`): the review stage must
+        /// revert to its last reviewed checkpoint, not abandon passing work.
+        timed_out: bool,
+    },
+    /// A terminal path (lease lost, agent killed by timeout) that already did
+    /// its own release/ledger bookkeeping — the caller just returns this.
+    Exit(IterationOutcome),
+}
 
 /// Emit one NDJSON event to `out` (stdout in production).
 pub fn emit_event(
@@ -362,12 +412,13 @@ pub fn run_iteration(
     agent_cmd: &str,
     out: &mut dyn Write,
     spine: Option<&crate::spine::Spine>,
-    // When Some(base): `runner` is scoped to this worker's PRIVATE git
-    // worktree, and the iteration may safely hard-reset it to `base` and put
-    // each issue's work on its own branch. NEVER pass Some for a runner that
+    // When Some: `runner` is scoped to this worker's PRIVATE git worktree,
+    // and the iteration may safely hard-reset it to `fleet.base` and put each
+    // issue's work on its own branch. NEVER pass Some for a runner that
     // targets the user's own checkout — the reset would destroy their work.
-    isolate_base: Option<&str>,
+    fleet: Option<&Fleet>,
 ) -> IterationOutcome {
+    let isolate_base: Option<&str> = fleet.map(|f| f.base.as_str());
     ledger_warn("upsert_worker", ledger.upsert_worker(worker, "working"));
 
     // Suite spine (§2): past-tense job/gate/receipt facts to <root>/.suite/.
@@ -700,11 +751,6 @@ pub fn run_iteration(
     // `retry_budget` is the max number of WORK+GATE attempts (min 1 — a budget
     // of 0/1 yields a single attempt, matching the pre-SIRF-9 one-shot loop).
     let max_attempts = config.retry_budget.max(1);
-    // Assigned on every non-returning path out of the loop below (the loop runs
-    // at least once and sets both before any `break`); the timeout path returns.
-    let mut work_ok;
-    let mut gate_result;
-    let mut attempt: u32 = 0;
     // SIRF-11: pin the pre-work baseline BEFORE the agent runs. The gate diffs
     // against this commit, not bare HEAD — agents routinely COMMIT their work,
     // and a worktree-vs-HEAD diff over a committed change is empty, which used
@@ -743,39 +789,208 @@ pub fn run_iteration(
             (head, untracked)
         }
     };
-    loop {
-        // WORK: spawn the agent command under supervision (SIRF-7). One beat
-        //    fires before the spawn, and then a periodic heartbeat renews BOTH
-        //    leases — the amt issue via `amt.heartbeat` and each held Hayvenhurst
-        //    claim by re-claiming the same entities/intent (same agent + same id
-        //    = refresh, not a collision). This closes the double-claim race for
-        //    any agent run longer than amt's 900s lease. A configurable timeout
-        //    kills a hung/runaway agent; on expiry the iteration FAILS (released
-        //    without advancing, plus a deadend note). The agent's output is
-        //    captured to a durable log so it no longer vanishes on success.
-        // Pre-spawn lease check: a REFUSED refresh (amt's exit-0
-        // `claimed:false` answer — the lease lapsed and someone else may hold
-        // the issue) must ABORT before the expensive agent spawns; warning
-        // and spawning anyway (the old behavior) put two agents on one issue.
-        // A transient `Failed` (amt hiccup) only warns — the lease may well
-        // still be ours.
+    // The shared lease renewal: fired before every agent spawn and on the
+    // heartbeat while the agent (or reviewer) runs.
+    let renew = || {
+        // Renew the Ametrite issue lease. Mid-run we cannot abort the child
+        // from here, but a refusal is never silent.
+        if let Err(e) = amt.heartbeat(&issue, worker) {
+            eprintln!("sirius: {e} for {issue} (agent still running)");
+        }
+        // Renew each held Hayvenhurst entity claim (re-claim = refresh) — and
+        // say so when the renewal comes back as anything but ours.
+        if !held_entities.is_empty() {
+            match hv.claim(&held_entities, &lock_intent, false) {
+                crate::hayven::ClaimVerdict::Registered { .. } => {}
+                other => eprintln!(
+                    "sirius: entity lease renewal for {issue} returned {other:?} (agent still running)"
+                ),
+            }
+        }
+    };
+    // A refused lease refresh mid-iteration: the issue may now belong to
+    // someone else. Release OUR entity claims, record the error, and do NOT
+    // release the issue — the lease is not ours to release. Shared by the
+    // pre-spawn check (work/fix) and the pre-review check (SIRF-23).
+    let lease_lost = |out: &mut dyn Write, reason: &str, when: &str| -> IterationOutcome {
+        release_entities(hv, ledger, &issue, &claim_ids);
+        emit_event(
+            out,
+            worker,
+            Some(&issue),
+            "release",
+            json!({"reason": "lease_lost", "detail": reason}),
+        );
+        ledger_warn(
+            "finish_iteration",
+            ledger.finish_iteration(
+                iter_id,
+                &entities,
+                "error",
+                None,
+                &oracle_verdicts,
+                None,
+                Some(start.elapsed().as_millis() as i64),
+                None,
+            ),
+        );
+        ledger_warn("upsert_worker", ledger.upsert_worker(worker, "idle"));
+        emit_job("job.blocked", &issue);
+        IterationOutcome::Error(format!("lease on {issue} lost before {when}: {reason}"))
+    };
+    // Renew now and SAY whether the amt lease is still ours (a transient amt
+    // failure only warns — the lease may well still be ours).
+    let renew_checked = || -> Result<(), String> {
         match amt.heartbeat(&issue, worker) {
             Ok(()) => {}
-            Err(crate::amt::HeartbeatError::Refused(reason)) => {
+            Err(crate::amt::HeartbeatError::Refused(reason)) => return Err(reason),
+            Err(e) => eprintln!("sirius: {e} for {issue} (continuing — may be transient)"),
+        }
+        if !held_entities.is_empty() {
+            match hv.claim(&held_entities, &lock_intent, false) {
+                crate::hayven::ClaimVerdict::Registered { .. } => {}
+                other => eprintln!("sirius: entity lease renewal for {issue} returned {other:?}"),
+            }
+        }
+        Ok(())
+    };
+    // The env every agent/reviewer process gets (SIRF-22 #4/#5, SIRF-23).
+    let base_env: Vec<(String, String)> = vec![
+        kv("SIRIUS_ISSUE", issue.clone()),
+        kv("SIRIUS_WORKER", worker),
+        kv("AMT_AGENT", worker),
+        kv(
+            "SIRIUS_WORKTREE",
+            fleet
+                .map(|f| f.worktree.display().to_string())
+                .or_else(|| {
+                    std::env::current_dir()
+                        .ok()
+                        .map(|d| d.display().to_string())
+                })
+                .unwrap_or_default(),
+        ),
+        kv("SIRIUS_BASE", pre_head.clone().unwrap_or_default()),
+    ];
+    // WORK⇄GATE as a reusable unit: the initial work pass (phase `work`) and
+    // every review fix round (phase `fix`) run through the same supervision,
+    // heartbeat, timeout, log capture, baseline diff, and retry budget.
+    let run_work_gate = |out: &mut dyn Write,
+                         phase: &str,
+                         round: u32,
+                         extra_env: &[(String, String)]|
+     -> WorkGate {
+        let mut work_ok;
+        let mut gate_result;
+        let mut attempt: u32 = 0;
+        let mut last_exit: Option<i32>;
+        let mut last_log: Option<std::path::PathBuf>;
+        loop {
+            // WORK: spawn the agent command under supervision (SIRF-7). One beat
+            //    fires before the spawn, and then a periodic heartbeat renews BOTH
+            //    leases — the amt issue via `amt.heartbeat` and each held Hayvenhurst
+            //    claim by re-claiming the same entities/intent (same agent + same id
+            //    = refresh, not a collision). This closes the double-claim race for
+            //    any agent run longer than amt's 900s lease. A configurable timeout
+            //    kills a hung/runaway agent; on expiry the iteration FAILS (released
+            //    without advancing, plus a deadend note). The agent's output is
+            //    captured to a durable log so it no longer vanishes on success.
+            // Pre-spawn lease check: a REFUSED refresh (amt's exit-0
+            // `claimed:false` answer — the lease lapsed and someone else may hold
+            // the issue) must ABORT before the expensive agent spawns; warning
+            // and spawning anyway (the old behavior) put two agents on one issue.
+            // A transient `Failed` (amt hiccup) only warns — the lease may well
+            // still be ours.
+            match amt.heartbeat(&issue, worker) {
+                Ok(()) => {}
+                Err(crate::amt::HeartbeatError::Refused(reason)) => {
+                    return WorkGate::Exit(lease_lost(out, &reason, "agent spawn"));
+                }
+                Err(e) => eprintln!("sirius: {e} for {issue} (continuing — may be transient)"),
+            }
+            let mut heartbeat = || renew();
+            // The agent contract (SIRF-22 #4/#5): the agent is TOLD which issue
+            // it claimed, as whom, where, and in which phase — no more
+            // reverse-engineering the worker id from the worktree name — and
+            // AMT_AGENT attributes its board writes to `sirius/<tree>`, not the
+            // human running the fleet.
+            let mut env = base_env.clone();
+            env.push(kv("SIRIUS_PHASE", phase));
+            env.extend(extra_env.iter().cloned());
+            let log_path = agent_log_path(&if phase == "work" {
+                issue.clone()
+            } else {
+                format!("{issue}-{phase}-r{round}")
+            });
+            let opts = AgentRunOpts {
+                timeout: Duration::from_secs(config.agent_timeout_secs),
+                heartbeat_interval: Duration::from_secs(config.heartbeat_interval_secs()),
+                log_path: log_path.clone(),
+                env,
+            };
+            let cmd = template_cmd(agent_cmd, &issue, worker);
+            let work = runner.run_agent("sh", &["-c", &cmd], &opts, &mut heartbeat);
+            let timed_out = work.as_ref().map(AgentOutcome::timed_out).unwrap_or(false);
+            work_ok = work.as_ref().map(AgentOutcome::success).unwrap_or(false);
+            // Agent exit code, from the captured output (durably logged by the runner).
+            let agent_code = work.as_ref().ok().and_then(|w| w.output().code);
+            // A spawn-level failure (sh missing, fork failure) used to be dropped
+            // entirely — the event now carries it so "the agent never ran" is
+            // distinguishable from "the agent ran and failed".
+            let spawn_err = work.as_ref().err().map(|e| e.to_string());
+            last_exit = agent_code;
+            last_log = log_path.clone();
+            let mut ev = json!({"agent_ok": work_ok, "timed_out": timed_out, "exit": agent_code, "attempt": attempt + 1, "spawn_error": spawn_err});
+            if phase != "work" {
+                ev["round"] = json!(round);
+            }
+            emit_event(out, worker, Some(&issue), phase, ev);
+
+            // On a timeout the agent was killed. The iteration must FAIL immediately:
+            // release the held entity claims (reverse), return the issue to `todo`
+            // un-advanced, and file a deadend note so the next agent does not
+            // re-derive the hang. A killed agent does NOT consume the retry budget
+            // (SIRF-7 / SIRF-9): we return straight out of the loop rather than
+            // looping back to WORK.
+            if timed_out && phase != "work" {
+                // A hung FIX agent: hand control back to the review stage, which
+                // reverts to the last reviewed (gate-passing) checkpoint and
+                // escalates. Releasing here would abandon that work — the next
+                // iteration's reset would wipe it.
+                return WorkGate::Done {
+                    work_ok: false,
+                    gate_result: "skipped",
+                    exit: agent_code,
+                    log: log_path,
+                    timed_out: true,
+                };
+            }
+            if timed_out {
                 release_entities(hv, ledger, &issue, &claim_ids);
+                release_issue_checked(
+                    amt,
+                    ledger,
+                    &issue,
+                    worker,
+                    Some("todo"),
+                    Some(&format!(
+                        "sirius: released — agent timed out after {}s (killed)",
+                        config.agent_timeout_secs
+                    )),
+                );
                 emit_event(
                     out,
                     worker,
                     Some(&issue),
                     "release",
-                    json!({"reason": "lease_lost", "detail": reason}),
+                    json!({"reason": "agent_timeout", "advanced": false}),
                 );
                 ledger_warn(
                     "finish_iteration",
                     ledger.finish_iteration(
                         iter_id,
                         &entities,
-                        "error",
+                        "agent_timeout",
                         None,
                         &oracle_verdicts,
                         None,
@@ -784,103 +999,16 @@ pub fn run_iteration(
                     ),
                 );
                 ledger_warn("upsert_worker", ledger.upsert_worker(worker, "idle"));
+                file_deadend(hv, &entities, &issue, "agent timed out");
                 emit_job("job.blocked", &issue);
-                // Deliberately NO amt release: the lease is not ours to release.
-                return IterationOutcome::Error(format!(
-                    "lease on {issue} lost before agent spawn: {reason}"
-                ));
+                return WorkGate::Exit(IterationOutcome::Deadend);
             }
-            Err(e) => eprintln!("sirius: {e} for {issue} (continuing — may be transient)"),
-        }
-        let mut heartbeat = || {
-            // Renew the Ametrite issue lease. Mid-run we cannot abort the
-            // child from here, but a refusal is never silent.
-            if let Err(e) = amt.heartbeat(&issue, worker) {
-                eprintln!("sirius: {e} for {issue} (agent still running)");
-            }
-            // Renew each held Hayvenhurst entity claim (re-claim = refresh) —
-            // and say so when the renewal comes back as anything but ours.
-            if !held_entities.is_empty() {
-                match hv.claim(&held_entities, &lock_intent, false) {
-                    crate::hayven::ClaimVerdict::Registered { .. } => {}
-                    other => eprintln!(
-                        "sirius: entity lease renewal for {issue} returned {other:?} (agent still running)"
-                    ),
-                }
-            }
-        };
-        let opts = AgentRunOpts {
-            timeout: Duration::from_secs(config.agent_timeout_secs),
-            heartbeat_interval: Duration::from_secs(config.heartbeat_interval_secs()),
-            log_path: agent_log_path(&issue),
-        };
-        let work = runner.run_agent("sh", &["-c", agent_cmd], &opts, &mut heartbeat);
-        let timed_out = work.as_ref().map(AgentOutcome::timed_out).unwrap_or(false);
-        work_ok = work.as_ref().map(AgentOutcome::success).unwrap_or(false);
-        // Agent exit code, from the captured output (durably logged by the runner).
-        let agent_code = work.as_ref().ok().and_then(|w| w.output().code);
-        // A spawn-level failure (sh missing, fork failure) used to be dropped
-        // entirely — the event now carries it so "the agent never ran" is
-        // distinguishable from "the agent ran and failed".
-        let spawn_err = work.as_ref().err().map(|e| e.to_string());
-        emit_event(
-            out,
-            worker,
-            Some(&issue),
-            "work",
-            json!({"agent_ok": work_ok, "timed_out": timed_out, "exit": agent_code, "attempt": attempt + 1, "spawn_error": spawn_err}),
-        );
 
-        // On a timeout the agent was killed. The iteration must FAIL immediately:
-        // release the held entity claims (reverse), return the issue to `todo`
-        // un-advanced, and file a deadend note so the next agent does not
-        // re-derive the hang. A killed agent does NOT consume the retry budget
-        // (SIRF-7 / SIRF-9): we return straight out of the loop rather than
-        // looping back to WORK.
-        if timed_out {
-            release_entities(hv, ledger, &issue, &claim_ids);
-            release_issue_checked(
-                amt,
-                ledger,
-                &issue,
-                worker,
-                Some("todo"),
-                Some(&format!(
-                    "sirius: released — agent timed out after {}s (killed)",
-                    config.agent_timeout_secs
-                )),
-            );
-            emit_event(
-                out,
-                worker,
-                Some(&issue),
-                "release",
-                json!({"reason": "agent_timeout", "advanced": false}),
-            );
-            ledger_warn(
-                "finish_iteration",
-                ledger.finish_iteration(
-                    iter_id,
-                    &entities,
-                    "agent_timeout",
-                    None,
-                    &oracle_verdicts,
-                    None,
-                    Some(start.elapsed().as_millis() as i64),
-                    None,
-                ),
-            );
-            ledger_warn("upsert_worker", ledger.upsert_worker(worker, "idle"));
-            file_deadend(hv, &entities, &issue, "agent timed out");
-            emit_job("job.blocked", &issue);
-            return IterationOutcome::Deadend;
-        }
-
-        // GATE — select over the agent's ACTUAL changes, run the tests, and take
-        //    the verdict from the test runner (never from the selector's exit
-        //    code). `hayven affected-tests` only selects; on any doubt the gate
-        //    runs the full suite. See gate.rs / SIRF-5 / D-3.
-        let verdict =
+            // GATE — select over the agent's ACTUAL changes, run the tests, and take
+            //    the verdict from the test runner (never from the selector's exit
+            //    code). `hayven affected-tests` only selects; on any doubt the gate
+            //    runs the full suite. See gate.rs / SIRF-5 / D-3.
+            let verdict =
             match baseline_err.clone().map_or_else(
                 || crate::gitrange::changed_since(runner, pre_head.as_deref(), &pre_untracked),
                 Err,
@@ -912,68 +1040,64 @@ pub fn run_iteration(
                 )),
                 Ok(files) => Some(crate::gate::evaluate(hv, runner, &config.gate, &files)),
             };
-        gate_result = match &verdict {
-            Some(v) if v.passed => {
-                // Advance requires the AGENT to have succeeded too: a passing
-                // suite over changes a failed/never-spawned agent didn't make
-                // (leftovers, pre-existing state) is not completed work.
-                if work_ok {
-                    let _ = amt.update_status(&issue, &config.target_status);
+            // A pass does NOT move the issue by itself: the status changes once,
+            // at RELEASE, after the review stage (SIRF-23) has had its say — a
+            // gate pass is necessary, not sufficient.
+            gate_result = match &verdict {
+                Some(v) if v.passed => "pass",
+                Some(v) => {
+                    let _ = amt.comment_as(
+                        &issue,
+                        &format!("sirius: gate failed [{}]: {}", v.plan, v.reason),
+                        worker,
+                    );
+                    "fail"
                 }
-                "pass"
+                None => "skipped",
+            };
+            emit_event(
+                out,
+                worker,
+                Some(&issue),
+                "gate",
+                json!({
+                    "result": gate_result,
+                    "plan": verdict.as_ref().map(|v| v.plan.clone()),
+                    "tests_run": verdict.as_ref().map(|v| v.tests_run),
+                    "attempt": attempt + 1,
+                }),
+            );
+            // Durable: amt status advance (pass) / comment (fail) applied above. A
+            // skipped gate (nothing to test) is not a gate verdict, so no event.
+            if let Some(v) = &verdict {
+                if gate_result != "skipped" {
+                    emit_spine(
+                        if gate_result == "pass" {
+                            "gate.passed"
+                        } else {
+                            "gate.failed"
+                        },
+                        vec![crate::spine::issue_ref(&issue)],
+                        json!({ "issue": issue.as_str(), "tests": v.test_ids.clone() }),
+                    );
+                }
             }
-            Some(v) => {
-                let _ = amt.comment(
-                    &issue,
-                    &format!("sirius: gate failed [{}]: {}", v.plan, v.reason),
-                );
-                "fail"
-            }
-            None => "skipped",
-        };
-        emit_event(
-            out,
-            worker,
-            Some(&issue),
-            "gate",
-            json!({
-                "result": gate_result,
-                "plan": verdict.as_ref().map(|v| v.plan.clone()),
-                "tests_run": verdict.as_ref().map(|v| v.tests_run),
-                "attempt": attempt + 1,
-            }),
-        );
-        // Durable: amt status advance (pass) / comment (fail) applied above. A
-        // skipped gate (nothing to test) is not a gate verdict, so no event.
-        if let Some(v) = &verdict {
-            if gate_result != "skipped" {
-                emit_spine(
-                    if gate_result == "pass" {
-                        "gate.passed"
-                    } else {
-                        "gate.failed"
-                    },
-                    vec![crate::spine::issue_ref(&issue)],
-                    json!({ "issue": issue.as_str(), "tests": v.test_ids.clone() }),
-                );
-            }
-        }
 
-        // Retry decision (SIRF-9): only a FAIL is retryable, and only while the
-        // budget has attempts left. Each retry is recorded as a policy event so
-        // the ledger shows the honest attempt history.
-        //
-        // An `unconfigured` fail is STRUCTURAL — no test_cmd exists, so a
-        // fresh agent attempt cannot change the verdict, and retrying re-runs
-        // the whole (expensive) agent against a gate that can never pass
-        // (observed in the field as a fleet burning 3× agent time per issue
-        // and completing nothing). Everything else stays retryable: a blocked
-        // selection or a test-runner spawn failure can be transient (daemon
-        // restarting, fork pressure), and a fresh attempt produces a fresh
-        // diff that may map cleanly.
-        let gate_retryable = verdict.as_ref().map(|v| !v.structural).unwrap_or(false);
-        if gate_result == "fail" && gate_retryable && attempt + 1 < max_attempts {
-            ledger_warn(
+            // Retry decision (SIRF-9): only a FAIL is retryable, and only while the
+            // budget has attempts left. Each retry is recorded as a policy event so
+            // the ledger shows the honest attempt history.
+            //
+            // An `unconfigured` fail is STRUCTURAL — no test_cmd exists, so a
+            // fresh agent attempt cannot change the verdict, and retrying re-runs
+            // the whole (expensive) agent against a gate that can never pass
+            // (observed in the field as a fleet burning 3× agent time per issue
+            // and completing nothing). Everything else stays retryable: a blocked
+            // selection or a test-runner spawn failure can be transient (daemon
+            // restarting, fork pressure), and a fresh attempt produces a fresh
+            // diff that may map cleanly.
+            let gate_retryable = verdict.as_ref().map(|v| !v.structural).unwrap_or(false);
+            if gate_result == "fail" && gate_retryable && attempt + 1 < max_attempts {
+                ledger_warn(
                 "log_policy_event",
                 ledger.log_policy_event(
                     iter_ref,
@@ -981,27 +1105,88 @@ pub fn run_iteration(
                     &json!({"issue": issue, "attempt": attempt + 1, "max_attempts": max_attempts}),
                 ),
             );
-            emit_event(
-                out,
-                worker,
-                Some(&issue),
-                "work",
-                json!({"retrying": true, "attempt": attempt + 1, "max_attempts": max_attempts}),
-            );
-            attempt += 1;
-            continue;
+                emit_event(
+                    out,
+                    worker,
+                    Some(&issue),
+                    phase,
+                    json!({"retrying": true, "attempt": attempt + 1, "max_attempts": max_attempts}),
+                );
+                attempt += 1;
+                continue;
+            }
+            break;
         }
-        break;
+        WorkGate::Done {
+            work_ok,
+            gate_result,
+            exit: last_exit,
+            log: last_log,
+            timed_out: false,
+        }
+    };
+
+    let (work_ok, gate_result, work_exit, work_log) = match run_work_gate(out, "work", 0, &[]) {
+        WorkGate::Done {
+            work_ok,
+            gate_result,
+            exit,
+            log,
+            ..
+        } => (work_ok, gate_result, exit, log),
+        WorkGate::Exit(o) => return o,
+    };
+
+    // 6. REVIEW⇄FIX (SIRF-23): only over work that passed the gate. Off unless
+    //    `review.cmd` is set, and fleet-only (it checkpoints commits and may
+    //    hard-reset, which is only safe in a private worktree).
+    let review = if work_ok && (gate_result == "pass" || gate_result == "skipped") {
+        match fleet {
+            Some(f) if config.review.cmd.is_some() => {
+                let cx = ReviewCtx {
+                    amt,
+                    ledger,
+                    config,
+                    runner,
+                    worker,
+                    issue: &issue,
+                    fleet: f,
+                    iter_ref,
+                    base_env: &base_env,
+                    spine,
+                    renew: &renew,
+                    renew_checked: &renew_checked,
+                };
+                let fix_round = |out: &mut dyn Write, round: u32, env: &[(String, String)]| {
+                    run_work_gate(out, "fix", round, env)
+                };
+                run_review_stage(&cx, out, &fix_round)
+            }
+            _ => ReviewStage::Off,
+        }
+    } else {
+        ReviewStage::Off
+    };
+    if let ReviewStage::LeaseLost(reason) = &review {
+        return lease_lost(out, reason, "the review");
+    }
+    if let ReviewStage::Exit(o) = review {
+        return o;
     }
 
     // 7. RECEIPT: decide + two-way link (only on a passing/complete iteration).
     let mut receipt_id: Option<i64> = None;
-    if work_ok && (gate_result == "pass" || gate_result == "skipped") {
-        if let Ok(decision_ref) = amt.decide(
-            &issue,
-            &format!("Resolved {issue} via sirius"),
-            "See linked entities.",
-        ) {
+    let review_released = matches!(review, ReviewStage::Release { .. });
+    let review_summary: Option<&crate::review::ReviewSummary> = match &review {
+        ReviewStage::Advance { summary, .. } => summary.as_ref(),
+        ReviewStage::Release { summary, .. } => Some(summary),
+        _ => None,
+    };
+    if work_ok && (gate_result == "pass" || gate_result == "skipped") && !review_released {
+        // The decision carries the WHY (SIRF-22 #6): the review history when
+        // a review ran, attributed to the worker (SIRF-22 #5).
+        let (title, body) = decision_text(&issue, &review);
+        if let Ok(decision_ref) = amt.decide_as(&issue, &title, &body, worker) {
             if let Ok(rec) = crate::bridge::link(
                 amt,
                 hv,
@@ -1044,7 +1229,8 @@ pub fn run_iteration(
     //    Otherwise the issue returns to `todo`: re-claimable, but un-promoted
     //    (matching the entity-overlap release path above). (SIRF-6)
     release_entities(hv, ledger, &issue, &claim_ids);
-    let mut advanced = work_ok && (gate_result == "pass" || gate_result == "skipped");
+    let mut advanced =
+        work_ok && (gate_result == "pass" || gate_result == "skipped") && !review_released;
     // PRESERVE the completed work before anything can reset the worktree
     // (isolated fleets hard-reset between issues and tear worktrees down at
     // exit). Non-committing agents are common — without this, a gated,
@@ -1078,20 +1264,43 @@ pub fn run_iteration(
             eprintln!(
                 "sirius: FAILED to stamp {branch} for {issue}: {e} — work retained in the worktree; NOT advancing"
             );
-            let _ = amt.comment(
+            let _ = amt.comment_as(
                 &issue,
                 &format!("sirius: gate passed but preserving the work failed ({e}) — released without advancing"),
+                worker,
             );
             advanced = false;
         }
     }
-    let (release_status, release_comment): (&str, Option<&str>) = if advanced {
-        (config.target_status.as_str(), None)
+    // Say what ACTUALLY held the issue back (SIRF-22 #8): "gate did not
+    // pass" used to be posted even when the agent itself had exited 1.
+    let held_back = if advanced {
+        None
+    } else if let ReviewStage::Release { why, .. } = &review {
+        Some(format!(
+            "sirius: released without advancing — review: {why}"
+        ))
+    } else if !work_ok {
+        Some(format!(
+            "sirius: released without advancing — agent {}{}",
+            match work_exit {
+                Some(c) => format!("exited {c}"),
+                None => "did not run (spawn failure)".into(),
+            },
+            work_log
+                .as_ref()
+                .map(|p| format!(" (see {})", p.display()))
+                .unwrap_or_default()
+        ))
+    } else if gate_result == "fail" {
+        Some("sirius: released without advancing — gate did not pass".to_string())
     } else {
-        (
-            "todo",
-            Some("sirius: released without advancing — gate did not pass"),
-        )
+        Some("sirius: released without advancing — the work could not be preserved".to_string())
+    };
+    let release_status: &str = if advanced {
+        config.target_status.as_str()
+    } else {
+        "todo"
     };
     release_issue_checked(
         amt,
@@ -1099,18 +1308,20 @@ pub fn run_iteration(
         &issue,
         worker,
         Some(release_status),
-        release_comment,
+        held_back.as_deref(),
     );
-    emit_event(
-        out,
-        worker,
-        Some(&issue),
-        "release",
-        json!({"status": release_status, "advanced": advanced}),
-    );
+    let mut release_ev = json!({"status": release_status, "advanced": advanced});
+    if let Some(sum) = review_summary {
+        release_ev["review"] = json!(sum.line());
+    }
+    emit_event(out, worker, Some(&issue), "release", release_ev);
 
     let outcome = if gate_result == "fail" {
         "gate_failed"
+    } else if review_released {
+        // `deadend` (not a new outcome string): it is one — a deadend note
+        // is filed below — and the console's outcome enum counts it.
+        "deadend"
     } else if advanced {
         "completed"
     } else {
@@ -1145,6 +1356,9 @@ pub fn run_iteration(
         // Record the failure as a deadend note so the next agent does not
         // re-derive it (PRD §F3 retry-budget exhaustion behavior).
         file_deadend(hv, &entities, &issue, "gate failed (affected-tests)");
+        IterationOutcome::Deadend
+    } else if review_released {
+        file_deadend(hv, &entities, &issue, "review did not converge");
         IterationOutcome::Deadend
     } else if outcome == "error" {
         // A failed agent with nothing advanced is an OPERATIONAL error: it
@@ -1187,10 +1401,744 @@ pub fn file_deadend(hv: &Hayven, entities: &[String], issue: &str, reason: &str)
     let _ = hv.remember(&note, primary, "deadend", entities);
 }
 
+// ── 6. REVIEW⇄FIX (SIRF-23) ─────────────────────────────────────────────────
+
+use crate::review::{Finding, ReviewSummary, RoundResult};
+
+/// Everything the review stage needs from the iteration.
+pub struct ReviewCtx<'a, 'r> {
+    pub amt: &'a Amt<'r>,
+    pub ledger: &'a Ledger,
+    pub config: &'a Config,
+    pub runner: &'a dyn Runner,
+    pub worker: &'a str,
+    pub issue: &'a str,
+    pub fleet: &'a Fleet,
+    pub iter_ref: Option<i64>,
+    pub base_env: &'a [(String, String)],
+    pub spine: Option<&'a crate::spine::Spine>,
+    /// Renews both leases; fired on the reviewer's heartbeat too (a review
+    /// takes minutes — the lease must not lapse under it).
+    pub renew: &'a dyn Fn(),
+    /// Renew BEFORE spawning the reviewer and report a refused amt lease:
+    /// the gap since the last beat (agent tail + full-suite gate + merge
+    /// prep + the first heartbeat interval) can exceed the 900s lease.
+    pub renew_checked: &'a dyn Fn() -> Result<(), String>,
+}
+
+/// How the review stage ended.
+pub enum ReviewStage {
+    /// `review.cmd` unset, not isolated, or the work never passed the gate —
+    /// today's behavior.
+    Off,
+    /// Advance: clean, skipped (`skip_paths`), or escalated `advance-flagged`
+    /// (then `open` lists the unresolved confirmed findings).
+    Advance {
+        summary: Option<ReviewSummary>,
+        open: Vec<Finding>,
+    },
+    /// Escalated with `release`: back to `todo`, the findings already posted.
+    Release { summary: ReviewSummary, why: String },
+    /// A fix round hit a terminal path that already did its bookkeeping.
+    Exit(IterationOutcome),
+    /// The amt lease was refused before a reviewer spawned — the issue may
+    /// now belong to someone else. The caller does the lease-lost unwind.
+    LeaseLost(String),
+}
+
+/// One reviewer attempt's result.
+enum ReviewOnce {
+    Report {
+        report: crate::review::ReviewReport,
+        head: String,
+    },
+    /// `current-base-merge` conflicted: these are the blocking findings.
+    Conflicts {
+        findings: Vec<Finding>,
+        head: String,
+    },
+    Failed {
+        result: RoundResult,
+        detail: String,
+    },
+    LeaseLost(String),
+}
+
+/// What the reviewer must leave alone, as text: the HEAD commit, the porcelain
+/// status (untracked included), and the full diff against HEAD. Any change
+/// between before and after = the reviewer edited, staged, or committed.
+fn tree_fingerprint(runner: &dyn Runner) -> String {
+    [
+        &["log", "-1", "--format=%H"][..],
+        &["status", "--porcelain=v1", "--untracked-files=all"][..],
+        &["diff", "--no-ext-diff", "--binary", "HEAD"][..],
+    ]
+    .iter()
+    .map(|args| match crate::gitrange::run_git(runner, args) {
+        Ok(o) => o.stdout,
+        Err(e) => format!("ERR:{e}"),
+    })
+    .collect::<Vec<_>>()
+    .join("\u{0}")
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn safe_name(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Commit whatever the worker left uncommitted so the review sees exactly
+/// `base..HEAD`, and a tampering reviewer can be undone with one reset.
+fn checkpoint(cx: &ReviewCtx, round: u32) -> Result<String, String> {
+    let _ = crate::gitrange::run_git(cx.runner, &["add", "-A"]);
+    // "nothing to commit" is fine; a dirty tree afterwards is not.
+    let _ = crate::gitrange::run_git(
+        cx.runner,
+        &[
+            "commit",
+            "-m",
+            &format!(
+                "sirius: checkpoint {} before review round {round}",
+                cx.issue
+            ),
+        ],
+    );
+    let clean = crate::gitrange::run_git(cx.runner, &["status", "--porcelain"])
+        .map(|o| o.stdout.trim().is_empty())
+        .unwrap_or(false);
+    if !clean {
+        return Err("cannot checkpoint the work before review (missing git identity?)".into());
+    }
+    crate::gitrange::head_rev(cx.runner)
+}
+
+/// Discard everything since `head` in the worker's worktree.
+fn revert_to(cx: &ReviewCtx, head: &str) {
+    let _ = crate::gitrange::run_git(cx.runner, &["reset", "--hard", head]);
+    let _ = crate::gitrange::run_git(cx.runner, &["clean", "-fd"]);
+}
+
+/// `git worktree add/remove/prune` contend on `.git` admin locks; v0.1.1
+/// moved fleet worktree setup to a serial step for exactly that reason. The
+/// review stage's throwaway merge trees are created from N worker threads,
+/// so their admin operations are serialized process-wide.
+static WORKTREE_ADMIN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn worktree_admin<T>(f: impl FnOnce() -> T) -> T {
+    // A poisoned lock only means another thread panicked mid-operation; the
+    // guard protects git's lock files, not shared Rust state.
+    let _g = WORKTREE_ADMIN.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
+
+/// Remove a throwaway review tree (always — even on error paths).
+fn remove_review_tree(cx: &ReviewCtx, t: &std::path::Path) {
+    let t_str = t.to_string_lossy().to_string();
+    worktree_admin(|| {
+        let _ = crate::gitrange::run_git(cx.runner, &["worktree", "remove", "--force", &t_str]);
+    });
+    let _ = std::fs::remove_dir_all(t);
+}
+
+/// Run ONE reviewer attempt for `round` (attempt `try_n` within the round).
+fn review_once(
+    cx: &ReviewCtx,
+    review_cmd: &str,
+    round: u32,
+    try_n: u32,
+    prev_findings: Option<&std::path::Path>,
+) -> ReviewOnce {
+    let rc = &cx.config.review;
+    let fleet = cx.fleet;
+    let head = match checkpoint(cx, round) {
+        Ok(h) => h,
+        Err(detail) => {
+            return ReviewOnce::Failed {
+                result: RoundResult::Error,
+                detail,
+            }
+        }
+    };
+    let reviews_dir = fleet.sirius_dir.join("reviews");
+    let _ = std::fs::create_dir_all(&reviews_dir);
+    let stem = format!("{}-r{round}-t{try_n}-{}", safe_name(cx.issue), unix_secs());
+
+    // Which tree to review: the worker's own, or a throwaway merge of the
+    // work onto the CURRENT base tip (catches clashes with work merged since
+    // launch). Falls back to the launch base when there is nothing newer.
+    let mut review_dir = fleet.worktree.clone();
+    let mut diff_range = format!("{}..HEAD", fleet.base);
+    let mut tmp: Option<std::path::PathBuf> = None;
+    if rc.against == crate::config::ReviewAgainst::CurrentBaseMerge {
+        let base_ref = rc.base_ref.clone().or_else(|| fleet.base_ref.clone());
+        let cur = base_ref.as_deref().and_then(|r| {
+            crate::gitrange::run_git(
+                cx.runner,
+                &["rev-parse", "--verify", &format!("{r}^{{commit}}")],
+            )
+            .map(|o| o.stdout.trim().to_string())
+            .ok()
+            .filter(|c| !c.is_empty())
+        });
+        match (base_ref, cur) {
+            (Some(r), Some(cur)) if cur != fleet.base => {
+                let t = fleet
+                    .sirius_dir
+                    .join("worktrees")
+                    .join(format!("{}-review", safe_name(cx.worker)));
+                let t_str = t.to_string_lossy().to_string();
+                remove_review_tree(cx, &t);
+                let added = worktree_admin(|| {
+                    crate::gitrange::run_git(cx.runner, &["worktree", "add", "--detach", &t_str, &cur])
+                });
+                if let Err(e) = added {
+                    return ReviewOnce::Failed {
+                        result: RoundResult::Error,
+                        detail: format!("cannot create the review merge tree: {e}"),
+                    };
+                }
+                // A throwaway merge commit, never on any branch — so a fixed
+                // identity is fine and the user's git config is not needed.
+                let merged = crate::gitrange::run_git(
+                    cx.runner,
+                    &[
+                        "-C", &t_str, "-c", "user.name=sirius", "-c",
+                        "user.email=sirius@localhost", "merge", "--no-ff", "--no-edit", &head,
+                    ],
+                );
+                if let Err(e) = merged {
+                    let conflicts: Vec<String> = crate::gitrange::run_git(
+                        cx.runner,
+                        &["-C", &t_str, "diff", "--name-only", "--diff-filter=U"],
+                    )
+                    .map(|o| {
+                        o.stdout
+                            .lines()
+                            .map(str::trim)
+                            .filter(|l| !l.is_empty())
+                            .map(String::from)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                    remove_review_tree(cx, &t);
+                    if conflicts.is_empty() {
+                        return ReviewOnce::Failed {
+                            result: RoundResult::Error,
+                            detail: format!("merging onto {r} failed: {e}"),
+                        };
+                    }
+                    let short = &cur[..cur.len().min(10)];
+                    let findings = conflicts
+                        .iter()
+                        .enumerate()
+                        .map(|(i, f)| Finding {
+                            id: format!("R{round}-c{}", i + 1),
+                            kind: "conflict".into(),
+                            confidence: "confirmed".into(),
+                            file: Some(f.clone()),
+                            line: None,
+                            summary: format!("conflicts with the current {r} ({short})"),
+                            scenario: format!(
+                                "merging this issue's work onto {r} at {short} conflicts in {f}"
+                            ),
+                            fix: format!(
+                                "merge the current base into the issue work (`git merge {cur}`) and resolve the conflict"
+                            ),
+                            response: None,
+                        })
+                        .collect();
+                    return ReviewOnce::Conflicts { findings, head };
+                }
+                review_dir = t.clone();
+                diff_range = format!("{cur}..HEAD");
+                tmp = Some(t);
+            }
+            (None, _) => eprintln!(
+                "sirius: review.against=current-base-merge but no base_ref (detached launch) — reviewing against the launch base"
+            ),
+            (Some(r), None) => eprintln!(
+                "sirius: review base_ref `{r}` does not resolve to a commit — reviewing against the launch base instead"
+            ),
+            _ => {} // the base has not moved: the plain diff IS the merge
+        }
+    }
+
+    let out_path = reviews_dir.join(format!("{stem}.json"));
+    let _ = std::fs::remove_file(&out_path);
+    let findings_path = prev_findings
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(none — this is round 1)".into());
+    let mut vars: Vec<(String, String)> = cx.base_env.to_vec();
+    vars.extend([
+        kv("SIRIUS_PHASE", "review"),
+        kv("SIRIUS_REVIEW_DIR", review_dir.display().to_string()),
+        kv("SIRIUS_DIFF_RANGE", diff_range),
+        kv("SIRIUS_ROUND", round.to_string()),
+        kv("SIRIUS_REVIEW_OUT", out_path.display().to_string()),
+    ]);
+    let rendered = crate::review::render_prompt(
+        &fleet.review_prompt,
+        &[
+            vars.clone(),
+            vec![kv("SIRIUS_REVIEW_FINDINGS", findings_path.clone())],
+        ]
+        .concat(),
+    );
+    let prompt_path = reviews_dir.join(format!("{stem}-prompt.md"));
+    let _ = std::fs::write(&prompt_path, rendered);
+    let mut env = vars;
+    env.push(kv(
+        "SIRIUS_REVIEW_PROMPT",
+        prompt_path.display().to_string(),
+    ));
+    if let Some(p) = prev_findings {
+        env.push(kv("SIRIUS_REVIEW_FINDINGS", p.display().to_string()));
+    }
+
+    if let Err(reason) = (cx.renew_checked)() {
+        if let Some(t) = &tmp {
+            remove_review_tree(cx, t);
+        }
+        return ReviewOnce::LeaseLost(reason);
+    }
+    let fp_before = tree_fingerprint(cx.runner);
+    let opts = AgentRunOpts {
+        timeout: Duration::from_secs(rc.timeout_secs),
+        heartbeat_interval: Duration::from_secs(cx.config.heartbeat_interval_secs()),
+        log_path: agent_log_path(&format!("{}-review-r{round}", cx.issue)),
+        env,
+    };
+    // A FRESH process: the reviewer's only inputs are the issue spec (via
+    // amt), the diff, and the repo — never the worker's session.
+    let cmd = format!(
+        "cd \"$SIRIUS_REVIEW_DIR\" || exit 1; {}",
+        template_cmd(review_cmd, cx.issue, cx.worker)
+    );
+    let ran = cx
+        .runner
+        .run_agent("sh", &["-c", &cmd], &opts, &mut || (cx.renew)());
+
+    if let Some(t) = &tmp {
+        remove_review_tree(cx, t);
+    }
+    // READ-ONLY enforcement: any change to the worker's tree is discarded.
+    if tree_fingerprint(cx.runner) != fp_before {
+        revert_to(cx, &head);
+        return ReviewOnce::Failed {
+            result: RoundResult::Tampered,
+            detail: "the reviewer modified the worktree; its changes were discarded".into(),
+        };
+    }
+    match &ran {
+        Err(e) => {
+            return ReviewOnce::Failed {
+                result: RoundResult::Error,
+                detail: format!("reviewer did not run: {e}"),
+            }
+        }
+        Ok(o) if o.timed_out() => {
+            return ReviewOnce::Failed {
+                result: RoundResult::Error,
+                detail: format!("reviewer timed out after {}s", rc.timeout_secs),
+            }
+        }
+        Ok(_) => {}
+    }
+    let exit = ran.as_ref().ok().and_then(|o| o.output().code);
+    let raw = match std::fs::read_to_string(&out_path) {
+        Ok(r) => r,
+        Err(_) => {
+            return ReviewOnce::Failed {
+                result: RoundResult::Error,
+                detail: format!(
+                    "reviewer wrote no findings to $SIRIUS_REVIEW_OUT (exit {})",
+                    exit.map(|c| c.to_string()).unwrap_or_else(|| "?".into())
+                ),
+            }
+        }
+    };
+    match crate::review::parse_review(&raw, round) {
+        Ok(report) => ReviewOnce::Report { report, head },
+        Err(detail) => ReviewOnce::Failed {
+            result: RoundResult::Error,
+            detail,
+        },
+    }
+}
+
+fn spine_emit(cx: &ReviewCtx, ty: &str, data: Value) {
+    if let Some(sp) = cx.spine {
+        sp.emit(
+            ty,
+            vec![
+                crate::spine::issue_ref(cx.issue),
+                crate::spine::worker_ref(cx.worker),
+            ],
+            data,
+        );
+    }
+}
+
+/// Apply `on_exhausted` / `on_review_error`.
+fn escalate(
+    cx: &ReviewCtx,
+    policy: crate::config::ReviewEscalation,
+    why: &str,
+    open: Vec<Finding>,
+    mut summary: ReviewSummary,
+) -> ReviewStage {
+    summary.open = open.len();
+    let _ = cx.amt.comment_as(
+        cx.issue,
+        &crate::review::unresolved_comment(why, &open),
+        cx.worker,
+    );
+    match policy {
+        crate::config::ReviewEscalation::AdvanceFlagged => {
+            // Advance anyway — the work is never hidden or thrown away — but
+            // label it so the human sees exactly what is left.
+            let _ = cx.amt.add_label(cx.issue, "review:open");
+            summary.outcome = "flagged".into();
+            spine_emit(
+                cx,
+                "review.flagged",
+                json!({"issue": cx.issue, "action": "advance-flagged", "why": why, "open": open.len()}),
+            );
+            ReviewStage::Advance {
+                summary: Some(summary),
+                open,
+            }
+        }
+        crate::config::ReviewEscalation::Release => {
+            summary.outcome = "released".into();
+            spine_emit(
+                cx,
+                "review.flagged",
+                json!({"issue": cx.issue, "action": "release", "why": why, "open": open.len()}),
+            );
+            ReviewStage::Release {
+                summary,
+                why: why.to_string(),
+            }
+        }
+    }
+}
+
+fn strip_responses(fs: &[Finding]) -> Vec<Finding> {
+    fs.iter()
+        .cloned()
+        .map(|mut f| {
+            f.response = None;
+            f
+        })
+        .collect()
+}
+
+/// A review fix round: re-run the worker in fix mode with the given extra env
+/// for the given round, then re-gate (the WORK⇄GATE loop, reused).
+pub type FixRound<'a> = dyn Fn(&mut dyn Write, u32, &[(String, String)]) -> WorkGate + 'a;
+
+/// The review stage: REVIEW ⇄ FIX until clean or `review.max_rounds` is spent.
+/// `fix_round` re-runs the worker in fix mode and re-gates (WORK⇄GATE reuse).
+pub fn run_review_stage(cx: &ReviewCtx, out: &mut dyn Write, fix_round: &FixRound) -> ReviewStage {
+    let rc = &cx.config.review;
+    let Some(review_cmd) = rc.cmd.as_deref().filter(|c| !c.trim().is_empty()) else {
+        return ReviewStage::Off;
+    };
+    let issue = cx.issue;
+    let worker = cx.worker;
+
+    // A diff touching only `skip_paths` (docs, say) is not worth a review.
+    if let Ok(files) = crate::gitrange::changed_since(cx.runner, Some(&cx.fleet.base), &[]) {
+        // Nothing changed (the gate was "skipped") or only skip_paths did.
+        if files.is_empty() || crate::review::all_skippable(&files, &rc.skip_paths) {
+            emit_event(
+                out,
+                worker,
+                Some(issue),
+                "review",
+                json!({"round": 0, "result": "skipped", "confirmed": 0, "notes": 0}),
+            );
+            return ReviewStage::Advance {
+                summary: Some(ReviewSummary {
+                    outcome: "skipped".into(),
+                    ..Default::default()
+                }),
+                open: vec![],
+            };
+        }
+    }
+
+    spine_emit(cx, "review.started", json!({"issue": issue}));
+    let reviews_dir = cx.fleet.sirius_dir.join("reviews");
+    let _ = std::fs::create_dir_all(&reviews_dir);
+    let max_rounds = rc.max_rounds.max(1);
+    let mut summary = ReviewSummary::default();
+    // The last round's blocking findings, with the worker's responses.
+    let mut previous: Vec<Finding> = Vec::new();
+    let mut prev_path: Option<std::path::PathBuf> = None;
+    let mut round: u32 = 0;
+    loop {
+        round += 1;
+        summary.rounds = round;
+
+        // Up to two attempts per round: a review error is retried once.
+        let mut got: Option<ReviewOnce> = None;
+        let mut last_err = String::new();
+        for try_n in 0..2 {
+            match review_once(cx, review_cmd, round, try_n, prev_path.as_deref()) {
+                ReviewOnce::Failed { result, detail } => {
+                    emit_event(
+                        out,
+                        worker,
+                        Some(issue),
+                        "review",
+                        json!({"round": round, "result": result.as_str(), "confirmed": 0, "notes": 0, "detail": detail}),
+                    );
+                    ledger_warn(
+                        "insert_review_round",
+                        cx.ledger.insert_review_round(
+                            cx.iter_ref,
+                            issue,
+                            worker,
+                            round,
+                            result.as_str(),
+                            0,
+                            0,
+                            &json!({"error": detail}),
+                        ),
+                    );
+                    if result == RoundResult::Tampered {
+                        spine_emit(
+                            cx,
+                            "review.tampered",
+                            json!({"issue": issue, "round": round}),
+                        );
+                    }
+                    last_err = detail;
+                }
+                ReviewOnce::LeaseLost(reason) => return ReviewStage::LeaseLost(reason),
+                ok => {
+                    got = Some(ok);
+                    break;
+                }
+            }
+        }
+        let (rec, head) = match got {
+            Some(ReviewOnce::Report { report, head }) => (
+                crate::review::reconcile(&previous, &report, &rc.block_on),
+                head,
+            ),
+            Some(ReviewOnce::Conflicts { findings, head }) => {
+                // No review ran this round: the previous findings are still
+                // unverified, so they stay open alongside the conflicts.
+                let mut blocking = findings;
+                blocking.extend(strip_responses(&previous));
+                (
+                    crate::review::Reconciled {
+                        blocking,
+                        ..Default::default()
+                    },
+                    head,
+                )
+            }
+            _ => {
+                let why = format!("the review could not complete in round {round} ({last_err})");
+                return escalate(
+                    cx,
+                    rc.on_review_error,
+                    &why,
+                    strip_responses(&previous),
+                    summary,
+                );
+            }
+        };
+        summary.fixed += rec.fixed;
+        summary.rebuttals_accepted += rec.rebuttals_accepted;
+        let result = if rec.blocking.is_empty() {
+            RoundResult::Clean
+        } else {
+            RoundResult::Blocking
+        };
+        let round_json = json!({"findings": rec.blocking, "notes": rec.notes});
+        ledger_warn(
+            "insert_review_round",
+            cx.ledger.insert_review_round(
+                cx.iter_ref,
+                issue,
+                worker,
+                round,
+                result.as_str(),
+                rec.blocking.len(),
+                rec.notes.len(),
+                &round_json,
+            ),
+        );
+        emit_event(
+            out,
+            worker,
+            Some(issue),
+            "review",
+            json!({"round": round, "result": result.as_str(), "confirmed": rec.blocking.len(), "notes": rec.notes.len()}),
+        );
+        let _ = cx.amt.comment_as(
+            issue,
+            &crate::review::round_comment(round, &rec, round > 1),
+            worker,
+        );
+        for f in &rec.blocking {
+            spine_emit(
+                cx,
+                "review.finding",
+                json!({"issue": issue, "round": round, "id": f.id, "kind": f.kind,
+                       "file": f.file, "line": f.line, "summary": f.summary}),
+            );
+        }
+        if rec.blocking.is_empty() {
+            // A re-claimed issue that was flagged on an earlier pass must not
+            // keep a stale `review:open` label once a review comes back clean.
+            let _ = cx.amt.remove_label(issue, "review:open");
+            summary.outcome = "clean".into();
+            spine_emit(
+                cx,
+                "review.passed",
+                json!({"issue": issue, "rounds": round}),
+            );
+            return ReviewStage::Advance {
+                summary: Some(summary),
+                open: vec![],
+            };
+        }
+        if round >= max_rounds {
+            let why = format!("{round} review round(s) used up with confirmed findings open");
+            return escalate(cx, rc.on_exhausted, &why, rec.blocking, summary);
+        }
+
+        // FIX: the worker gets the findings and answers each one.
+        let findings_path =
+            reviews_dir.join(format!("{}-r{round}-findings.json", safe_name(issue)));
+        let fix_out = reviews_dir.join(format!("{}-r{round}-fix.json", safe_name(issue)));
+        let _ = std::fs::write(&findings_path, round_json.to_string());
+        let _ = std::fs::remove_file(&fix_out);
+        let env = vec![
+            kv("SIRIUS_ROUND", round.to_string()),
+            kv("SIRIUS_REVIEW_DIR", cx.fleet.worktree.display().to_string()),
+            kv("SIRIUS_DIFF_RANGE", format!("{}..HEAD", cx.fleet.base)),
+            kv(
+                "SIRIUS_REVIEW_FINDINGS",
+                findings_path.display().to_string(),
+            ),
+            kv("SIRIUS_FIX_OUT", fix_out.display().to_string()),
+        ];
+        match fix_round(out, round, &env) {
+            WorkGate::Exit(o) => return ReviewStage::Exit(o),
+            WorkGate::Done {
+                work_ok,
+                gate_result,
+                timed_out,
+                ..
+            } => {
+                if !work_ok || gate_result == "fail" {
+                    // Never trade gate-passing work for a broken fix: put the
+                    // last reviewed (and gated) state back, then escalate.
+                    revert_to(cx, &head);
+                    let (policy, why) = if timed_out {
+                        (
+                            rc.on_review_error,
+                            format!(
+                                "the fix-mode worker timed out in round {round} (killed after {}s); reverted to the last reviewed state",
+                                cx.config.agent_timeout_secs
+                            ),
+                        )
+                    } else if !work_ok {
+                        (
+                            rc.on_review_error,
+                            format!("the fix-mode worker failed in round {round}; reverted to the last reviewed state"),
+                        )
+                    } else {
+                        (
+                            rc.on_exhausted,
+                            format!("fix round {round} broke the gate and could not repair it within retry_budget; reverted to the last passing state"),
+                        )
+                    };
+                    return escalate(cx, policy, &why, rec.blocking, summary);
+                }
+            }
+        }
+        let fix = crate::review::parse_fix(std::fs::read_to_string(&fix_out).ok().as_deref());
+        let _ = cx
+            .amt
+            .comment_as(issue, &crate::review::fix_comment(round, &fix), worker);
+        let mut answered = rec.blocking;
+        crate::review::attach_responses(&mut answered, &fix);
+        // The next reviewer sees each finding next to the worker's answer.
+        let _ = std::fs::write(
+            &findings_path,
+            json!({"findings": answered, "notes": rec.notes}).to_string(),
+        );
+        prev_path = Some(findings_path);
+        previous = answered;
+    }
+}
+
+/// The receipt's decision title/body: the review history when a review ran.
+fn decision_text(issue: &str, review: &ReviewStage) -> (String, String) {
+    match review {
+        ReviewStage::Advance {
+            summary: Some(s),
+            open,
+        } => {
+            let mut body = format!("See linked entities.\n\n{}", s.line());
+            if !open.is_empty() {
+                body.push_str("\n\nOpen (label review:open):");
+                for f in open {
+                    body.push_str(&format!("\n- [{}] {} — {}", f.id, f.location(), f.summary));
+                }
+            }
+            (format!("Resolved {issue} via sirius · {}", s.line()), body)
+        }
+        _ => (
+            format!("Resolved {issue} via sirius"),
+            "See linked entities.".to_string(),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::shell::{MockResponse, MockRunner};
+
+    /// A fleet context rooted in a private temp dir (review files land there,
+    /// never in the repo's own `.sirius/`).
+    fn test_fleet(base: &str) -> Fleet {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("sirius-fleet-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Fleet {
+            base: base.into(),
+            base_ref: None,
+            worktree: dir.join("wt"),
+            sirius_dir: dir,
+            review_prompt: crate::review::DEFAULT_PROMPT.into(),
+        }
+    }
 
     fn cfg() -> Config {
         Config {
@@ -1970,7 +2918,7 @@ mod tests {
             "true",
             &mut out,
             None,
-            Some("base999"),
+            Some(&test_fleet("base999")),
         );
         assert_eq!(o, IterationOutcome::Completed);
         let calls = m.recorded();
@@ -2083,7 +3031,7 @@ mod tests {
             "true",
             &mut out,
             None,
-            Some("base999"),
+            Some(&test_fleet("base999")),
         );
         match o {
             IterationOutcome::Error(e) => assert!(e.contains("worktree prep"), "{e}"),
@@ -2257,6 +3205,681 @@ mod tests {
         let ndjson = String::from_utf8(out).unwrap();
         assert!(ndjson.contains("\"result\":\"fail\""), "{ndjson}");
         assert!(!ndjson.contains("\"result\":\"skipped\""), "{ndjson}");
+    }
+
+    // ---- SIRF-23: the review stage ----------------------------------------
+
+    fn review_cfg(max_rounds: u32) -> Config {
+        let mut c = cfg();
+        c.review.cmd = Some("reviewer".into());
+        c.review.max_rounds = max_rounds;
+        c.review.against = crate::config::ReviewAgainst::LaunchBase;
+        c
+    }
+
+    /// claim→map→lock→brief, a passing WORK gate over a real diff, the review
+    /// stage's skip_paths probe, and a decision for the receipt.
+    fn program_review_iteration(m: &MockRunner, issue: &str) {
+        program_prefix(m, issue);
+        m.expect(&["git", "diff", "--name-only", "base999"], 0, "src/x.rs\n"); // work gate
+        m.expect(&["git", "diff", "--name-only", "base999"], 0, "src/x.rs\n"); // skip probe
+        m.expect(
+            &["amt", "--json", "decide"],
+            0,
+            &format!(r#"{{"id":"D-1","resolves":"{issue}"}}"#),
+        );
+        m.expect(
+            &["amt", "--json", "decision", "show"],
+            0,
+            &format!(r#"{{"id":"D-1","resolves":"{issue}"}}"#),
+        );
+    }
+
+    /// One checkpoint HEAD per reviewer attempt.
+    fn checkpoint_heads(m: &MockRunner, heads: &[&str]) {
+        for h in heads {
+            m.expect(&["git", "rev-parse", "HEAD"], 0, &format!("{h}\n"));
+        }
+    }
+
+    const BUG: &str = r#"{"findings":[{"id":"R1-1","kind":"bug","confidence":"confirmed",
+        "file":"src/x.rs","line":7,"summary":"off by one","scenario":"n=0 panics","fix":"guard"}]}"#;
+    const CLEAN: &str = r#"{"findings":[],"checked":["callers of x"]}"#;
+
+    fn run_fleet(m: &MockRunner, c: &Config) -> (IterationOutcome, Ledger, String) {
+        let amt = Amt::new(m);
+        let hv = Hayven::new(m);
+        let led = Ledger::open_in_memory().unwrap();
+        let mut out = Vec::new();
+        let fleet = test_fleet("base999");
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            c,
+            m,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
+            None,
+            Some(&fleet),
+        );
+        (o, led, String::from_utf8(out).unwrap())
+    }
+
+    fn phases(m: &MockRunner) -> Vec<String> {
+        m.agent_envs()
+            .iter()
+            .map(|env| {
+                env.iter()
+                    .find(|(k, _)| k == "SIRIUS_PHASE")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    fn env_of(env: &[(String, String)], k: &str) -> Option<String> {
+        env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone())
+    }
+
+    fn released_with(m: &MockRunner, status: &str) -> bool {
+        m.recorded().iter().any(|c| {
+            c.starts_with("amt --json release") && c.contains(&format!("--status {status}"))
+        })
+    }
+
+    #[test]
+    fn review_cmd_null_is_todays_loop() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-50");
+        let (o, led, nd) = run_fleet(&m, &cfg());
+        assert_eq!(o, IterationOutcome::Completed);
+        assert_eq!(phases(&m), vec!["work"], "one agent run, no reviewer");
+        assert!(!nd.contains("\"phase\":\"review\""), "{nd}");
+        assert!(
+            !m.recorded().iter().any(|c| c.contains("checkpoint")),
+            "no checkpoint commit without a review stage"
+        );
+        assert!(led.review_rounds_for_issue("AMT-50").unwrap().is_empty());
+        assert!(released_with(&m, "in_review"));
+    }
+
+    #[test]
+    fn agent_gets_the_issue_contract_and_templated_cmd() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-51");
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let fleet = test_fleet("base999");
+        let mut out = Vec::new();
+        run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &cfg(),
+            &m,
+            "sirius/oak",
+            None,
+            "agent --issue {issue} --as {worker}",
+            &mut out,
+            None,
+            Some(&fleet),
+        );
+        assert!(m
+            .recorded()
+            .iter()
+            .any(|c| c == "sh -c agent --issue AMT-51 --as sirius/oak"));
+        let env = &m.agent_envs()[0];
+        assert_eq!(env_of(env, "SIRIUS_ISSUE").as_deref(), Some("AMT-51"));
+        assert_eq!(env_of(env, "SIRIUS_WORKER").as_deref(), Some("sirius/oak"));
+        // Board writes by the agent are attributed to the worker, not $USER.
+        assert_eq!(env_of(env, "AMT_AGENT").as_deref(), Some("sirius/oak"));
+        assert_eq!(env_of(env, "SIRIUS_PHASE").as_deref(), Some("work"));
+        assert_eq!(env_of(env, "SIRIUS_BASE").as_deref(), Some("base999"));
+        assert_eq!(
+            env_of(env, "SIRIUS_WORKTREE").as_deref(),
+            Some(fleet.worktree.display().to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn clean_review_advances_with_review_in_the_receipt() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-52");
+        checkpoint_heads(&m, &["ck1"]);
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+        let (o, led, nd) = run_fleet(&m, &review_cfg(3));
+        assert_eq!(o, IterationOutcome::Completed);
+        assert_eq!(phases(&m), vec!["work", "review"]);
+        assert_eq!(nd.matches("\"phase\":\"review\"").count(), 1, "{nd}");
+        assert!(nd.contains("\"result\":\"clean\""), "{nd}");
+        // The status moves ONCE, at release — not at gate time.
+        assert!(!m
+            .recorded()
+            .iter()
+            .any(|c| c.contains("issue update AMT-52 --status")));
+        assert!(released_with(&m, "in_review"));
+        let decide = m
+            .recorded()
+            .into_iter()
+            .find(|c| c.starts_with("amt --json decide"))
+            .unwrap();
+        assert!(decide.contains("review: 1 round, 0 bugs fixed"), "{decide}");
+        assert!(decide.ends_with("--author sirius/oak"), "{decide}");
+        // The reviewer was told what to review, read-only, in a fresh process.
+        let env = &m.agent_envs()[1];
+        assert_eq!(
+            env_of(env, "SIRIUS_DIFF_RANGE").as_deref(),
+            Some("base999..HEAD")
+        );
+        assert_eq!(env_of(env, "SIRIUS_ROUND").as_deref(), Some("1"));
+        let prompt = std::fs::read_to_string(env_of(env, "SIRIUS_REVIEW_PROMPT").unwrap()).unwrap();
+        assert!(prompt.contains("issue AMT-52") && !prompt.contains("$SIRIUS_ISSUE"));
+        assert!(m
+            .recorded()
+            .iter()
+            .any(|c| c.contains("sh -c cd \"$SIRIUS_REVIEW_DIR\" || exit 1; reviewer")));
+        let rounds = led.review_rounds_for_issue("AMT-52").unwrap();
+        assert_eq!(rounds.len(), 1);
+        assert_eq!(rounds[0].result, "clean");
+        // A clean review clears any stale flag from an earlier pass.
+        assert!(m
+            .recorded()
+            .iter()
+            .any(|c| c == "amt --json issue update AMT-52 --remove-label review:open"));
+    }
+
+    #[test]
+    fn confirmed_bug_runs_fix_regate_and_clean_rereview() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-53");
+        m.expect(&["git", "diff", "--name-only", "base999"], 0, "src/x.rs\n"); // fix gate
+        checkpoint_heads(&m, &["ck1", "ck2"]);
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", BUG);
+        m.on_phase_write(
+            "fix",
+            "SIRIUS_FIX_OUT",
+            r#"{"responses":[{"id":"R1-1","status":"fixed","note":"guarded n=0"}]}"#,
+        );
+        m.on_phase_write(
+            "review",
+            "SIRIUS_REVIEW_OUT",
+            r#"{"findings":[],"previous":[{"id":"R1-1","verdict":"resolved"}]}"#,
+        );
+        let (o, led, nd) = run_fleet(&m, &review_cfg(3));
+        assert_eq!(o, IterationOutcome::Completed);
+        assert_eq!(phases(&m), vec!["work", "review", "fix", "review"]);
+        // The fix round got the findings; the re-review got the answers.
+        let envs = m.agent_envs();
+        let findings =
+            std::fs::read_to_string(env_of(&envs[2], "SIRIUS_REVIEW_FINDINGS").unwrap()).unwrap();
+        assert!(
+            findings.contains("off by one") && findings.contains("guarded n=0"),
+            "{findings}"
+        );
+        assert_eq!(env_of(&envs[3], "SIRIUS_ROUND").as_deref(), Some("2"));
+        // The fix worker also gets what to look at (spec env table).
+        assert_eq!(
+            env_of(&envs[2], "SIRIUS_DIFF_RANGE").as_deref(),
+            Some("base999..HEAD")
+        );
+        assert!(env_of(&envs[2], "SIRIUS_REVIEW_DIR").is_some());
+        assert!(env_of(&envs[2], "SIRIUS_FIX_OUT").is_some());
+        // Re-gated after the fix.
+        assert!(nd.contains("\"phase\":\"fix\""), "{nd}");
+        assert_eq!(nd.matches("\"phase\":\"gate\"").count(), 2, "{nd}");
+        let rounds = led.review_rounds_for_issue("AMT-53").unwrap();
+        let results: Vec<&str> = rounds.iter().map(|r| r.result.as_str()).collect();
+        assert_eq!(results, vec!["blocking", "clean"]);
+        let decide = m
+            .recorded()
+            .into_iter()
+            .find(|c| c.starts_with("amt --json decide"))
+            .unwrap();
+        assert!(
+            decide.contains("review: 2 rounds, 1 bug fixed, 0 rebuttals accepted"),
+            "{decide}"
+        );
+        // One comment per round, plus the fix responses, as the worker.
+        let comments: Vec<String> = m
+            .recorded()
+            .into_iter()
+            .filter(|c| c.contains("issue comment AMT-53"))
+            .collect();
+        assert!(comments
+            .iter()
+            .any(|c| c.contains("Review round 1: 1 confirmed")));
+        assert!(comments
+            .iter()
+            .any(|c| c.contains("Fix round 1") && c.contains("guarded n=0")));
+        assert!(
+            comments.iter().all(|c| c.ends_with("--author sirius/oak")),
+            "{comments:?}"
+        );
+        assert!(released_with(&m, "in_review"));
+    }
+
+    #[test]
+    fn uncertain_and_minor_findings_only_advance_as_notes() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-54");
+        checkpoint_heads(&m, &["ck1"]);
+        m.on_phase_write(
+            "review",
+            "SIRIUS_REVIEW_OUT",
+            r#"{"findings":[{"kind":"bug","confidence":"uncertain","summary":"maybe racy"},
+                            {"kind":"minor","confidence":"confirmed","summary":"typo"}]}"#,
+        );
+        let (o, _led, nd) = run_fleet(&m, &review_cfg(3));
+        assert_eq!(o, IterationOutcome::Completed);
+        assert_eq!(phases(&m), vec!["work", "review"], "no fix round for notes");
+        assert!(
+            nd.contains("\"confirmed\":0") && nd.contains("\"notes\":2"),
+            "{nd}"
+        );
+        assert!(m
+            .recorded()
+            .iter()
+            .any(|c| c.contains("Notes (non-blocking)") && c.contains("maybe racy")));
+        assert!(released_with(&m, "in_review"));
+    }
+
+    #[test]
+    fn accepted_rebuttal_closes_the_finding() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-55");
+        checkpoint_heads(&m, &["ck1", "ck2"]);
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", BUG);
+        m.on_phase_write(
+            "fix",
+            "SIRIUS_FIX_OUT",
+            r#"{"responses":[{"id":"R1-1","status":"rebutted","note":"n is never 0: guarded by caller"}]}"#,
+        );
+        m.on_phase_write(
+            "review",
+            "SIRIUS_REVIEW_OUT",
+            r#"{"findings":[],"previous":[{"id":"R1-1","verdict":"accepted","note":"right"}]}"#,
+        );
+        let (o, _led, _nd) = run_fleet(&m, &review_cfg(3));
+        assert_eq!(o, IterationOutcome::Completed);
+        let decide = m
+            .recorded()
+            .into_iter()
+            .find(|c| c.starts_with("amt --json decide"))
+            .unwrap();
+        assert!(
+            decide.contains("0 bugs fixed, 1 rebuttal accepted"),
+            "{decide}"
+        );
+        assert!(released_with(&m, "in_review"));
+    }
+
+    #[test]
+    fn exhausted_rounds_advance_flagged_with_label_and_comment() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-56");
+        checkpoint_heads(&m, &["ck1", "ck2"]);
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", BUG);
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", BUG); // not fixed
+        let (o, _led, _nd) = run_fleet(&m, &review_cfg(2));
+        assert_eq!(o, IterationOutcome::Completed);
+        assert_eq!(phases(&m), vec!["work", "review", "fix", "review"]);
+        let rec = m.recorded();
+        assert!(rec
+            .iter()
+            .any(|c| c == "amt --json issue update AMT-56 --add-label review:open"));
+        assert!(rec
+            .iter()
+            .any(|c| c.contains("2 review round(s) used up") && c.contains("[R1-1] src/x.rs:7")));
+        assert!(
+            released_with(&m, "in_review"),
+            "advance-flagged still advances"
+        );
+        let decide = rec
+            .iter()
+            .find(|c| c.starts_with("amt --json decide"))
+            .unwrap();
+        assert!(decide.contains("1 still open (flagged)"), "{decide}");
+    }
+
+    #[test]
+    fn exhausted_rounds_release_variant_goes_back_to_todo() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-57");
+        checkpoint_heads(&m, &["ck1"]);
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", BUG);
+        let mut c = review_cfg(1);
+        c.review.on_exhausted = crate::config::ReviewEscalation::Release;
+        let (o, led, _nd) = run_fleet(&m, &c);
+        assert_eq!(o, IterationOutcome::Deadend);
+        assert_eq!(
+            phases(&m),
+            vec!["work", "review"],
+            "max_rounds 1 ⇒ no fix round"
+        );
+        let rec = m.recorded();
+        assert!(released_with(&m, "todo"));
+        assert!(rec.iter().any(|c| c.starts_with("amt --json release")
+            && c.contains("released without advancing — review:")));
+        assert!(
+            !rec.iter().any(|c| c.starts_with("amt --json decide")),
+            "no receipt"
+        );
+        assert!(!rec.iter().any(|c| c.contains("--add-label")));
+        let outcome: String = led
+            .conn
+            .query_row("SELECT outcome FROM iterations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(outcome, "deadend");
+    }
+
+    #[test]
+    fn tampering_reviewer_is_discarded_and_counts_as_an_error() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-58");
+        checkpoint_heads(&m, &["ck1", "ck1"]);
+        // Attempt 1: the tree changes under the reviewer. Attempt 2: clean.
+        m.expect(&["git", "status", "--porcelain=v1"], 0, "");
+        m.expect(&["git", "status", "--porcelain=v1"], 0, " M src/x.rs\n");
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+        let (o, led, nd) = run_fleet(&m, &review_cfg(3));
+        assert!(
+            m.recorded().iter().any(|c| c == "git reset --hard ck1"),
+            "changes discarded"
+        );
+        assert!(nd.contains("\"result\":\"tampered\""), "{nd}");
+        let results: Vec<String> = led
+            .review_rounds_for_issue("AMT-58")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.result)
+            .collect();
+        assert_eq!(
+            results,
+            vec!["tampered", "clean"],
+            "retried once, then clean"
+        );
+        assert_eq!(o, IterationOutcome::Completed);
+    }
+
+    #[test]
+    fn malformed_json_retries_once_then_on_review_error() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-59");
+        checkpoint_heads(&m, &["ck1", "ck1"]);
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", "the review found nothing!");
+        // Attempt 2 writes nothing at all (missing file).
+        let (o, led, _nd) = run_fleet(&m, &review_cfg(3));
+        assert_eq!(
+            phases(&m),
+            vec!["work", "review", "review"],
+            "exactly one retry"
+        );
+        assert_eq!(led.review_rounds_for_issue("AMT-59").unwrap().len(), 2);
+        // Default on_review_error = advance-flagged.
+        assert_eq!(o, IterationOutcome::Completed);
+        assert!(m
+            .recorded()
+            .iter()
+            .any(|c| c.contains("--add-label review:open")));
+        assert!(m
+            .recorded()
+            .iter()
+            .any(|c| c.contains("the review could not complete")));
+        assert!(released_with(&m, "in_review"));
+        // The receipt must not read like a clean review.
+        let decide = m
+            .recorded()
+            .into_iter()
+            .find(|c| c.starts_with("amt --json decide"))
+            .unwrap();
+        assert!(
+            decide.contains("review: did not complete after 1 round (flagged)"),
+            "{decide}"
+        );
+        assert!(!decide.contains("0 bugs fixed"), "{decide}");
+    }
+
+    #[test]
+    fn review_error_release_variant() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-60");
+        checkpoint_heads(&m, &["ck1", "ck1"]);
+        let mut c = review_cfg(3);
+        c.review.on_review_error = crate::config::ReviewEscalation::Release;
+        let (o, _led, _nd) = run_fleet(&m, &c);
+        assert_eq!(o, IterationOutcome::Deadend);
+        assert!(released_with(&m, "todo"));
+    }
+
+    #[test]
+    fn fix_that_breaks_the_gate_goes_back_to_fixing_within_budget() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-61");
+        m.expect(&["git", "diff", "--name-only", "base999"], 0, "src/x.rs\n"); // fix gate 1
+        m.expect(&["git", "diff", "--name-only", "base999"], 0, "src/x.rs\n"); // fix gate 2
+        m.expect(&["sh", "-c", "run-suite"], 0, "ok"); // work gate
+        m.push(MockResponse::new(
+            &["sh", "-c", "run-suite"],
+            1,
+            "FAILED",
+            "",
+        )); // fix breaks it
+        m.expect(&["sh", "-c", "run-suite"], 0, "ok"); // fix retry repairs it
+        checkpoint_heads(&m, &["ck1", "ck2"]);
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", BUG);
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+        let (o, _led, _nd) = run_fleet(&m, &review_cfg(3));
+        assert_eq!(o, IterationOutcome::Completed);
+        assert_eq!(phases(&m), vec!["work", "review", "fix", "fix", "review"]);
+        assert!(released_with(&m, "in_review"));
+    }
+
+    #[test]
+    fn fix_that_cannot_repair_the_gate_reverts_and_escalates() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-62");
+        for _ in 0..3 {
+            m.expect(&["git", "diff", "--name-only", "base999"], 0, "src/x.rs\n");
+        }
+        m.expect(&["sh", "-c", "run-suite"], 0, "ok"); // work gate passes
+        for _ in 0..3 {
+            m.push(MockResponse::new(
+                &["sh", "-c", "run-suite"],
+                1,
+                "FAILED",
+                "",
+            ));
+        }
+        checkpoint_heads(&m, &["ck1"]);
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", BUG);
+        let (o, _led, _nd) = run_fleet(&m, &review_cfg(3));
+        // The gate-passing checkpoint is restored, never the broken fix.
+        assert!(m.recorded().iter().any(|c| c == "git reset --hard ck1"));
+        assert!(m.recorded().iter().any(|c| c.contains("broke the gate")));
+        assert_eq!(
+            o,
+            IterationOutcome::Completed,
+            "advance-flagged keeps the passing work"
+        );
+        assert!(m
+            .recorded()
+            .iter()
+            .any(|c| c.contains("--add-label review:open")));
+    }
+
+    #[test]
+    fn fix_round_timeout_reverts_and_escalates_instead_of_abandoning_work() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-66");
+        checkpoint_heads(&m, &["ck1"]);
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", BUG);
+        m.arm_phase_timeout("fix");
+        let (o, _led, _nd) = run_fleet(&m, &review_cfg(3));
+        let rec = m.recorded();
+        // The reviewed, gate-passing checkpoint is restored and kept...
+        assert!(rec.iter().any(|c| c == "git reset --hard ck1"), "{rec:?}");
+        assert!(rec.iter().any(|c| c.contains("timed out in round 1")));
+        // ...and it advances flagged (on_review_error) — NOT released to todo
+        // with a deadend, which would let the next reset wipe it.
+        assert_eq!(o, IterationOutcome::Completed);
+        assert!(released_with(&m, "in_review"));
+        assert!(rec.iter().any(|c| c.contains("--add-label review:open")));
+        assert!(!rec.iter().any(|c| c.contains("agent timed out after")));
+    }
+
+    #[test]
+    fn lease_lost_before_the_reviewer_aborts_without_releasing_the_issue() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-67");
+        checkpoint_heads(&m, &["ck1"]);
+        // Pre-spawn (work) renewal OK; the pre-review renewal is REFUSED.
+        m.expect(
+            &["amt", "--json", "claim", "--issue"],
+            0,
+            r#"{"id":"AMT-67"}"#,
+        );
+        m.expect(
+            &["amt", "--json", "claim", "--issue"],
+            0,
+            r#"{"claimed":false,"reason":"held by sirius/rowan"}"#,
+        );
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+        let (o, _led, nd) = run_fleet(&m, &review_cfg(3));
+        match o {
+            IterationOutcome::Error(e) => assert!(e.contains("before the review"), "{e}"),
+            other => panic!("expected a lease-lost error, got {other:?}"),
+        }
+        assert_eq!(phases(&m), vec!["work"], "the reviewer never spawned");
+        let rec = m.recorded();
+        assert!(
+            !rec.iter().any(|c| c.starts_with("amt --json release")),
+            "not ours to release"
+        );
+        assert!(
+            !rec.iter().any(|c| c.starts_with("amt --json decide")),
+            "no receipt"
+        );
+        assert!(nd.contains("\"reason\":\"lease_lost\""), "{nd}");
+    }
+
+    #[test]
+    fn nothing_changed_means_nothing_to_review() {
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-68");
+        // Both the gate and the skip probe see an empty diff.
+        m.expect(
+            &["amt", "--json", "decide"],
+            0,
+            r#"{"id":"D-1","resolves":"AMT-68"}"#,
+        );
+        let (o, _led, nd) = run_fleet(&m, &review_cfg(3));
+        assert_eq!(o, IterationOutcome::Completed);
+        assert_eq!(phases(&m), vec!["work"], "no reviewer over an empty diff");
+        assert!(nd.contains("\"result\":\"skipped\""), "{nd}");
+    }
+
+    #[test]
+    fn current_base_merge_conflict_is_a_blocking_finding_and_cleans_up() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-63");
+        checkpoint_heads(&m, &["ck1", "ck2"]);
+        m.expect(&["git", "rev-parse", "--verify"], 0, "cur777\n"); // round 1
+        m.expect(&["git", "rev-parse", "--verify"], 0, "cur777\n"); // round 2
+        m.push(MockResponse::new(
+            &["git", "-C"],
+            1,
+            "",
+            "CONFLICT (content)",
+        )); // merge
+        m.expect(&["git", "-C"], 0, "src/x.rs\n"); // diff --diff-filter=U
+                                                   // Round 2: the merge succeeds (benign), the reviewer reviews it clean.
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+        let mut c = review_cfg(3);
+        c.review.against = crate::config::ReviewAgainst::CurrentBaseMerge;
+        c.review.base_ref = Some("main".into());
+        let (o, led, _nd) = run_fleet(&m, &c);
+        assert_eq!(o, IterationOutcome::Completed);
+        assert_eq!(
+            phases(&m),
+            vec!["work", "fix", "review"],
+            "no reviewer on a conflict round"
+        );
+        let envs = m.agent_envs();
+        let findings =
+            std::fs::read_to_string(env_of(&envs[1], "SIRIUS_REVIEW_FINDINGS").unwrap()).unwrap();
+        assert!(
+            findings.contains("\"kind\":\"conflict\"") && findings.contains("git merge cur777"),
+            "{findings}"
+        );
+        // Round 2 reviews the throwaway merge tree, against the CURRENT base.
+        let review_dir = env_of(&envs[2], "SIRIUS_REVIEW_DIR").unwrap();
+        assert!(review_dir.ends_with("sirius_oak-review"), "{review_dir}");
+        assert_eq!(
+            env_of(&envs[2], "SIRIUS_DIFF_RANGE").as_deref(),
+            Some("cur777..HEAD")
+        );
+        // The temporary worktree is removed after EVERY round.
+        let removes = m
+            .recorded()
+            .iter()
+            .filter(|c| {
+                c.starts_with("git worktree remove --force") && c.ends_with("sirius_oak-review")
+            })
+            .count();
+        assert!(
+            removes >= 4,
+            "pre-clean + post-remove in both rounds, got {removes}"
+        );
+        let rounds = led.review_rounds_for_issue("AMT-63").unwrap();
+        assert_eq!(rounds[0].result, "blocking");
+        assert_eq!(rounds[1].result, "clean");
+    }
+
+    #[test]
+    fn doc_only_diff_skips_review() {
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-64");
+        m.expect(&["git", "diff", "--name-only", "base999"], 0, "README.md\n");
+        m.expect(
+            &["git", "diff", "--name-only", "base999"],
+            0,
+            "docs/guide.md\n",
+        );
+        m.expect(
+            &["amt", "--json", "decide"],
+            0,
+            r#"{"id":"D-1","resolves":"AMT-64"}"#,
+        );
+        let (o, _led, nd) = run_fleet(&m, &review_cfg(3));
+        assert_eq!(o, IterationOutcome::Completed);
+        assert_eq!(phases(&m), vec!["work"], "no reviewer for docs");
+        assert!(nd.contains("\"result\":\"skipped\""), "{nd}");
+    }
+
+    #[test]
+    fn failed_agent_release_comment_names_the_agent_not_the_gate() {
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-65");
+        m.push(MockResponse::new(
+            &["sh", "-c", "true"],
+            1,
+            "",
+            "Not logged in",
+        ));
+        let (o, _led, _nd) = run_fleet(&m, &cfg());
+        assert!(matches!(o, IterationOutcome::Error(_)));
+        let rel = m
+            .recorded()
+            .into_iter()
+            .find(|c| c.starts_with("amt --json release"))
+            .unwrap();
+        assert!(rel.contains("agent exited 1"), "{rel}");
+        assert!(!rel.contains("gate did not pass"), "{rel}");
     }
 
     #[test]

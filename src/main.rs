@@ -13,6 +13,7 @@ mod gate;
 mod gitrange;
 mod hayven;
 mod ledger;
+mod review;
 mod run;
 mod shell;
 mod spine;
@@ -63,8 +64,9 @@ fn main() -> ExitCode {
             agent_cmd,
             from,
             max_iterations,
+            review_cmd,
             json: _, // contract-compat no-op: run always streams NDJSON
-        } => cmd_run(&ws, workers, &agent_cmd, from, max_iterations),
+        } => cmd_run(&ws, workers, &agent_cmd, from, max_iterations, review_cmd),
     };
     ExitCode::from(code)
 }
@@ -115,6 +117,15 @@ fn cmd_init(ws: &Workspace, json: bool) -> u8 {
     if !cfg_path.exists() {
         if let Err(e) = std::fs::write(&cfg_path, Config::default_json()) {
             eprint_err(&format!("cannot write config.json: {e}"));
+            return 1;
+        }
+    }
+    // The default reviewer prompt (SIRF-23), only if absent — the operator's
+    // edits are never overwritten.
+    let prompt_path = dir.join("review-prompt.md");
+    if !prompt_path.exists() {
+        if let Err(e) = std::fs::write(&prompt_path, review::DEFAULT_PROMPT) {
+            eprint_err(&format!("cannot write review-prompt.md: {e}"));
             return 1;
         }
     }
@@ -336,15 +347,44 @@ fn cmd_why(ws: &Workspace, runner: &RealRunner, target: &str, json: bool) -> u8 
     if is_issue {
         match bridge::why_issue(&amt, target) {
             Ok(w) => {
+                // The review history (SIRF-23), when this repo has a ledger.
+                let rounds = if ws.ledger_path().exists() {
+                    Ledger::open(&ws.ledger_path())
+                        .and_then(|l| l.review_rounds_for_issue(target))
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
                 if json {
+                    let review: Vec<Value> = rounds
+                        .iter()
+                        .map(|r| {
+                            json!({
+                                "round": r.round, "result": r.result,
+                                "confirmed": r.confirmed, "notes": r.notes,
+                                "worker": r.worker, "at": r.created_at,
+                                "findings": serde_json::from_str::<Value>(&r.findings).unwrap_or(Value::Null),
+                            })
+                        })
+                        .collect();
                     print_json(
-                        &json!({"ref": w.r#ref, "symbols": w.symbols, "decisions": w.decisions}),
+                        &json!({"ref": w.r#ref, "symbols": w.symbols, "decisions": w.decisions, "review": review}),
                     );
                 } else {
                     println!(
                         "{}: symbols {:?}, decisions {:?}",
                         w.r#ref, w.symbols, w.decisions
                     );
+                    for r in &rounds {
+                        println!(
+                            "  review round {} ({}): {} — {} confirmed, {} notes",
+                            r.round,
+                            r.worker.as_deref().unwrap_or("?"),
+                            r.result,
+                            r.confirmed,
+                            r.notes
+                        );
+                    }
                 }
                 0
             }
@@ -489,6 +529,7 @@ fn cmd_run(
     agent_cmd: &str,
     from: Option<String>,
     max_iterations: u32,
+    review_cmd: Option<String>,
 ) -> u8 {
     // Validate the ledger up front for the friendly "run `sirius init` first"
     // message; workers open their OWN connections (rusqlite Connection is not
@@ -497,10 +538,15 @@ fn cmd_run(
         Ok(l) => drop(l),
         Err(c) => return c,
     }
-    let cfg = match load_config(ws) {
+    let mut cfg = match load_config(ws) {
         Ok(c) => c,
         Err(c) => return c,
     };
+    // `--review-cmd` overrides `review.cmd` (SIRF-23); an empty string turns
+    // a configured review stage off for this run.
+    if let Some(rc) = review_cmd {
+        cfg.review.cmd = Some(rc).filter(|c| !c.trim().is_empty());
+    }
     let spine = spine::Spine::new(&ws.root);
 
     // Workers run as REAL parallel threads. The old v1 loop ran them
@@ -565,7 +611,33 @@ fn cmd_run(
             return 1;
         }
     };
-    let worktrees_root = ws.sirius_dir().join("worktrees");
+    // The branch HEAD pointed to at launch: the default review base for
+    // `current-base-merge` (its CURRENT tip is what the review merges onto).
+    let base_ref = repo_runner
+        .run("git", &["rev-parse", "--abbrev-ref", "HEAD"])
+        .ok()
+        .filter(|o| o.success())
+        .map(|o| o.stdout.trim().to_string())
+        .filter(|r| !r.is_empty() && r != "HEAD");
+    // Absolute paths: worktrees, review files, and the reviewer's cwd must
+    // not depend on where each child process happens to run.
+    let sirius_abs = {
+        let d = ws.sirius_dir();
+        if d.is_absolute() {
+            d
+        } else {
+            std::env::current_dir().map(|c| c.join(&d)).unwrap_or(d)
+        }
+    };
+    let review_prompt = match load_review_prompt(ws, &cfg) {
+        Ok(p) => p,
+        Err(e) => {
+            eprint_err(&e);
+            let _ = std::fs::remove_file(&lock_path);
+            return 1;
+        }
+    };
+    let worktrees_root = sirius_abs.join("worktrees");
     let _ = repo_runner.run("git", &["worktree", "prune"]);
     let mut assignments: Vec<(String, std::path::PathBuf)> = Vec::new();
     for name in &names {
@@ -590,13 +662,22 @@ fn cmd_run(
     let iterations = std::sync::atomic::AtomicU32::new(0);
     let any_failed = std::sync::atomic::AtomicBool::new(false);
     let ledger_path = ws.ledger_path();
+    let fleets: Vec<run::Fleet> = assignments
+        .iter()
+        .map(|(_, wt_path)| run::Fleet {
+            base: base.clone(),
+            base_ref: base_ref.clone(),
+            worktree: wt_path.clone(),
+            sirius_dir: sirius_abs.clone(),
+            review_prompt: review_prompt.clone(),
+        })
+        .collect();
     std::thread::scope(|s| {
-        for (name, wt_path) in &assignments {
+        for ((name, _), fleet) in assignments.iter().zip(&fleets) {
             s.spawn(|| {
                 worker_loop(
                     name,
-                    wt_path,
-                    &base,
+                    fleet,
                     &ledger_path,
                     &cfg,
                     agent_cmd,
@@ -619,6 +700,33 @@ fn cmd_run(
     u8::from(any_failed.load(std::sync::atomic::Ordering::SeqCst))
 }
 
+/// The reviewer prompt template (SIRF-23). A configured-but-missing prompt
+/// file is materialized from the built-in default so the operator has a real
+/// file to edit; only an UNREADABLE existing file is an error. With the review
+/// stage off this is never needed, so nothing is written.
+fn load_review_prompt(ws: &Workspace, cfg: &Config) -> Result<String, String> {
+    if cfg.review.cmd.is_none() {
+        return Ok(String::new());
+    }
+    let path = ws.root.join(&cfg.review.prompt_file);
+    match std::fs::read_to_string(&path) {
+        Ok(p) => Ok(p),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = std::fs::write(&path, review::DEFAULT_PROMPT) {
+                eprint_err(&format!(
+                    "could not write the default review prompt to {}: {e} (using the built-in copy)",
+                    path.display()
+                ));
+            }
+            Ok(review::DEFAULT_PROMPT.to_string())
+        }
+        Err(e) => Err(format!("cannot read review prompt {}: {e}", path.display())),
+    }
+}
+
 /// Best-effort "is this pid alive" via `kill -0` semantics, without a libc
 /// dependency: `ps -p <pid>` exit status. Only used to detect a stale fleet
 /// pidfile, so a false "alive" merely makes the operator remove the file.
@@ -634,8 +742,7 @@ fn libc_kill_probe(pid: i32) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn worker_loop(
     name: &str,
-    wt_path: &std::path::Path,
-    base: &str,
+    fleet: &run::Fleet,
     ledger_path: &std::path::Path,
     cfg: &Config,
     agent_cmd: &str,
@@ -660,7 +767,7 @@ fn worker_loop(
     // index.lock — isolation is what makes the parallel fleet sound.
     let repo_runner = RealRunner::default();
     let agent_runner = RealRunner {
-        cwd: Some(wt_path.to_path_buf()),
+        cwd: Some(fleet.worktree.clone()),
     };
 
     let ledger = match Ledger::open(ledger_path) {
@@ -693,7 +800,7 @@ fn worker_loop(
             agent_cmd,
             &mut out,
             Some(spine),
-            Some(base),
+            Some(fleet),
         );
         match outcome {
             run::IterationOutcome::NoWork { retry_after } => {

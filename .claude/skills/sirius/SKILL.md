@@ -46,8 +46,16 @@ they want the foreman working the board on the current repo.
    - `--workers N` — how many workers (start small, e.g. 2–3);
    - `--from <stage>` — which column to pull from (default `todo`);
    - `--agent-cmd '<command>'` — the command each iteration runs to do the work,
-     e.g. `claude -p "work the claimed issue the Sirius way"`. This is the agent;
-     without it the loop has nothing to run.
+     e.g. `claude -p "work issue {issue} the Sirius way"`. This is the agent;
+     without it the loop has nothing to run. `{issue}`/`{worker}` are filled in,
+     and the agent also gets `SIRIUS_ISSUE`, `SIRIUS_WORKER`, `SIRIUS_WORKTREE`,
+     `SIRIUS_PHASE` and `AMT_AGENT` in its environment.
+   - `--review-cmd '<command>'` (recommended) — a FRESH reviewer that checks each
+     gated diff before it advances, e.g.
+     `claude -p "$(cat "$SIRIUS_REVIEW_PROMPT")"`. On confirmed bugs, the worker
+     runs again in fix mode until the review is clean (`review.max_rounds`). The
+     gate alone proves only that the existing suite still passes — the first real
+     fleet run passed 9/9 gates with 25 confirmed bugs among them.
 3. **Run it and watch the fleet.**
    ```bash
    sirius run --workers 2 --from todo \
@@ -177,6 +185,21 @@ hayven affected-tests --changed --gate --gate-tier safe
   the next worker inherits the lesson instead of the failure.
 
 Do **not** advance an issue past a failing gate. The gate is the whole point.
+
+### 6b. Fix mode — when Sirius runs YOU with `SIRIUS_PHASE=fix`
+With a review stage enabled, a fresh reviewer (not you, not your session) reads
+your diff after the gate passes. If it confirms bugs, Sirius runs you again
+with `SIRIUS_PHASE=fix` (check it first — `work` means a fresh start):
+- `$SIRIUS_REVIEW_FINDINGS` — the findings JSON. Each blocking finding has an
+  `id`, `file:line`, a concrete failure `scenario`, and a suggested `fix`.
+- For EACH finding, either fix it or rebut it — then write
+  `{"responses":[{"id":"R1-1","status":"fixed|rebutted","note":"what changed / why it's not a bug"}]}`
+  to `$SIRIUS_FIX_OUT`. Rebut only with evidence: the next reviewer judges every
+  rebuttal and an unaccepted one keeps the finding open.
+- A `conflict` finding means your work clashes with work merged since launch:
+  merge the named base commit into your work and resolve.
+- You are re-gated afterwards. Don't trade a passing gate for a fix — if your
+  fix breaks tests, Sirius reverts to the last passing state and flags the issue.
 
 ### 7. Receipt — file two-way provenance
 Record a decision and stamp it in both directions:

@@ -78,6 +78,10 @@ impl Ledger {
             [],
             |r| r.get::<_, String>(0),
         )?;
+        // Additive migrations (idempotent): tables added after v1 shipped are
+        // created on open, so ledgers made by older binaries gain them without
+        // a re-init. Older binaries simply never read them.
+        conn.execute_batch(ADDITIVE_TABLES)?;
         Ok(Ledger { conn })
     }
 
@@ -235,6 +239,60 @@ impl Ledger {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Record one review round (SIRF-23). `findings` is the round's full
+    /// findings JSON (including any fix responses), kept verbatim so
+    /// `sirius why <ISSUE>` and the console can show the review history.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_review_round(
+        &self,
+        iteration_id: Option<i64>,
+        issue: &str,
+        worker: &str,
+        round: u32,
+        result: &str,
+        confirmed: usize,
+        notes: usize,
+        findings: &serde_json::Value,
+    ) -> rusqlite::Result<i64> {
+        self.conn.execute(
+            "INSERT INTO review_rounds
+               (iteration_id, issue_ref, worker_id, round, result, confirmed, notes, findings, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                iteration_id,
+                issue,
+                worker,
+                round,
+                result,
+                confirmed as i64,
+                notes as i64,
+                findings.to_string(),
+                now_iso8601()
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Every recorded review round for an issue, oldest first.
+    pub fn review_rounds_for_issue(&self, issue: &str) -> rusqlite::Result<Vec<ReviewRoundRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT round, result, confirmed, notes, findings, created_at, worker_id
+               FROM review_rounds WHERE issue_ref = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![issue], |r| {
+            Ok(ReviewRoundRow {
+                round: r.get::<_, i64>(0)? as u32,
+                result: r.get(1)?,
+                confirmed: r.get::<_, i64>(2)? as usize,
+                notes: r.get::<_, i64>(3)? as usize,
+                findings: r.get(4)?,
+                created_at: r.get(5)?,
+                worker: r.get(6)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     /// Count how many of the LAST `limit` policy events (of any kind) are of
     /// `kind` — used by adaptive claiming (M5) to read contention from recent
     /// history. The filter must apply AFTER the window: the old form filtered
@@ -251,6 +309,38 @@ impl Ledger {
         )
     }
 }
+
+/// One recorded review round (SIRF-23), as read back for `sirius why`.
+#[derive(Debug, Clone)]
+pub struct ReviewRoundRow {
+    pub round: u32,
+    pub result: String,
+    pub confirmed: usize,
+    pub notes: usize,
+    /// The round's findings JSON, verbatim.
+    pub findings: String,
+    pub created_at: String,
+    pub worker: Option<String>,
+}
+
+/// Tables added after schema v1 shipped. Purely additive and idempotent —
+/// applied at create AND on every open (see `Ledger::open`), so no version
+/// bump is needed and older binaries are unaffected.
+const ADDITIVE_TABLES: &str = r#"
+    CREATE TABLE IF NOT EXISTS review_rounds (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      iteration_id INTEGER REFERENCES iterations(id),
+      issue_ref    TEXT NOT NULL,
+      worker_id    TEXT,
+      round        INTEGER NOT NULL,
+      result       TEXT NOT NULL,
+      confirmed    INTEGER NOT NULL DEFAULT 0,
+      notes        INTEGER NOT NULL DEFAULT 0,
+      findings     TEXT,
+      created_at   TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS review_rounds_issue ON review_rounds(issue_ref);
+"#;
 
 /// Apply the full CONTRACTS §1 schema and seed the meta rows.
 fn apply_schema(conn: &Connection, sirius_version: &str) -> rusqlite::Result<()> {
@@ -304,6 +394,8 @@ fn apply_schema(conn: &Connection, sirius_version: &str) -> rusqlite::Result<()>
         "#,
     )?;
 
+    conn.execute_batch(ADDITIVE_TABLES)?;
+
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
 
     let now = now_iso8601();
@@ -340,6 +432,34 @@ mod tests {
         let empty = dir.join("empty.db");
         std::fs::write(&empty, b"").unwrap();
         assert!(Ledger::open(&empty).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn review_rounds_round_trip_and_migrate_onto_old_ledgers() {
+        // A ledger created WITHOUT the additive table (simulating an older
+        // binary's v1 ledger) gains it on open.
+        let dir = std::env::temp_dir().join(format!("sirius-ledger-rr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        {
+            let led = Ledger::create(&path, "0.1.0").unwrap();
+            led.conn.execute("DROP TABLE review_rounds", []).unwrap();
+        }
+        let led = Ledger::open(&path).unwrap();
+        let f = serde_json::json!({"findings": [{"id": "R1-1"}]});
+        led.insert_review_round(None, "AMT-7", "sirius/oak", 1, "blocking", 1, 2, &f)
+            .unwrap();
+        led.insert_review_round(None, "AMT-7", "sirius/oak", 2, "clean", 0, 0, &f)
+            .unwrap();
+        led.insert_review_round(None, "AMT-8", "sirius/oak", 1, "clean", 0, 0, &f)
+            .unwrap();
+        let rows = led.review_rounds_for_issue("AMT-7").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].round, rows[0].result.as_str()), (1, "blocking"));
+        assert_eq!((rows[1].round, rows[1].confirmed), (2, 0));
+        assert!(rows[0].findings.contains("R1-1"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

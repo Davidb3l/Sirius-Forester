@@ -157,6 +157,25 @@ impl<'r> Amt<'r> {
         self.json_ok(&["--json", "issue", "comment", issue, "-m", body])
     }
 
+    /// `amt --json issue comment <id> -m <body> --author <author>` — attribute
+    /// the comment to a worker (`sirius/oak`) instead of the human whose
+    /// `$USER` amt would otherwise fall back to (SIRF-22 #5).
+    pub fn comment_as(&self, issue: &str, body: &str, author: &str) -> Result<(), String> {
+        self.json_ok(&[
+            "--json", "issue", "comment", issue, "-m", body, "--author", author,
+        ])
+    }
+
+    /// `amt --json issue update <id> --remove-label <label>`
+    pub fn remove_label(&self, issue: &str, label: &str) -> Result<(), String> {
+        self.json_ok(&["--json", "issue", "update", issue, "--remove-label", label])
+    }
+
+    /// `amt --json issue update <id> --add-label <label>`
+    pub fn add_label(&self, issue: &str, label: &str) -> Result<(), String> {
+        self.json_ok(&["--json", "issue", "update", issue, "--add-label", label])
+    }
+
     /// `amt --json issue update <id> --status <status>`
     pub fn update_status(&self, issue: &str, status: &str) -> Result<Value, String> {
         self.json(&["--json", "issue", "update", issue, "--status", status])
@@ -182,10 +201,18 @@ impl<'r> Amt<'r> {
         self.json_ok(&args)
     }
 
-    /// `amt --json decide --issue <id> --title <title> -b <body>` → `D-n`.
-    pub fn decide(&self, issue: &str, title: &str, body: &str) -> Result<String, String> {
+    /// `amt --json decide --issue <id> --title <title> -b <body> --author <a>`
+    /// → `D-n`, attributed to `author` (a worker id) rather than the human
+    /// running the fleet (SIRF-22 #5).
+    pub fn decide_as(
+        &self,
+        issue: &str,
+        title: &str,
+        body: &str,
+        author: &str,
+    ) -> Result<String, String> {
         let v = self.json(&[
-            "--json", "decide", "--issue", issue, "--title", title, "-b", body,
+            "--json", "decide", "--issue", issue, "--title", title, "-b", body, "--author", author,
         ])?;
         v.get("id")
             .and_then(Value::as_str)
@@ -314,7 +341,10 @@ mod tests {
             r#"{"id":"D-3","resolves":"AMT-7"}"#,
         );
         let amt = Amt::new(&m);
-        assert_eq!(amt.decide("AMT-7", "why", "body").unwrap(), "D-3");
+        assert_eq!(
+            amt.decide_as("AMT-7", "why", "body", "sirius/oak").unwrap(),
+            "D-3"
+        );
     }
 
     #[test]

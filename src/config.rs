@@ -92,6 +92,105 @@ pub struct GateConfig {
     pub fallback: GateFallback,
 }
 
+/// What to do when the review stage cannot reach a clean verdict (SIRF-23).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewEscalation {
+    /// Advance to `target_status` anyway, label the issue `review:open`, and
+    /// comment every unresolved confirmed finding. The work is never hidden or
+    /// thrown away, and the human sees exactly what is left.
+    #[default]
+    AdvanceFlagged,
+    /// Release back to `todo` with the findings attached.
+    Release,
+}
+
+/// Which tree the reviewer looks at (SIRF-23).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewAgainst {
+    /// The plain diff against the fleet's launch base.
+    LaunchBase,
+    /// The issue's work merged onto the CURRENT tip of `base_ref` in a
+    /// throwaway worktree — catches bugs that only appear when the branch
+    /// meets work merged later in the same run. A merge conflict becomes a
+    /// blocking `conflict` finding.
+    #[default]
+    CurrentBaseMerge,
+}
+
+/// The review stage (SIRF-23): an unbiased fresh-eyes review after the gate,
+/// with an automatic fix loop. `cmd: None` turns the stage off entirely —
+/// today's behavior, byte for byte.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReviewConfig {
+    /// The reviewer command, run via `sh -c` in a fresh process (e.g.
+    /// `claude -p "$(cat "$SIRIUS_REVIEW_PROMPT")" --model <other>`).
+    /// Overridden by `sirius run --review-cmd`. `None` = stage off.
+    #[serde(default)]
+    pub cmd: Option<String>,
+    /// The reviewer prompt template. Sirius renders `$SIRIUS_*` placeholders
+    /// per round and hands the rendered file over as `SIRIUS_REVIEW_PROMPT`.
+    /// A missing file is materialized from the built-in default.
+    #[serde(default = "default_review_prompt_file")]
+    pub prompt_file: String,
+    /// Max review runs per issue (fix rounds = max_rounds - 1).
+    #[serde(default = "default_review_max_rounds")]
+    pub max_rounds: u32,
+    /// Finding kinds that block when `confidence == "confirmed"`.
+    #[serde(default = "default_review_block_on")]
+    pub block_on: Vec<String>,
+    #[serde(default)]
+    pub against: ReviewAgainst,
+    /// The ref whose CURRENT tip `current-base-merge` merges onto. `None` =
+    /// the branch HEAD pointed to when the fleet launched.
+    #[serde(default)]
+    pub base_ref: Option<String>,
+    /// Hard wall-clock cap on one reviewer run.
+    #[serde(default = "default_review_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default)]
+    pub on_exhausted: ReviewEscalation,
+    #[serde(default)]
+    pub on_review_error: ReviewEscalation,
+    /// A diff touching ONLY files matching these globs skips review.
+    #[serde(default = "default_review_skip_paths")]
+    pub skip_paths: Vec<String>,
+}
+
+fn default_review_prompt_file() -> String {
+    ".sirius/review-prompt.md".into()
+}
+fn default_review_max_rounds() -> u32 {
+    3
+}
+fn default_review_block_on() -> Vec<String> {
+    vec!["bug".into(), "conflict".into()]
+}
+fn default_review_timeout_secs() -> u64 {
+    1500
+}
+fn default_review_skip_paths() -> Vec<String> {
+    vec!["**/*.md".into(), "docs/**".into()]
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        ReviewConfig {
+            cmd: None,
+            prompt_file: default_review_prompt_file(),
+            max_rounds: default_review_max_rounds(),
+            block_on: default_review_block_on(),
+            against: ReviewAgainst::default(),
+            base_ref: None,
+            timeout_secs: default_review_timeout_secs(),
+            on_exhausted: ReviewEscalation::default(),
+            on_review_error: ReviewEscalation::default(),
+            skip_paths: default_review_skip_paths(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     #[serde(default = "default_true")]
@@ -130,6 +229,9 @@ pub struct Config {
     /// lease can never lapse mid-run (amt's lease is 900s by contract).
     #[serde(default = "default_lease_ttl_secs")]
     pub lease_ttl_secs: u64,
+    /// SIRF-23: the fresh-eyes review stage. Off unless `review.cmd` is set.
+    #[serde(default)]
+    pub review: ReviewConfig,
 }
 
 fn default_true() -> bool {
@@ -172,6 +274,7 @@ impl Default for Config {
             gate: GateConfig::default(),
             agent_timeout_secs: default_agent_timeout_secs(),
             lease_ttl_secs: default_lease_ttl_secs(),
+            review: ReviewConfig::default(),
         }
     }
 }
@@ -236,6 +339,29 @@ mod tests {
         assert_eq!(c.agent_timeout_secs, 1800);
         assert_eq!(c.lease_ttl_secs, 900);
         assert_eq!(c.heartbeat_interval_secs(), 300);
+        // SIRF-23: the review stage is OFF by default (identical to the
+        // pre-review loop) with the spec's defaults ready when it is enabled.
+        assert_eq!(c.review.cmd, None);
+        assert_eq!(c.review.max_rounds, 3);
+        assert_eq!(c.review.block_on, vec!["bug", "conflict"]);
+        assert_eq!(c.review.against, ReviewAgainst::CurrentBaseMerge);
+        assert_eq!(c.review.on_exhausted, ReviewEscalation::AdvanceFlagged);
+        assert_eq!(c.review.on_review_error, ReviewEscalation::AdvanceFlagged);
+        assert_eq!(c.review.timeout_secs, 1500);
+    }
+
+    #[test]
+    fn review_block_parses_kebab_case_and_fills_defaults() {
+        let c: Config = serde_json::from_str(
+            r#"{"review":{"cmd":"rev","against":"launch-base","on_exhausted":"release"}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.review.cmd.as_deref(), Some("rev"));
+        assert_eq!(c.review.against, ReviewAgainst::LaunchBase);
+        assert_eq!(c.review.on_exhausted, ReviewEscalation::Release);
+        // Unspecified fields fall back to defaults.
+        assert_eq!(c.review.max_rounds, 3);
+        assert_eq!(c.review.on_review_error, ReviewEscalation::AdvanceFlagged);
     }
 
     #[test]

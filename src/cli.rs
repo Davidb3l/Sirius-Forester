@@ -77,6 +77,10 @@ pub enum Command {
         /// Run at most this many iterations total (0 = until no work).
         #[arg(long, default_value_t = 0)]
         max_iterations: u32,
+        /// Fresh-eyes reviewer command for the review stage (SIRF-23),
+        /// overriding `review.cmd`; "" disables a configured review.
+        #[arg(long)]
+        review_cmd: Option<String>,
         /// Accepted for CLI-contract compatibility (CONTRACTS §2 documents it);
         /// `run` ALWAYS streams NDJSON to stdout, so this changes nothing.
         #[arg(long)]

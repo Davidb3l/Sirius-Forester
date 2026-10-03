@@ -42,6 +42,10 @@ pub struct AgentRunOpts {
     /// Where to persist the agent's output so it does not vanish on success.
     /// `None` disables durable capture (still returned in-memory).
     pub log_path: Option<PathBuf>,
+    /// Extra environment for the child — the SIRF-22/23 agent contract
+    /// (`SIRIUS_ISSUE`, `SIRIUS_WORKER`, `AMT_AGENT`, `SIRIUS_PHASE`, …).
+    /// Layered on top of the inherited environment.
+    pub env: Vec<(String, String)>,
 }
 
 /// The result of supervising an agent command (SIRF-7).
@@ -155,6 +159,7 @@ impl Runner for RealRunner {
 
         let mut cmd = Command::new(program);
         cmd.args(args).stdout(stdout_cfg).stderr(stderr_cfg);
+        cmd.envs(opts.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         if let Some(d) = &self.cwd {
             cmd.current_dir(d);
         }
@@ -267,6 +272,16 @@ pub struct MockRunner {
     /// fires `heartbeat` `beats` times first (so tests can assert lease renewal)
     /// then either returns normally or reports a timeout kill.
     agent_sim: Mutex<Option<AgentSim>>,
+    /// SIRF-23: the environment of every `run_agent` call, in order, so tests
+    /// can assert the agent contract.
+    agent_envs: Mutex<Vec<Vec<(String, String)>>>,
+    /// SIRF-23: scripted agent side effects keyed by `SIRIUS_PHASE`. Each
+    /// entry is (env var naming the output path, file contents); a `run_agent`
+    /// call in that phase pops one and writes it — how a test plays the
+    /// reviewer (`SIRIUS_REVIEW_OUT`) or a fix-mode worker (`SIRIUS_FIX_OUT`).
+    phase_writes: Mutex<std::collections::HashMap<String, VecDeque<(String, String)>>>,
+    /// SIRF-23: phases whose NEXT `run_agent` call simulates a timeout kill.
+    phase_timeouts: Mutex<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -318,6 +333,30 @@ impl MockRunner {
             timeout: true,
         });
         self
+    }
+
+    /// SIRF-23: when the next `run_agent` call in `phase` happens, write
+    /// `contents` to the path held by its env var `out_var`. Queued per phase,
+    /// consumed FIFO.
+    pub fn on_phase_write(&self, phase: &str, out_var: &str, contents: &str) -> &Self {
+        self.phase_writes
+            .lock()
+            .unwrap()
+            .entry(phase.to_string())
+            .or_default()
+            .push_back((out_var.to_string(), contents.to_string()));
+        self
+    }
+
+    /// SIRF-23: make the next `run_agent` call in `phase` time out (killed).
+    pub fn arm_phase_timeout(&self, phase: &str) -> &Self {
+        self.phase_timeouts.lock().unwrap().push(phase.to_string());
+        self
+    }
+
+    /// SIRF-23: the env of every `run_agent` call so far, in order.
+    pub fn agent_envs(&self) -> Vec<Vec<(String, String)>> {
+        self.agent_envs.lock().unwrap().clone()
     }
 
     /// SIRF-7: fire the heartbeat `beats` times on a *normal* (non-timeout)
@@ -373,9 +412,38 @@ impl Runner for MockRunner {
         &self,
         program: &str,
         args: &[&str],
-        _opts: &AgentRunOpts,
+        opts: &AgentRunOpts,
         heartbeat: &mut dyn FnMut(),
     ) -> std::io::Result<AgentOutcome> {
+        self.agent_envs.lock().unwrap().push(opts.env.clone());
+        // Play any scripted side effect for this phase (SIRF-23).
+        let phase = opts
+            .env
+            .iter()
+            .find(|(k, _)| k == "SIRIUS_PHASE")
+            .map(|(_, v)| v.clone());
+        if let Some(phase) = &phase {
+            let mut timeouts = self.phase_timeouts.lock().unwrap();
+            if let Some(i) = timeouts.iter().position(|p| p == phase) {
+                timeouts.remove(i);
+                drop(timeouts);
+                let out = self.run(program, args)?;
+                return Ok(AgentOutcome::TimedOut { output: out });
+            }
+        }
+        if let Some(phase) = phase {
+            let next = self
+                .phase_writes
+                .lock()
+                .unwrap()
+                .get_mut(&phase)
+                .and_then(VecDeque::pop_front);
+            if let Some((var, contents)) = next {
+                if let Some((_, path)) = opts.env.iter().find(|(k, _)| *k == var) {
+                    std::fs::write(path, contents)?;
+                }
+            }
+        }
         let out = self.run(program, args)?;
         let sim = self.agent_sim.lock().unwrap().take();
         match sim {
@@ -445,6 +513,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             heartbeat_interval: Duration::from_secs(1),
             log_path: None,
+            env: vec![],
         };
         let mut beats = 0;
         let mut hb = || beats += 1;
@@ -465,6 +534,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             heartbeat_interval: Duration::from_secs(1),
             log_path: None,
+            env: vec![],
         };
         let mut beats = 0;
         let mut hb = || beats += 1;
@@ -486,6 +556,7 @@ mod tests {
             timeout: Duration::from_millis(200),
             heartbeat_interval: Duration::from_millis(50),
             log_path: None,
+            env: vec![],
         };
         let mut beats = 0;
         let mut hb = || beats += 1;
@@ -513,6 +584,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             heartbeat_interval: Duration::from_secs(1),
             log_path: Some(log.clone()),
+            env: vec![],
         };
         let mut hb = || {};
         let outcome = r
@@ -540,6 +612,7 @@ mod tests {
             timeout: Duration::from_secs(15),
             heartbeat_interval: Duration::from_secs(100),
             log_path: Some(log.clone()),
+            env: vec![],
         };
         let mut hb = || {};
         // ~200 KB to stdout (>> any pipe buffer).

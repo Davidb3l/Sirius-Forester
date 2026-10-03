@@ -260,6 +260,23 @@ sirius run --workers 3 --agent-cmd 'claude -p "fix the claimed issue"' --from to
 # {"event":"iteration","worker":"sirius/oak","phase":"release","issue":"AMT-12","status":"in_review","advanced":true}
 ```
 
+**Review stage** (recommended): add `--review-cmd` (or `review.cmd` in
+`.sirius/config.json`) and every gated diff gets an unbiased fresh-eyes review
+before it advances. A separate reviewer process — no access to the worker's
+session — reads the issue, the diff, and the repo, by default merged onto the
+*current* base so clashes with work merged mid-run surface too. Confirmed bugs
+send the worker back in fix mode, then re-gate and re-review, until the review
+is clean or `review.max_rounds` is spent (then `advance-flagged`: it advances
+with a `review:open` label and every open finding in a comment). The reviewer is
+read-only — a review that edits the tree is discarded. Doc-only diffs
+(`review.skip_paths`) skip it. Contract: [`CONTRACTS.md` §3.1](CONTRACTS.md).
+
+```bash
+sirius run --workers 2 --from todo \
+  --agent-cmd 'claude -p "work issue {issue} the Sirius way"' \
+  --review-cmd 'claude -p "$(cat "$SIRIUS_REVIEW_PROMPT")"'
+```
+
 Workers run as parallel threads in one killable foreground process, each in
 its own private git worktree (`.sirius/worktrees/<worker>`) with each issue's
 work on its own `sirius/<issue>` branch; a worker exits when the board is dry
