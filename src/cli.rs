@@ -38,7 +38,9 @@ pub enum Command {
         /// Resolve symbols from a git range instead of --symbols.
         #[arg(long)]
         changed: bool,
-        /// Git range for --changed (default: working tree vs HEAD).
+        /// Git range for --changed (default: working tree vs HEAD). With other
+        /// agents working in the same checkout, pass the issue's own commits
+        /// (e.g. `base..branch`) — the default sweeps in everyone's edits.
         #[arg(long)]
         range: Option<String>,
         #[arg(long)]
@@ -46,7 +48,7 @@ pub enum Command {
     },
     /// Explain a symbol's issues/decisions, or an issue's symbols/decisions.
     Why {
-        /// A symbol id or an issue ref (AMT-n).
+        /// A symbol id (as `hayven query` prints it) or an issue key (PREFIX-n).
         target: String,
         #[arg(long)]
         json: bool,

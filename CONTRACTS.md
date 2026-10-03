@@ -116,7 +116,9 @@ sirius doctor --json        -> {"ok":bool,"checks":[{"name":str,"pass":bool,"det
                                # the five §6 contract facts: amt present+schema, hayven daemon,
                                # claim exit-code semantics, gate exit codes, fleet-memory write path
 
-sirius link AMT-7 --symbols a,b,c [--changed] --json
+sirius link AMT-7 --symbols a,b,c [--changed [--range <git-range>]] --json
+   # --changed resolves files → entities by PATH (hayven affected-tests roots);
+   # the --json object also carries "changed_files": int|null
    -> {"ok":true,"receipt_id":12,"kind":"issue","ref":"AMT-7",
        "symbols":["a","b","c"],"forward_ok":true,"reverse_ok":true}
 sirius link --decision D-3 --symbols ... --json    # same shape, kind:"decision"

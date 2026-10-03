@@ -264,9 +264,17 @@ fn cmd_link(
         }
     };
 
+    let mut changed_files: Option<usize> = None;
     if changed {
         match gitrange::changed_symbols(runner, &hv, range.as_deref()) {
-            Ok(mut s) => symbols.append(&mut s),
+            Ok(c) => {
+                // The count is printed WITH its file count (SIRF-20) so an
+                // over-broad stamp is visible. (No ratio heuristic: hayven's
+                // roots are every entity in a changed file, so one large
+                // file legitimately yields ~100.)
+                changed_files = Some(c.files.len());
+                symbols.extend(c.symbols);
+            }
             Err(e) => {
                 eprint_err(&format!("--changed resolution failed: {e}"));
                 return 1;
@@ -314,14 +322,18 @@ fn cmd_link(
                     "ref": r.r#ref,
                     "symbols": r.symbols,
                     "forward_ok": r.forward_ok,
-                    "reverse_ok": r.reverse_ok
+                    "reverse_ok": r.reverse_ok,
+                    "changed_files": changed_files
                 }));
             } else {
                 println!(
-                    "linked {} {} → {} symbols (forward: {}, reverse: {})",
+                    "linked {} {} → {} symbols{} (forward: {}, reverse: {})",
                     r.kind.as_str(),
                     r.r#ref,
                     r.symbols.len(),
+                    changed_files
+                        .map(|n| format!(" from {n} changed file(s)"))
+                        .unwrap_or_default(),
                     r.forward_ok,
                     r.reverse_ok
                 );
@@ -429,8 +441,17 @@ fn cmd_why(ws: &Workspace, runner: &RealRunner, target: &str, json: bool) -> u8 
     }
 }
 
+/// An issue key: any amt workspace prefix (`AMT-7`, `GRA-12`, `SIRF-23`,
+/// `BC9-1`), matching the issue-ref rule `extract_refs` uses. SIRF-15: this
+/// was hard-coded to `^AMT-\d+$`, so every custom-prefix key fell through to
+/// the SYMBOL path and came back as a silent empty success.
 fn regex_is_issue(target: &str) -> bool {
-    regex::Regex::new(r"^AMT-\d+$").unwrap().is_match(target)
+    // amt prefixes are 1–16 alphanumerics starting with a letter (so `X-1`
+    // is a real key); only `D-n` — a decision ref — is excluded.
+    regex::Regex::new(r"^[A-Za-z][A-Za-z0-9]*-\d+$")
+        .unwrap()
+        .is_match(target)
+        && !regex::Regex::new(r"^[Dd]-\d+$").unwrap().is_match(target)
 }
 
 // ---- gate --------------------------------------------------------------
@@ -925,8 +946,19 @@ mod tests {
     #[test]
     fn issue_ref_detection() {
         assert!(regex_is_issue("AMT-7"));
+        // SIRF-15: any workspace prefix dispatches as an issue.
+        assert!(regex_is_issue("GRA-12"));
+        assert!(regex_is_issue("SIRF-23"));
+        assert!(regex_is_issue("BC9-1"));
         assert!(!regex_is_issue("some::symbol"));
+        assert!(!regex_is_issue("src/review/glob_regex"));
         assert!(!regex_is_issue("AMT-7-extra"));
+        assert!(
+            regex_is_issue("X-1"),
+            "single-letter prefixes are real amt keys"
+        );
+        assert!(!regex_is_issue("D-3"), "a decision ref is not an issue");
+        assert!(!regex_is_issue("src/a-1"));
     }
 
     /// SUITE_CONTRACTS §3.1: under `--json`, an unhealthy-but-speaking tool

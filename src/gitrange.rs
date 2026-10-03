@@ -1,7 +1,8 @@
 //! Resolving a git range to changed files, then to Hayvenhurst symbols.
 //!
 //! Used by `sirius link ... --changed` and the gate. We shell `git diff` for
-//! the file list, then map each changed file to symbols via `hayven query`.
+//! the file list, then map the changed files to entities by PATH via
+//! `hayven affected-tests --changed` (its `roots`) — never by basename.
 
 use crate::hayven::Hayven;
 use crate::shell::Runner;
@@ -88,30 +89,59 @@ pub fn changed_since(
     Ok(files)
 }
 
-/// Resolve changed files to Hayvenhurst symbol ids by querying the index for
-/// each file's basename and collecting entity ids. Best-effort and dedup'd.
+/// What a git range resolved to: the changed files and the entities in them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ChangedSymbols {
+    pub files: Vec<String>,
+    pub symbols: Vec<String>,
+}
+
+/// Resolve a git range's changed files to Hayvenhurst entity ids, by PATH.
+///
+/// SIRF-20: this used to `hayven query <file stem>` per file — a full-text
+/// search on the BASENAME, so a commit touching one package's `types.ts`
+/// stamped every `types`/`index` module in every package of a monorepo
+/// (83 symbols from 5 files, observed), writing false provenance into the
+/// ledger. `hayven affected-tests --changed <files>` reports `roots`: the
+/// daemon's own path-exact file → entity resolution (the same mapping the
+/// gate trusts). Unindexed files (lockfiles, configs) contribute nothing.
+/// A daemon that cannot answer is an ERROR, never a silently empty stamp.
 pub fn changed_symbols(
     runner: &dyn Runner,
     hv: &Hayven,
     range: Option<&str>,
-) -> Result<Vec<String>, String> {
+) -> Result<ChangedSymbols, String> {
     let files = changed_files(runner, range)?;
+    if files.is_empty() {
+        return Ok(ChangedSymbols::default());
+    }
+    let (ok, parsed, detail) = hv.affected_tests_changed(&files);
+    let v = match parsed {
+        Some(v) if ok => v,
+        _ => {
+            return Err(format!(
+                "hayven could not map the changed files to entities: {}",
+                detail.lines().next().unwrap_or("no output")
+            ))
+        }
+    };
+    let roots = v
+        .get("roots")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "hayven affected-tests returned no \"roots\" array".to_string())?;
     let mut symbols: Vec<String> = Vec::new();
-    for f in &files {
-        // Query by the file path stem; hayven FTS matches on it.
-        let stem = std::path::Path::new(f)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(f);
-        if let Ok(v) = hv.query(stem) {
-            for id in extract_ids(&v) {
-                if !symbols.contains(&id) {
-                    symbols.push(id);
-                }
+    for r in roots {
+        let id = r
+            .as_str()
+            .or_else(|| r.get("id").and_then(Value::as_str))
+            .map(String::from);
+        if let Some(id) = id {
+            if !symbols.contains(&id) {
+                symbols.push(id);
             }
         }
     }
-    Ok(symbols)
+    Ok(ChangedSymbols { files, symbols })
 }
 
 /// Pull entity ids out of a `hayven query` result (`{"hits":[{"id":..}]}`).
@@ -209,29 +239,62 @@ mod tests {
     }
 
     #[test]
-    fn changed_symbols_dedups() {
+    fn changed_symbols_resolves_by_path_not_basename() {
+        // SIRF-20 regression: two same-named modules in different packages.
+        // Only the changed one may be stamped — never b/types via basename.
         let m = MockRunner::new();
-        m.push(MockResponse::new(
-            &["git", "diff"],
+        m.expect(&["git", "diff"], 0, "a/types.ts\nbun.lock\n");
+        m.expect(
+            &["hayven", "affected-tests"],
             0,
-            "src/math.rs\nsrc/math_test.rs\n",
-            "",
-        ));
-        // Both queries return the same id → deduped.
-        m.push(MockResponse::new(
+            r#"{"changed":["a/types.ts","bun.lock"],"roots":["a/types","a/types/Foo","a/types"],"tests":[]}"#,
+        );
+        // If anything still searched by basename, this would leak b/types in.
+        m.expect(
             &["hayven", "query"],
             0,
-            r#"{"hits":[{"id":"src/math::add"}]}"#,
-            "",
-        ));
+            r#"{"hits":[{"id":"a/types"},{"id":"b/types"}]}"#,
+        );
+        let hv = Hayven::new(&m);
+        let got = changed_symbols(&m, &hv, Some("x~1..x")).unwrap();
+        assert_eq!(got.files, vec!["a/types.ts", "bun.lock"]);
+        assert_eq!(
+            got.symbols,
+            vec!["a/types", "a/types/Foo"],
+            "deduped, path-exact"
+        );
+        let calls = m.recorded();
+        assert!(calls
+            .iter()
+            .any(|c| c == "hayven affected-tests --changed a/types.ts,bun.lock --json"));
+        assert!(
+            !calls.iter().any(|c| c.starts_with("hayven query")),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn changed_symbols_errors_when_hayven_cannot_answer() {
+        // A daemon failure must not become a silently EMPTY (or partial) stamp.
+        let m = MockRunner::new();
+        m.expect(&["git", "diff"], 0, "src/a.rs\n");
         m.push(MockResponse::new(
-            &["hayven", "query"],
-            0,
-            r#"{"hits":[{"id":"src/math::add"}]}"#,
+            &["hayven", "affected-tests"],
+            1,
             "",
+            "daemon serves a DIFFERENT project",
         ));
         let hv = Hayven::new(&m);
-        let syms = changed_symbols(&m, &hv, None).unwrap();
-        assert_eq!(syms, vec!["src/math::add"]);
+        let e = changed_symbols(&m, &hv, None).unwrap_err();
+        assert!(e.contains("DIFFERENT project"), "{e}");
+        // An empty range is just empty — not an error, and no hayven call.
+        let m2 = MockRunner::new();
+        m2.expect(&["git", "diff"], 0, "");
+        let hv2 = Hayven::new(&m2);
+        assert_eq!(
+            changed_symbols(&m2, &hv2, None).unwrap(),
+            ChangedSymbols::default()
+        );
+        assert!(!m2.recorded().iter().any(|c| c.starts_with("hayven")));
     }
 }

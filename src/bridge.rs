@@ -193,6 +193,36 @@ pub fn why_symbol(amt: &Amt, hv: &Hayven, symbol: &str) -> Result<WhySymbol, Str
             issues.push((r, title));
         }
     }
+    // SIRF-15: an empty answer must say WHY. "This symbol has no recorded
+    // provenance" (exit 0) and "no such symbol" (exit 1) are different
+    // answers — the old silent empty for both made a correct stamp look like
+    // a failed write. `hayven context` answers an EXACT id with
+    // `resolved: null`; anything else it either fuzzy-resolves to a
+    // DIFFERENT id (bare names) or rejects with exit 1 ("No node with id",
+    // for paths and hyphenated args). Both mean "not a node". Only a
+    // connectivity failure is inconclusive — and recall just succeeded, so
+    // the daemon is up.
+    if issues.is_empty() && decision_refs.is_empty() {
+        if Regex::new(r"^[Dd]-\d+$").unwrap().is_match(symbol) {
+            return Err(format!(
+                "`{symbol}` is a decision ref, not a symbol — try `amt decision show {symbol}`"
+            ));
+        }
+        let exists = match hv.context(symbol) {
+            Ok(ctx) => match ctx.get("resolved") {
+                None | Some(Value::Null) => true,
+                Some(r) => r.as_str() == Some(symbol),
+            },
+            Err(e) if crate::hayven::looks_like_connectivity_failure(&e) => true,
+            Err(_) => false,
+        };
+        if !exists {
+            return Err(format!(
+                "no symbol `{symbol}` in the index{} (`sirius why` takes a full node id as `hayven query` prints it, or an issue key)",
+                near_miss(hv, symbol)
+            ));
+        }
+    }
     let mut decisions = Vec::new();
     for r in decision_refs {
         let summary = amt
@@ -207,6 +237,32 @@ pub fn why_symbol(amt: &Amt, hv: &Hayven, symbol: &str) -> Result<WhySymbol, Str
         issues,
         decisions,
     })
+}
+
+/// A "did you mean" hint for a non-node `why` arg — ONLY when the index holds
+/// a node whose NAME is exactly the arg's last segment (`zonedWallClockToUtc`
+/// → `pkg/lib/timezone/zonedWallClockToUtc`). hayven's own fuzzy pick is a
+/// full-text top hit and can be unrelated, which would mislead.
+fn near_miss(hv: &Hayven, arg: &str) -> String {
+    let leaf = arg
+        .trim_end_matches('/')
+        .rsplit(['/', ':'])
+        .next()
+        .unwrap_or(arg);
+    if leaf.is_empty() {
+        return String::new();
+    }
+    let hit = hv.query(leaf).ok().and_then(|v| {
+        v.get("hits")?
+            .as_array()?
+            .iter()
+            .find(|h| h.get("name").and_then(Value::as_str) == Some(leaf))
+            .and_then(|h| h.get("id").and_then(Value::as_str).map(String::from))
+    });
+    match hit {
+        Some(id) if id != arg => format!("; did you mean `{id}`?"),
+        _ => String::new(),
+    }
 }
 
 /// `sirius why AMT-n`: read the issue activity and list the symbols + decisions
@@ -465,6 +521,104 @@ mod tests {
         assert_eq!(w.issues.len(), 1);
         assert_eq!(w.issues[0].0, "AMT-7");
         assert_eq!(w.issues[0].1, "Fix the widget");
+    }
+
+    #[test]
+    fn why_unknown_symbol_errors_with_a_near_miss() {
+        // SIRF-15: a bare name is not an id — it must not return a silent
+        // empty success that reads like a failed stamp. Real hayven fuzzy-
+        // resolves it (exit 0) to some OTHER id; the hint comes only from an
+        // exact NAME match, never from hayven's (possibly unrelated) pick.
+        let m = MockRunner::new();
+        m.expect(&["hayven", "recall"], 0, r#"{"count":0,"notes":[]}"#);
+        m.expect(
+            &["hayven", "context"],
+            0,
+            r#"{"symbol":"src/gate/GateOutcome","resolved":"src/gate/GateOutcome","slices":[]}"#,
+        );
+        m.expect(
+            &["hayven", "query"],
+            0,
+            r#"{"hits":[{"id":"src/gate/GateOutcome","name":"GateOutcome"},
+                        {"id":"pkg/tz/zonedWallClockToUtc","name":"zonedWallClockToUtc"}]}"#,
+        );
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let e = why_symbol(&amt, &hv, "zonedWallClockToUtc").unwrap_err();
+        assert!(e.contains("no symbol `zonedWallClockToUtc`"), "{e}");
+        assert!(
+            e.contains("did you mean `pkg/tz/zonedWallClockToUtc`"),
+            "{e}"
+        );
+        assert!(
+            !e.contains("GateOutcome"),
+            "never hayven's unrelated pick: {e}"
+        );
+    }
+
+    #[test]
+    fn why_unknown_path_errors_when_hayven_rejects_it() {
+        // Real hayven answers a non-node PATH with exit 1 ("No node with id")
+        // and no JSON — that must be "not found", not a silent empty success.
+        let m = MockRunner::new();
+        m.expect(&["hayven", "recall"], 0, r#"{"count":0,"notes":[]}"#);
+        m.push(crate::shell::MockResponse::new(
+            &["hayven", "context"],
+            1,
+            "",
+            "No node with id `totally/made/up` — try `hayven query totally/made/up`",
+        ));
+        m.expect(&["hayven", "query"], 0, r#"{"hits":[]}"#);
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let e = why_symbol(&amt, &hv, "totally/made/up").unwrap_err();
+        assert!(e.contains("no symbol `totally/made/up`"), "{e}");
+        assert!(
+            !e.contains("did you mean"),
+            "no exact-name match ⇒ no hint: {e}"
+        );
+    }
+
+    #[test]
+    fn why_decision_ref_points_at_amt() {
+        let m = MockRunner::new();
+        m.expect(&["hayven", "recall"], 0, r#"{"count":0,"notes":[]}"#);
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let e = why_symbol(&amt, &hv, "D-3").unwrap_err();
+        assert!(e.contains("amt decision show D-3"), "{e}");
+    }
+
+    #[test]
+    fn why_daemon_trouble_is_not_reported_as_unknown_symbol() {
+        // Inconclusive (connectivity) ⇒ keep the valid empty answer.
+        let m = MockRunner::new();
+        m.expect(&["hayven", "recall"], 0, r#"{"count":0,"notes":[]}"#);
+        m.push(crate::shell::MockResponse::new(
+            &["hayven", "context"],
+            1,
+            "",
+            "connection refused",
+        ));
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        assert!(why_symbol(&amt, &hv, "src/a/f").is_ok());
+    }
+
+    #[test]
+    fn why_known_symbol_without_provenance_is_a_valid_empty() {
+        // An EXACT id (`resolved: null`) with no notes is a real answer.
+        let m = MockRunner::new();
+        m.expect(&["hayven", "recall"], 0, r#"{"count":0,"notes":[]}"#);
+        m.expect(
+            &["hayven", "context"],
+            0,
+            r#"{"symbol":"src/a/f","resolved":null,"slices":[]}"#,
+        );
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let w = why_symbol(&amt, &hv, "src/a/f").unwrap();
+        assert!(w.issues.is_empty() && w.decisions.is_empty());
     }
 
     #[test]
