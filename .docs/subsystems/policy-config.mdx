@@ -38,6 +38,15 @@ createdBy: "claude-code"
 | `gate.test_cmd` | *unset* | full-suite command, run via `sh -c`. Unset ⇒ fail-closed |
 | `gate.fallback` | `full-suite` | `fail` / `pass-with-warning` also available |
 | `agent_timeout_secs` | `1800` | hard wall-clock cap on one agent run |
+| `review.cmd` | *unset* | the fresh-eyes reviewer (SIRF-23); unset ⇒ no review stage. `--review-cmd` overrides it |
+| `review.prompt_file` | `.sirius/review-prompt.md` | template rendered per round; materialized from the built-in default if missing |
+| `review.max_rounds` | `3` | review runs per issue (fix rounds = max_rounds − 1) |
+| `review.block_on` | `["bug","conflict"]` | kinds that block when `confidence == "confirmed"` |
+| `review.against` | `current-base-merge` | or `launch-base` |
+| `review.base_ref` | *unset* | default: the branch HEAD pointed to at launch |
+| `review.timeout_secs` | `1500` | hard cap on one reviewer run |
+| `review.on_exhausted` / `on_review_error` | `advance-flagged` | or `release` |
+| `review.skip_paths` | `["**/*.md","docs/**"]` | a diff touching only these skips review |
 | `lease_ttl_secs` | `900` | amt/hayven lease TTL |
 
 `backoff_delay_ms(attempt)` is `base << attempt`, clamped to `max_ms`: 500, 1000, 2000, 4000, 8000, then flat.

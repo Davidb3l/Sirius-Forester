@@ -57,6 +57,7 @@ Sirius never opens either parent's SQLite for writing. The console (`web/`) read
 | `src/shell.rs` | `Runner` trait + `MockRunner`, the seam every test uses | — |
 | `src/doctor.rs` | `sirius doctor` — the five contract facts live, plus an advisory `plugin_handoff` check (WARN, never gates `ok`) | — |
 | `src/gitrange.rs` | Changed-file resolution from a git range | — |
+| `src/review.rs` | The review stage's pure half: findings/fix JSON contracts, blocking rule, skip globs, prompt rendering, round bookkeeping | [subsystems/loop](../subsystems/loop) |
 
 ## Subcommands
 
@@ -68,7 +69,7 @@ sirius doctor          five contract facts live + plugin-handoff advisory
 sirius link <AMT-n>    stamp two-way provenance (--decision D-n for decisions)
 sirius why <target>    explain a symbol's issues/decisions, or an issue's symbols
 sirius gate <AMT-n>    select affected tests, run them, advance on pass
-sirius run             the loop, --workers N --agent-cmd "<cmd>"
+sirius run             the loop, --workers N --agent-cmd "<cmd>" [--review-cmd "<cmd>"]
 ```
 
 Exit codes follow the suite convention: `0` ok, `1` operational failure, `2` usage error, `3` soft-block. `sirius doctor --json` is the discovery handshake and deliberately **exits 0 even when unhealthy** — a peer that exits non-zero is read as ABSENT, so an unhealthy-but-present tool must report its health in the envelope body, not the exit code (`doctor_exit_code` in `src/main.rs`).

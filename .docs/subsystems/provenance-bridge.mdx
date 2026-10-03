@@ -29,6 +29,8 @@ Two-way provenance: after work lands, the issue knows which code it touched **an
 
 Both outcomes are recorded independently in the ledger as `forward_ok` and `reverse_ok`. A half-landed stamp is stored honestly as exactly that — see [subsystems/ledger](./ledger).
 
+When the loop stamps a receipt (`worker_id` is set), the forward comment is posted with `--author sirius/<tree>`, so fleet provenance is attributed to the worker rather than to whoever ran the fleet.
+
 That independence is load-bearing in a specific real case: when the Hayvenhurst daemon on `:7777` is bound to a *different* project than the current workspace, forward stamping still lands while reverse stamping reports `reverse_ok: false`. The receipt records the truth rather than failing the whole operation.
 
 `remember_with_retry` gives the reverse write a second chance before recording failure.
@@ -48,6 +50,6 @@ sirius link --decision D-3 --symbols ... --json
 Two shapes, dispatched on the target:
 
 - **`sirius why <symbol>`** — recalls fleet memory for that node and resolves the `AMT-n` / `D-n` references it finds, returning the issues and decisions behind the code.
-- **`sirius why AMT-n`** — reads the issue activity and returns the symbols and decisions attached to it.
+- **`sirius why AMT-n`** — reads the issue activity and returns the symbols and decisions attached to it, plus the issue's review rounds from the ledger (`review` in `--json`).
 
 `extract_refs` parses `AMT-n` / `D-n` out of note text and `extract_symbols_from_comment` recovers entity ids from the forward comment, so `why` works off what was actually written rather than requiring a side index.

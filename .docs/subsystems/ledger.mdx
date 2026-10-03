@@ -28,7 +28,7 @@ Parallel fleet workers each hold their own connection; WAL plus a 5-second `busy
 
 `Ledger::open` refuses a missing **or uninitialized** db: it opens without SQLite's CREATE flag and probes `meta.schema_version` before handing the connection out. A zero-byte or never-init'ed file used to "open" fine and then fail every write — each failure swallowed at its call site, which is how a fleet once ran for hours against a permanently-empty ledger with zero diagnostics. Failed ledger writes in the loop now also warn on stderr (`ledger_warn` in `src/run.rs`).
 
-## Five tables
+## Six tables
 
 | Table | Holds |
 |---|---|
@@ -37,6 +37,9 @@ Parallel fleet workers each hold their own connection; WAL plus a 5-second `busy
 | `iterations` | one row per loop pass: issue, entities, outcome, gate result, oracle verdicts, tokens, duration, receipt |
 | `receipts` | provenance stamps — `kind` (`issue`/`decision`), `ref`, `symbols`, `forward_ok`, `reverse_ok` |
 | `policy_events` | why the policy engine did what it did |
+| `review_rounds` | one row per review attempt (SIRF-23): issue, worker, round, result (`clean`/`blocking`/`error`/`tampered`), confirmed/notes counts, findings JSON |
+
+`review_rounds` is **additive**: `ADDITIVE_TABLES` runs on `create` and on every `open` (`CREATE TABLE IF NOT EXISTS`), so ledgers made by older binaries gain it without a re-init, `schema_version` stays 1, and older binaries never read it.
 
 `receipts` is created **before** `iterations` in `apply_schema`, because `iterations.receipt_id` references it and foreign keys are ON.
 
@@ -46,6 +49,7 @@ Parallel fleet workers each hold their own connection; WAL plus a 5-second `busy
 - `start_iteration(worker, issue)` → row id; `finish_iteration(...)` fills in outcome, gate result, oracle verdicts, tokens, duration, receipt. Two calls, one row.
 - `insert_receipt(kind, ref, symbols, forward_ok, reverse_ok, worker)` → row id. `forward_ok` / `reverse_ok` are stored independently, so a half-landed stamp is recorded honestly rather than as a success or a failure.
 - `log_policy_event(iteration_id, kind, detail)` — `detail` is arbitrary JSON.
+- `insert_review_round(...)` / `review_rounds_for_issue(issue)` — the review history `sirius why <ISSUE>` prints.
 - `count_policy_events(kind, limit)` — counts how many of the most recent `limit` events **of any kind** are of `kind`. The window comes first, then the filter — the reverse order (filter-then-limit) counted all-time occurrences capped at `limit`, which latched adaptive claiming into pre-claim forever after two 409s ever. This is what adaptive claiming reads to sense contention; see [subsystems/loop](./loop).
 
 ## Read API for the console
