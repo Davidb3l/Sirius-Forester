@@ -408,9 +408,54 @@ pub fn run_with_plugins_dir(
     // 6. plugin handoff — advisory; reports and recommends, never gates.
     checks.push(plugin_handoff_check(plugins_dir.as_deref()));
 
+    // 7. fleet models (SIRF-26) — advisory: what the fleet would run on.
+    checks.push(models_check(ws));
+
     // Only GATING checks decide overall health; an advisory failure is a WARN.
     let ok = checks.iter().all(|c| !c.gating || c.pass);
     DoctorReport { ok, checks }
+}
+
+/// Check #7 (ADVISORY, SIRF-26): which models the fleet would run on. A
+/// config with no `models.default` is a WARN naming the model every Claude
+/// worker would silently inherit — `sirius run` refuses it without
+/// `--model` / `--allow-default-model`.
+pub fn models_check(ws: &Workspace) -> Check {
+    const NAME: &str = "fleet_models";
+    let cfg = crate::config::Config::load(&ws.config_path()).unwrap_or_default();
+    let m = &cfg.models;
+    let routes: Vec<String> = m
+        .routes
+        .iter()
+        .map(|r| format!("[{}]→{}", r.labels.join("|"), r.model))
+        .collect();
+    let describe = format!(
+        "default {}, review {}, fix floor {}, routes {}",
+        m.default.as_deref().unwrap_or("(none)"),
+        crate::models::review_model(m)
+            .as_deref()
+            .unwrap_or("(none)"),
+        m.fix_floor.as_deref().unwrap_or("(none)"),
+        if routes.is_empty() {
+            "(none)".to_string()
+        } else {
+            routes.join(", ")
+        }
+    );
+    if m.default.as_deref().is_some_and(|d| !d.trim().is_empty()) {
+        return Check::advisory(NAME, true, describe);
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let would = crate::models::claude_default_model(&ws.root, home.as_deref())
+        .map(|(model, from)| format!("`{model}` (from {from})"))
+        .unwrap_or_else(|| "the CLI's built-in default".into());
+    Check::advisory(
+        NAME,
+        m.allow_default,
+        format!(
+            "{describe} — no models.default: `sirius run` needs --model <id> (or --allow-default-model), else workers would run on {would}"
+        ),
+    )
 }
 
 fn first_line(s: &str) -> String {
@@ -474,7 +519,7 @@ mod tests {
 
         let report = run_with_plugins_dir(&ws, &m, None);
         assert!(report.ok, "checks: {:?}", report.checks);
-        assert_eq!(report.checks.len(), 6);
+        assert_eq!(report.checks.len(), 7);
         // With no plugins dir the handoff check is an advisory PASS (skipped),
         // clearly labeled — a CI box is not an incomplete install.
         let ph = report

@@ -39,12 +39,37 @@ pub struct Fleet {
     pub sirius_dir: std::path::PathBuf,
     /// The reviewer prompt template (`review.prompt_file`, or the default).
     pub review_prompt: String,
+    /// SIRF-26: set (to the agent's message) when an agent hits a usage/plan
+    /// limit. Shared by every worker of the fleet: once set, nobody claims
+    /// again — the board is left alone instead of churned through.
+    pub pause: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
-/// Fill `{issue}` / `{worker}` in an agent or reviewer command (SIRF-22 #4).
-/// Issue keys and worker ids are `[A-Za-z0-9/_-]`, so no shell quoting needed.
-pub fn template_cmd(cmd: &str, issue: &str, worker: &str) -> String {
-    cmd.replace("{issue}", issue).replace("{worker}", worker)
+impl Fleet {
+    /// Pause the whole fleet (first reason wins).
+    pub fn pause_with(&self, reason: &str) {
+        let mut p = self.pause.lock().unwrap_or_else(|e| e.into_inner());
+        if p.is_none() {
+            *p = Some(reason.to_string());
+        }
+    }
+
+    pub fn paused(&self) -> Option<String> {
+        self.pause.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// Fill `{issue}` / `{worker}` / `{model}` in an agent or reviewer command
+/// (SIRF-22 #4, SIRF-26). Issue keys and worker ids are `[A-Za-z0-9/_-]`;
+/// explicit model ids are too, but an ALIAS like `fable[1m]` contains glob
+/// characters — quote `"{model}"` in commands (launch warns on aliases). With
+/// no model, `{model}` is left as-is (launch refuses that — `check_models`).
+pub fn template_cmd(cmd: &str, issue: &str, worker: &str, model: Option<&str>) -> String {
+    let out = cmd.replace("{issue}", issue).replace("{worker}", worker);
+    match model {
+        Some(m) => out.replace("{model}", m),
+        None => out,
+    }
 }
 
 /// An owned env pair.
@@ -396,6 +421,9 @@ pub enum IterationOutcome {
     Deadend,
     /// An operational error.
     Error(String),
+    /// SIRF-26: an agent hit a usage/plan limit — the issue went back to
+    /// `todo` untouched and the whole fleet stops claiming.
+    Paused(String),
 }
 
 /// Run ONE iteration for a worker. Deterministic and fully mockable — the whole
@@ -471,6 +499,20 @@ pub fn run_iteration(
         None => return IterationOutcome::Error("claim returned no issue id".into()),
     };
     let title = issue_title(&issue_val);
+    // SIRF-26: route this TICKET to a model by its labels (first match wins);
+    // fix rounds of un-routed tickets rise to `models.fix_floor`.
+    let labels: Vec<String> = issue_val
+        .get("labels")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|l| l.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let model_work = crate::models::model_for(&config.models, &labels, "work");
+    let model_fix = crate::models::model_for(&config.models, &labels, "fix");
+    let model_review = crate::models::review_model(&config.models);
     // A failed start_iteration is warned (not fatal) and leaves iter_id = -1;
     // `iter_ref` keeps that sentinel OUT of policy_events rows, whose FK on
     // iterations(id) would reject -1 — another formerly-silent write failure.
@@ -486,7 +528,7 @@ pub fn run_iteration(
         worker,
         Some(&issue),
         "claim",
-        json!({"claimed": true, "title": title}),
+        json!({"claimed": true, "title": title, "model": model_work, "review_model": model_review}),
     );
     // Durable: the Ametrite claim + ledger.start_iteration above.
     emit_job("job.dispatched", &issue);
@@ -838,6 +880,50 @@ pub fn run_iteration(
         emit_job("job.blocked", &issue);
         IterationOutcome::Error(format!("lease on {issue} lost before {when}: {reason}"))
     };
+    // SIRF-26: an agent hit a usage limit. Hand the issue back to `todo`
+    // UNTOUCHED (it never got a real attempt), say why on the board, and
+    // stop — the worker loop sees `Paused` and the fleet stops claiming.
+    let usage_paused = |out: &mut dyn Write, line: &str| -> IterationOutcome {
+        release_entities(hv, ledger, &issue, &claim_ids);
+        release_issue_checked(
+            amt,
+            ledger,
+            &issue,
+            worker,
+            Some("todo"),
+            Some(&format!(
+                "sirius: fleet paused — a usage limit was hit (\"{line}\"). {issue} is back in todo untouched; restart the fleet once the limit resets."
+            )),
+        );
+        emit_event(
+            out,
+            worker,
+            Some(&issue),
+            "release",
+            json!({"reason": "usage_limit", "detail": line, "advanced": false}),
+        );
+        ledger_warn(
+            "finish_iteration",
+            ledger.finish_iteration(
+                iter_id,
+                &entities,
+                "released",
+                None,
+                &oracle_verdicts,
+                None,
+                Some(start.elapsed().as_millis() as i64),
+                None,
+            ),
+        );
+        ledger_warn("upsert_worker", ledger.upsert_worker(worker, "idle"));
+        emit_spine(
+            "fleet.paused",
+            vec![crate::spine::issue_ref(&issue)],
+            json!({"issue": issue.as_str(), "reason": line}),
+        );
+        emit_job("job.blocked", &issue);
+        IterationOutcome::Paused(line.to_string())
+    };
     // Renew now and SAY whether the amt lease is still ours (a transient amt
     // failure only warns — the lease may well still be ours).
     let renew_checked = || -> Result<(), String> {
@@ -901,6 +987,19 @@ pub fn run_iteration(
             // and spawning anyway (the old behavior) put two agents on one issue.
             // A transient `Failed` (amt hiccup) only warns — the lease may well
             // still be ours.
+            // SIRF-26: another worker hit a usage limit — spawn nothing more.
+            if let Some(line) = fleet.and_then(Fleet::paused) {
+                if phase == "work" {
+                    return WorkGate::Exit(usage_paused(out, &line));
+                }
+                return WorkGate::Done {
+                    work_ok: false,
+                    gate_result: "skipped",
+                    exit: None,
+                    log: None,
+                    timed_out: false,
+                };
+            }
             match amt.heartbeat(&issue, worker) {
                 Ok(()) => {}
                 Err(crate::amt::HeartbeatError::Refused(reason)) => {
@@ -916,19 +1015,34 @@ pub fn run_iteration(
             // human running the fleet.
             let mut env = base_env.clone();
             env.push(kv("SIRIUS_PHASE", phase));
-            env.extend(extra_env.iter().cloned());
-            let log_path = agent_log_path(&if phase == "work" {
-                issue.clone()
+            // SIRF-26: an explicit model, never the CLI's silent global
+            // default. ANTHROPIC_MODEL steers Claude Code (it wins over
+            // settings.json — verified); SIRIUS_MODEL serves other agents.
+            let phase_model = if phase == "fix" {
+                model_fix.as_deref()
             } else {
-                format!("{issue}-{phase}-r{round}")
-            });
+                model_work.as_deref()
+            };
+            if let Some(m) = phase_model {
+                env.push(kv("ANTHROPIC_MODEL", m));
+                env.push(kv("SIRIUS_MODEL", m));
+            }
+            env.extend(extra_env.iter().cloned());
+            let log_path = agent_log_path(
+                fleet,
+                &if phase == "work" {
+                    issue.clone()
+                } else {
+                    format!("{issue}-{phase}-r{round}")
+                },
+            );
             let opts = AgentRunOpts {
                 timeout: Duration::from_secs(config.agent_timeout_secs),
                 heartbeat_interval: Duration::from_secs(config.heartbeat_interval_secs()),
                 log_path: log_path.clone(),
                 env,
             };
-            let cmd = template_cmd(agent_cmd, &issue, worker);
+            let cmd = template_cmd(agent_cmd, &issue, worker, phase_model);
             let work = runner.run_agent("sh", &["-c", &cmd], &opts, &mut heartbeat);
             let timed_out = work.as_ref().map(AgentOutcome::timed_out).unwrap_or(false);
             work_ok = work.as_ref().map(AgentOutcome::success).unwrap_or(false);
@@ -945,6 +1059,37 @@ pub fn run_iteration(
                 ev["round"] = json!(round);
             }
             emit_event(out, worker, Some(&issue), phase, ev);
+
+            // SIRF-26: a usage/plan limit is not a per-issue failure — every
+            // later claim would fail the same way in seconds (observed: the
+            // Lydgr fleet bounced its board after the limit hit). Pause the
+            // whole fleet; leave this issue in `todo` untouched.
+            if !work_ok {
+                let limit = fleet.and_then(|f| {
+                    log_path
+                        .as_ref()
+                        .and_then(|p| std::fs::read_to_string(p).ok())
+                        .and_then(|log| crate::models::usage_limit_in(&log))
+                        .map(|l| {
+                            f.pause_with(&l);
+                            l
+                        })
+                });
+                if let Some(line) = limit {
+                    if phase == "work" {
+                        return WorkGate::Exit(usage_paused(out, &line));
+                    }
+                    // A fix round: the review stage reverts to the last
+                    // reviewed state and escalates; the fleet still stops.
+                    return WorkGate::Done {
+                        work_ok: false,
+                        gate_result: "skipped",
+                        exit: agent_code,
+                        log: log_path,
+                        timed_out: false,
+                    };
+                }
+            }
 
             // On a timeout the agent was killed. The iteration must FAIL immediately:
             // release the held entity claims (reverse), return the issue to `todo`
@@ -1358,7 +1503,11 @@ pub fn run_iteration(
         file_deadend(hv, &entities, &issue, "gate failed (affected-tests)");
         IterationOutcome::Deadend
     } else if review_released {
-        file_deadend(hv, &entities, &issue, "review did not converge");
+        // A usage limit is not a dead end — the next attempt deserves a clean
+        // slate, not a misleading "did not converge" note.
+        if fleet.and_then(Fleet::paused).is_none() {
+            file_deadend(hv, &entities, &issue, "review did not converge");
+        }
         IterationOutcome::Deadend
     } else if outcome == "error" {
         // A failed agent with nothing advanced is an OPERATIONAL error: it
@@ -1371,11 +1520,11 @@ pub fn run_iteration(
     }
 }
 
-/// Durable log path for one agent run (SIRF-7): `.sirius/logs/<issue>-<ts>.log`.
-/// Relative to the cwd (the loop runs from the repo root beside `.sirius/`).
-/// Returns `None` only if the system clock is before the epoch (never, in
-/// practice) — the directory is created lazily by the writer.
-fn agent_log_path(issue: &str) -> Option<std::path::PathBuf> {
+/// Durable log path for one agent run (SIRF-7): `<.sirius>/logs/<issue>-<ts>.log`
+/// — absolute under the fleet's `.sirius/` (review logs live there too), or
+/// relative to the cwd when not isolated. Returns `None` only if the system
+/// clock is before the epoch — the directory is created lazily by the writer.
+fn agent_log_path(fleet: Option<&Fleet>, issue: &str) -> Option<std::path::PathBuf> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
@@ -1391,7 +1540,10 @@ fn agent_log_path(issue: &str) -> Option<std::path::PathBuf> {
             }
         })
         .collect();
-    Some(std::path::PathBuf::from(".sirius/logs").join(format!("{safe}-{ts}.log")))
+    let dir = fleet
+        .map(|f| f.sirius_dir.join("logs"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".sirius/logs"));
+    Some(dir.join(format!("{safe}-{ts}.log")))
 }
 
 /// File a deadend fleet-memory note when a retry budget is exhausted (PRD §F3).
@@ -1564,6 +1716,13 @@ fn review_once(
 ) -> ReviewOnce {
     let rc = &cx.config.review;
     let fleet = cx.fleet;
+    // SIRF-26: never spawn into a paused fleet (another worker hit a limit).
+    if let Some(line) = fleet.paused() {
+        return ReviewOnce::Failed {
+            result: RoundResult::Error,
+            detail: format!("fleet paused on a usage limit (\"{line}\") — review not started"),
+        };
+    }
     let head = match checkpoint(cx, round) {
         Ok(h) => h,
         Err(detail) => {
@@ -1705,6 +1864,12 @@ fn review_once(
         "SIRIUS_REVIEW_PROMPT",
         prompt_path.display().to_string(),
     ));
+    // SIRF-26: the reviewer's model, explicit (ideally not the workers').
+    let review_model = crate::models::review_model(&cx.config.models);
+    if let Some(m) = &review_model {
+        env.push(kv("ANTHROPIC_MODEL", m.as_str()));
+        env.push(kv("SIRIUS_REVIEW_MODEL", m.as_str()));
+    }
     if let Some(p) = prev_findings {
         env.push(kv("SIRIUS_REVIEW_FINDINGS", p.display().to_string()));
     }
@@ -1728,7 +1893,7 @@ fn review_once(
     // amt), the diff, and the repo — never the worker's session.
     let cmd = format!(
         "cd \"$SIRIUS_REVIEW_DIR\" || exit 1; {}",
-        template_cmd(review_cmd, cx.issue, cx.worker)
+        template_cmd(review_cmd, cx.issue, cx.worker, review_model.as_deref())
     );
     let ran = cx
         .runner
@@ -1761,6 +1926,22 @@ fn review_once(
         Ok(_) => {}
     }
     let exit = ran.as_ref().ok().and_then(|o| o.output().code);
+    // SIRF-26: a reviewer stopped by a usage limit pauses the fleet; the
+    // round is a review error and is NOT retried (it would hit the same wall).
+    if exit != Some(0) {
+        let limit = opts
+            .log_path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|log| crate::models::usage_limit_in(&log));
+        if let Some(line) = limit {
+            cx.fleet.pause_with(&line);
+            return ReviewOnce::Failed {
+                result: RoundResult::Error,
+                detail: format!("the reviewer hit a usage limit — fleet paused (\"{line}\")"),
+            };
+        }
+    }
     // The findings file, OR the reviewer's final message: a headless reviewer
     // is usually NOT allowed to write files (and needs no write tools at all
     // — the strongest read-only guarantee), so it may print the JSON instead.
@@ -1955,6 +2136,15 @@ pub fn run_review_stage(cx: &ReviewCtx, out: &mut dyn Write, fix_round: &FixRoun
                         );
                     }
                     last_err = detail;
+                    // A usage limit is not transient: never retry into it.
+                    if let Some(line) = cx.fleet.paused() {
+                        spine_emit(
+                            cx,
+                            "fleet.paused",
+                            json!({"issue": issue, "phase": "review", "reason": line}),
+                        );
+                        break;
+                    }
                 }
                 ReviewOnce::LeaseLost(reason) => return ReviewStage::LeaseLost(reason),
                 ok => {
@@ -2081,7 +2271,20 @@ pub fn run_review_stage(cx: &ReviewCtx, out: &mut dyn Write, fix_round: &FixRoun
                     // Never trade gate-passing work for a broken fix: put the
                     // last reviewed (and gated) state back, then escalate.
                     revert_to(cx, &head);
-                    let (policy, why) = if timed_out {
+                    let paused = cx.fleet.paused();
+                    if let Some(line) = &paused {
+                        spine_emit(
+                            cx,
+                            "fleet.paused",
+                            json!({"issue": issue, "phase": "fix", "reason": line}),
+                        );
+                    }
+                    let (policy, why) = if let Some(line) = paused {
+                        (
+                            rc.on_review_error,
+                            format!("the fleet hit a usage limit during fix round {round} (\"{line}\") — fleet paused; reverted to the last reviewed state"),
+                        )
+                    } else if timed_out {
                         (
                             rc.on_review_error,
                             format!(
@@ -2162,6 +2365,7 @@ mod tests {
             worktree: dir.join("wt"),
             sirius_dir: dir,
             review_prompt: crate::review::DEFAULT_PROMPT.into(),
+            pause: Default::default(),
         }
     }
 
@@ -3415,6 +3619,322 @@ mod tests {
             .recorded()
             .iter()
             .any(|c| c == "amt --json issue update AMT-52 --remove-label review:open"));
+    }
+
+    // ---- SIRF-26: model selection + the usage-limit pause ------------------
+
+    fn models_cfg() -> crate::models::ModelsConfig {
+        crate::models::ModelsConfig {
+            default: Some("claude-sonnet-5-5".into()),
+            routes: vec![crate::models::ModelRoute {
+                labels: vec!["security".into()],
+                model: "claude-opus-5-5".into(),
+            }],
+            fix_floor: Some("claude-opus-5-5".into()),
+            review: Some("claude-fable-5-1".into()),
+            allow_default: false,
+        }
+    }
+
+    #[test]
+    fn worker_and_reviewer_get_their_own_explicit_models() {
+        // The Done-when case: workers on sonnet, the reviewer on another model,
+        // both visible to the agent as ANTHROPIC_MODEL (+ SIRIUS_* twins).
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-80");
+        m.expect(&["git", "diff", "--name-only", "base999"], 0, "src/x.rs\n");
+        checkpoint_heads(&m, &["ck1", "ck2"]);
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", BUG);
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+        let mut c = review_cfg(3);
+        c.models = models_cfg();
+        let (o, _led, nd) = run_fleet(&m, &c);
+        assert_eq!(o, IterationOutcome::Completed);
+        let envs = m.agent_envs();
+        let model_of = |i: usize| env_of(&envs[i], "ANTHROPIC_MODEL");
+        assert_eq!(phases(&m), vec!["work", "review", "fix", "review"]);
+        assert_eq!(model_of(0).as_deref(), Some("claude-sonnet-5-5"), "worker");
+        assert_eq!(
+            env_of(&envs[0], "SIRIUS_MODEL").as_deref(),
+            Some("claude-sonnet-5-5")
+        );
+        assert_eq!(model_of(1).as_deref(), Some("claude-fable-5-1"), "reviewer");
+        assert_eq!(
+            env_of(&envs[1], "SIRIUS_REVIEW_MODEL").as_deref(),
+            Some("claude-fable-5-1")
+        );
+        // An un-routed ticket's FIX round rises to the floor.
+        assert_eq!(model_of(2).as_deref(), Some("claude-opus-5-5"), "fix floor");
+        // Visible in the claim event.
+        assert!(nd.contains("\"model\":\"claude-sonnet-5-5\""), "{nd}");
+        assert!(nd.contains("\"review_model\":\"claude-fable-5-1\""), "{nd}");
+    }
+
+    #[test]
+    fn ticket_labels_route_the_worker_model_and_fill_the_placeholder() {
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-81");
+        // Re-program the claim with a routed label (most-specific prefix wins).
+        m.expect(
+            &["amt", "--json", "claim", "--agent"],
+            0,
+            r#"{"id":"AMT-81","title":"T","labels":["Security","bug"]}"#,
+        );
+        let mut c = cfg();
+        c.models = models_cfg();
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let fleet = test_fleet("base999");
+        let mut out = Vec::new();
+        run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &c,
+            &m,
+            "sirius/oak",
+            None,
+            "agent --model {model} {issue}",
+            &mut out,
+            None,
+            Some(&fleet),
+        );
+        assert_eq!(
+            env_of(&m.agent_envs()[0], "ANTHROPIC_MODEL").as_deref(),
+            Some("claude-opus-5-5")
+        );
+        assert!(m
+            .recorded()
+            .iter()
+            .any(|c| c == "sh -c agent --model claude-opus-5-5 AMT-81"));
+    }
+
+    #[test]
+    fn no_models_configured_sets_no_model_env() {
+        // With nothing configured (and the launch allowed), Sirius injects
+        // nothing — it never invents a model.
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-82");
+        let (_o, _led, nd) = run_fleet(&m, &cfg());
+        assert!(env_of(&m.agent_envs()[0], "ANTHROPIC_MODEL").is_none());
+        assert!(nd.contains("\"model\":null"), "{nd}");
+    }
+
+    const LIMIT: &str = "You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.\n";
+
+    #[test]
+    fn a_usage_limit_pauses_the_fleet_and_leaves_the_issue_untouched() {
+        // The Lydgr failure mode: after the limit hit, the loop claimed and
+        // bounced tickets in seconds. Now: one hit pauses everything.
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-83");
+        m.push(MockResponse::new(&["sh", "-c", "true"], 1, "", ""));
+        m.on_phase_stdout("work", LIMIT);
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let fleet = test_fleet("base999");
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &cfg(),
+            &m,
+            "sirius/oak",
+            None,
+            "true",
+            &mut out,
+            None,
+            Some(&fleet),
+        );
+        assert!(
+            matches!(&o, IterationOutcome::Paused(l) if l.contains("Fable 5 limit")),
+            "{o:?}"
+        );
+        assert!(fleet.paused().is_some(), "the shared pause flag is set");
+        let rec = m.recorded();
+        let rel = rec
+            .iter()
+            .find(|c| c.starts_with("amt --json release"))
+            .unwrap();
+        assert!(
+            rel.contains("--status todo") && rel.contains("fleet paused"),
+            "{rel}"
+        );
+        // Not a deadend: the issue never got a real attempt.
+        assert!(!rec
+            .iter()
+            .any(|c| c.contains("hayven remember") && c.contains("deadend")));
+        let nd = String::from_utf8(out).unwrap();
+        assert!(nd.contains("\"reason\":\"usage_limit\""), "{nd}");
+    }
+
+    #[test]
+    fn a_fix_round_usage_limit_reverts_escalates_and_pauses() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-86");
+        checkpoint_heads(&m, &["ck1"]);
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", BUG);
+        // The fix-mode agent exits 1 at a limit.
+        m.push(MockResponse::new(&["sh", "-c", "true"], 0, "", "")); // work ok
+        m.push(MockResponse::new(&["sh", "-c", "true"], 1, "", "")); // fix fails
+        m.on_phase_stdout("fix", LIMIT);
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let fleet = test_fleet("base999");
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &review_cfg(3),
+            &m,
+            "sirius/oak",
+            None,
+            "true",
+            &mut out,
+            None,
+            Some(&fleet),
+        );
+        assert!(fleet.paused().is_some(), "fleet paused");
+        let rec = m.recorded();
+        assert!(
+            rec.iter().any(|c| c == "git reset --hard ck1"),
+            "reverted to the reviewed state"
+        );
+        assert!(
+            rec.iter()
+                .any(|c| c.contains("hit a usage limit during fix round 1")),
+            "the escalation names the limit: {rec:?}"
+        );
+        // The reviewed, gate-passing work is kept (advance-flagged default).
+        assert_eq!(o, IterationOutcome::Completed);
+        assert_eq!(
+            phases(&m),
+            vec!["work", "review", "fix"],
+            "no review after the pause"
+        );
+    }
+
+    #[test]
+    fn a_paused_fleet_spawns_nothing_more() {
+        // Another worker already hit the limit: this one must not spawn.
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-87");
+        let fleet = test_fleet("base999");
+        fleet.pause_with("You've reached your limit");
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &cfg(),
+            &m,
+            "sirius/oak",
+            None,
+            "true",
+            &mut out,
+            None,
+            Some(&fleet),
+        );
+        assert!(matches!(o, IterationOutcome::Paused(_)), "{o:?}");
+        assert!(phases(&m).is_empty(), "no agent spawned: {:?}", phases(&m));
+        assert!(released_with(&m, "todo"));
+    }
+
+    #[test]
+    fn review_cmd_model_placeholder_gets_the_review_model() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-88");
+        checkpoint_heads(&m, &["ck1"]);
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+        let mut c = review_cfg(3);
+        c.models = models_cfg();
+        c.review.cmd = Some("claude -p x --model {model}".into());
+        let (_o, _led, _nd) = run_fleet(&m, &c);
+        assert!(
+            m.recorded()
+                .iter()
+                .any(|c| c.ends_with("claude -p x --model claude-fable-5-1")),
+            "{:?}",
+            m.recorded()
+        );
+    }
+
+    #[test]
+    fn a_failure_without_limit_text_is_an_ordinary_error() {
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-84");
+        m.push(MockResponse::new(&["sh", "-c", "true"], 1, "", ""));
+        m.on_phase_stdout("work", "error: tests failed in the rate limit middleware\n");
+        let fleet = test_fleet("base999");
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &cfg(),
+            &m,
+            "sirius/oak",
+            None,
+            "true",
+            &mut out,
+            None,
+            Some(&fleet),
+        );
+        assert!(matches!(o, IterationOutcome::Error(_)), "{o:?}");
+        assert!(fleet.paused().is_none());
+    }
+
+    #[test]
+    fn a_reviewer_usage_limit_pauses_without_retrying() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-85");
+        checkpoint_heads(&m, &["ck1", "ck1"]);
+        // The reviewer exits 1 (as `claude -p` does at a limit); its whole
+        // command is ONE argv element.
+        m.push(MockResponse::new(
+            &["sh", "-c", "cd \"$SIRIUS_REVIEW_DIR\" || exit 1; reviewer"],
+            1,
+            "",
+            "",
+        ));
+        m.on_phase_stdout("review", LIMIT);
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let fleet = test_fleet("base999");
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &review_cfg(3),
+            &m,
+            "sirius/oak",
+            None,
+            "true",
+            &mut out,
+            None,
+            Some(&fleet),
+        );
+        assert_eq!(phases(&m), vec!["work", "review"], "no retry into the wall");
+        assert!(fleet.paused().is_some());
+        // The gate-passing work is kept (advance-flagged), never discarded.
+        assert_eq!(o, IterationOutcome::Completed);
+        assert!(m
+            .recorded()
+            .iter()
+            .any(|c| c.contains("--add-label review:open")));
     }
 
     #[test]

@@ -277,6 +277,16 @@ sirius run --workers 2 --from todo \
   --review-cmd 'claude -p "$(cat "$SIRIUS_REVIEW_PROMPT")" --allowedTools "Bash(git diff:*)" "Bash(git log:*)" "Bash(git show:*)" "Bash(amt issue show:*)" Read Grep Glob'
 ```
 
+**Models** (SIRF-26): pass `--model <exact id>` (and ideally a different
+`--review-model`). `sirius run` refuses to launch with no model — otherwise
+every Claude worker silently inherits the global `~/.claude/settings.json`
+default. The model reaches agents as `ANTHROPIC_MODEL` (Claude Code honors it
+over settings.json) plus `SIRIUS_MODEL` and a `{model}` placeholder. Tickets
+can be routed to models by Ametrite label (`models.routes`; fix rounds use at
+least `models.fix_floor`), and the resolved model is in every `claim` event and
+in `sirius doctor`. If any agent hits a usage/plan limit, the whole fleet
+**pauses** (exit `4`) instead of bouncing the board.
+
 The reviewer needs only **read** tools: it delivers its findings as JSON in its
 final message (headless `claude -p` is not allowed to write files by default —
 and a reviewer that cannot write cannot tamper). The built-in adversarial

@@ -83,6 +83,20 @@ pub enum Command {
         /// overriding `review.cmd`; "" disables a configured review.
         #[arg(long)]
         review_cmd: Option<String>,
+        /// The workers' model, exported as ANTHROPIC_MODEL / SIRIUS_MODEL and
+        /// `{model}` (SIRF-26). Pass YOUR OWN exact model id when a Claude
+        /// session launches the fleet; `inherit` reads $SIRIUS_PARENT_MODEL.
+        /// Overrides `models.default`; label routes still apply per ticket.
+        #[arg(long)]
+        model: Option<String>,
+        /// The reviewer's model (overrides `models.review`; default: the
+        /// workers' model). A different model avoids shared blind spots.
+        #[arg(long)]
+        review_model: Option<String>,
+        /// Launch even when no worker model resolves (agents then use their
+        /// CLI's own default — e.g. ~/.claude/settings.json `model`).
+        #[arg(long)]
+        allow_default_model: bool,
         /// Accepted for CLI-contract compatibility (CONTRACTS §2 documents it);
         /// `run` ALWAYS streams NDJSON to stdout, so this changes nothing.
         #[arg(long)]

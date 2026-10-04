@@ -13,6 +13,7 @@ mod gate;
 mod gitrange;
 mod hayven;
 mod ledger;
+mod models;
 mod review;
 mod run;
 mod shell;
@@ -65,8 +66,23 @@ fn main() -> ExitCode {
             from,
             max_iterations,
             review_cmd,
+            model,
+            review_model,
+            allow_default_model,
             json: _, // contract-compat no-op: run always streams NDJSON
-        } => cmd_run(&ws, workers, &agent_cmd, from, max_iterations, review_cmd),
+        } => cmd_run(
+            &ws,
+            workers,
+            &agent_cmd,
+            from,
+            max_iterations,
+            review_cmd,
+            RunModels {
+                model,
+                review_model,
+                allow_default_model,
+            },
+        ),
     };
     ExitCode::from(code)
 }
@@ -542,6 +558,7 @@ fn cmd_run(
     from: Option<String>,
     max_iterations: u32,
     review_cmd: Option<String>,
+    run_models: RunModels,
 ) -> u8 {
     // Validate the ledger up front for the friendly "run `sirius init` first"
     // message; workers open their OWN connections (rusqlite Connection is not
@@ -559,6 +576,34 @@ fn cmd_run(
     if let Some(rc) = review_cmd {
         cfg.review.cmd = Some(rc).filter(|c| !c.trim().is_empty());
     }
+    // SIRF-26: the fleet's model is explicit, visible, and never a silent
+    // inheritance of the global CLI default.
+    let parent = std::env::var("SIRIUS_PARENT_MODEL").ok();
+    let model_source = match models::resolve(
+        &mut cfg.models,
+        run_models.model.as_deref(),
+        run_models.review_model.as_deref(),
+        run_models.allow_default_model,
+        parent.as_deref(),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprint_err(&e);
+            return 2;
+        }
+    };
+    if let Err(e) = check_models(ws, &cfg, agent_cmd) {
+        eprint_err(&e);
+        return 2;
+    }
+    for m in models::named_models(&cfg.models) {
+        if models::looks_like_alias(&m) {
+            eprint_err(&format!(
+                "warning: model `{m}` looks like an ALIAS — aliases resolve silently (on 2026-10-03 `fable[1m]` became claude-fable-5); prefer an explicit id"
+            ));
+        }
+    }
+
     let spine = spine::Spine::new(&ws.root);
 
     // Workers run as REAL parallel threads. The old v1 loop ran them
@@ -674,6 +719,8 @@ fn cmd_run(
     let iterations = std::sync::atomic::AtomicU32::new(0);
     let any_failed = std::sync::atomic::AtomicBool::new(false);
     let ledger_path = ws.ledger_path();
+    // SIRF-26: one pause flag for the whole fleet (a usage limit stops all).
+    let pause: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
     let fleets: Vec<run::Fleet> = assignments
         .iter()
         .map(|(_, wt_path)| run::Fleet {
@@ -682,8 +729,26 @@ fn cmd_run(
             worktree: wt_path.clone(),
             sirius_dir: sirius_abs.clone(),
             review_prompt: review_prompt.clone(),
+            pause: pause.clone(),
         })
         .collect();
+    // Emitted once every launch check has passed — visible from the first event on (the claim events carry it per ticket).
+    StdoutLineWriter
+        .write_all(
+            format!(
+                "{}\n",
+                json!({
+                    "event": "fleet", "phase": "start",
+                    "models": {
+                        "default": cfg.models.default, "source": model_source,
+                        "review": models::review_model(&cfg.models),
+                        "fix_floor": cfg.models.fix_floor, "routes": cfg.models.routes,
+                    },
+                })
+            )
+            .as_bytes(),
+        )
+        .ok();
     std::thread::scope(|s| {
         for ((name, _), fleet) in assignments.iter().zip(&fleets) {
             s.spawn(|| {
@@ -709,7 +774,62 @@ fn cmd_run(
         let _ = repo_runner.run("git", &["worktree", "remove", "--force", &wt_str]);
     }
     let _ = std::fs::remove_file(&lock_path);
+    // Exit 4 = the fleet PAUSED on a usage limit (CONTRACTS §2): nothing is
+    // broken, so a wrapper can wait for the limit to reset and relaunch.
+    if let Some(reason) = fleets.first().and_then(run::Fleet::paused) {
+        StdoutLineWriter
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"event": "fleet", "phase": "paused", "reason": reason})
+                )
+                .as_bytes(),
+            )
+            .ok();
+        eprint_err(&format!(
+            "fleet PAUSED — an agent hit a usage limit: \"{reason}\". Unworked issues were left in todo; relaunch after the limit resets."
+        ));
+        return 4;
+    }
     u8::from(any_failed.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// `sirius run`'s model flags (SIRF-26).
+struct RunModels {
+    model: Option<String>,
+    review_model: Option<String>,
+    allow_default_model: bool,
+}
+
+/// Refuse a launch whose models are not explicit (SIRF-26): with no resolved
+/// worker model every un-routed agent silently inherits its CLI's default —
+/// the Lydgr incident. Name what it WOULD be, and require an explicit opt-in.
+fn check_models(ws: &Workspace, cfg: &Config, agent_cmd: &str) -> Result<(), String> {
+    let uses_placeholder = agent_cmd.contains("{model}")
+        || cfg
+            .review
+            .cmd
+            .as_deref()
+            .is_some_and(|c| c.contains("{model}"));
+    if cfg.models.default.is_some() {
+        return Ok(());
+    }
+    if uses_placeholder {
+        return Err("--agent-cmd / review.cmd use `{model}` but no model is set — pass --model <id> or set models.default".into());
+    }
+    if cfg.models.allow_default {
+        eprint_err("warning: no worker model set (--allow-default-model) — agents use their CLI's own default");
+        return Ok(());
+    }
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let would = match models::claude_default_model(&ws.root, home.as_deref()) {
+        Some((m, from)) => format!("`{m}` (from {from})"),
+        None => "the CLI's built-in default".into(),
+    };
+    Err(format!(
+        "no model set for the fleet — every Claude worker{} would silently run on {would}, the way the 2026-10-03 Lydgr fleet burned a weekly limit. Pass --model <exact id> (a launching Claude session: your OWN model id), set models.default in .sirius/config.json, or pass --allow-default-model to accept that default",
+        if cfg.review.cmd.is_some() { " and reviewer" } else { "" }
+    ))
 }
 
 /// The reviewer prompt template (SIRF-23): the BUILT-IN default unless a
@@ -797,6 +917,11 @@ fn worker_loop(
     let mut consecutive_errors = 0u32;
     let mut nowork_probes = 0u32;
     loop {
+        // SIRF-26: a usage limit anywhere in the fleet stops EVERY worker
+        // from claiming — the board is left as-is, not churned through.
+        if fleet.paused().is_some() {
+            break;
+        }
         // Reserve an iteration slot from the SHARED budget before claiming.
         if max_iterations > 0 && iterations.fetch_add(1, Ordering::SeqCst) >= max_iterations {
             break;
@@ -868,6 +993,7 @@ fn worker_loop(
                     cfg.backoff_delay_ms(consecutive_errors),
                 ));
             }
+            run::IterationOutcome::Paused(_) => break,
             _ => {
                 consecutive_overlaps = 0;
                 consecutive_errors = 0;
@@ -919,6 +1045,44 @@ mod tests {
             tree_names(3),
             vec!["sirius/oak", "sirius/rowan", "sirius/birch"]
         );
+    }
+
+    fn ws_at(dir: &std::path::Path) -> Workspace {
+        Workspace {
+            root: dir.to_path_buf(),
+            ametrite_db: None,
+            hayven_dir: None,
+        }
+    }
+
+    #[test]
+    fn launch_without_a_model_is_refused_and_names_the_inherited_default() {
+        // SIRF-26: never silently inherit the CLI's global default.
+        let dir = std::env::temp_dir().join(format!("sirius-models-launch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(
+            dir.join(".claude/settings.json"),
+            r#"{"model":"fable[1m]"}"#,
+        )
+        .unwrap();
+        let ws = ws_at(&dir);
+        let mut cfg = Config::default();
+        let e = check_models(&ws, &cfg, "claude -p go").unwrap_err();
+        assert!(e.contains("no model set") && e.contains("fable[1m]"), "{e}");
+        assert!(
+            e.contains("--model") && e.contains("--allow-default-model"),
+            "{e}"
+        );
+        // Explicitly allowed → proceeds.
+        cfg.models.allow_default = true;
+        assert!(check_models(&ws, &cfg, "claude -p go").is_ok());
+        // ...but never with a `{model}` placeholder it cannot fill.
+        assert!(check_models(&ws, &cfg, "x --model {model}").is_err());
+        // A resolved model → fine.
+        cfg.models.default = Some("claude-sonnet-5-5".into());
+        assert!(check_models(&ws, &cfg, "x --model {model}").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

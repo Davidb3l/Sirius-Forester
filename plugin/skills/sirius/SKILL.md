@@ -50,6 +50,17 @@ they want the foreman working the board on the current repo.
      without it the loop has nothing to run. `{issue}`/`{worker}` are filled in,
      and the agent also gets `SIRIUS_ISSUE`, `SIRIUS_WORKER`, `SIRIUS_WORKTREE`,
      `SIRIUS_PHASE` and `AMT_AGENT` in its environment.
+   - `--model <id>` — **always pass YOUR OWN exact model id** (the model you,
+     the launching session, are running as — e.g. `claude-opus-5-5`; never an
+     alias like `opus` or `fable[1m]`). Without it `sirius run` refuses: every
+     worker would silently inherit the global `~/.claude/settings.json` model
+     (on 2026-10-03 that put a whole fleet on a different, pricier model for
+     hours and burned the weekly limit). It is exported to agents as
+     `ANTHROPIC_MODEL`. Per-ticket routing by label lives in `.sirius/config.json`
+     `models.routes` (e.g. `security` → a heavier model); fix rounds of
+     un-routed tickets use `models.fix_floor`.
+   - `--review-model <id>` — the reviewer's model; prefer a DIFFERENT model
+     than the workers' so the review does not share the author's blind spots.
    - `--review-cmd '<command>'` (recommended) — a FRESH reviewer that checks each
      gated diff before it advances, e.g.
      `claude -p "$(cat "$SIRIUS_REVIEW_PROMPT")" --allowedTools "Bash(git diff:*)" "Bash(git log:*)" "Bash(git show:*)" "Bash(amt issue show:*)" Read Grep Glob`
@@ -69,7 +80,9 @@ they want the foreman working the board on the current repo.
    tail -f .suite/events/$(date -u +%F).jsonl
    ```
    The loop exits when a full round finds no claimable work. Exit codes: `0` ok,
-   `1` failure, `2` usage, `3` gate blocked.
+   `1` failure, `2` usage (incl. no model set), `3` gate blocked, `4` **paused**:
+   an agent hit a usage/plan limit, so every worker stopped claiming and the
+   unworked issues stay in `todo` — relaunch once the limit resets.
 4. **Read the receipts.** Every completed issue leaves a two-way receipt; spot
    check with `sirius why <symbol>` and `sirius why <ISSUE>` — both must answer.
 

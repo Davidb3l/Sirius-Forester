@@ -137,7 +137,14 @@ sirius gate AMT-7 [--tier safe] [--target-status in_review] [--range <git-range>
    # Selects affected tests over the changed files, then RUNS them via
    # gate.test_cmd (full suite on any doubt); verdict = the runner's exit code.
 
-sirius run --workers N --agent-cmd "<cmd>" [--from todo] [--review-cmd "<cmd>"] --json
+sirius run --workers N --agent-cmd "<cmd>" [--from todo] [--review-cmd "<cmd>"]
+           [--model <id>|inherit] [--review-model <id>|inherit] [--allow-default-model] --json
+   # first event: {"event":"fleet","phase":"start","models":{"default","source","review","fix_floor","routes"}}
+   # claim events carry "model" (this ticket's worker model) and "review_model"
+   # exit 2 when no worker model resolves (unless --allow-default-model / models.allow_default);
+   # exit 4 = PAUSED: an agent hit a usage/plan limit (its LAST output lines say so); every
+   # worker stopped claiming/spawning, unworked issues stay in todo. Last event:
+   # {"event":"fleet","phase":"paused","reason":str}; spine: fleet.paused (+ job.blocked)
    # streams NDJSON iteration events to stdout, one object per line:
    -> {"event":"iteration","worker":"sirius/oak","issue":"AMT-7","phase":"claim|map|lock|brief|work|gate|review|fix|receipt|release","...":...}
    # review (SIRF-23, only with review.cmd): {"phase":"review","round":N,"result":"clean|blocking|error|tampered|skipped","confirmed":K,"notes":M}
@@ -145,7 +152,7 @@ sirius run --workers N --agent-cmd "<cmd>" [--from todo] [--review-cmd "<cmd>"] 
    # release gains "review":"review: 2 rounds, 4 bugs fixed, 1 rebuttal accepted" when a review ran
 ```
 
-`--agent-cmd` and `--review-cmd` support `{issue}` / `{worker}` templating, and
+`--agent-cmd` and `--review-cmd` support `{issue}` / `{worker}` / `{model}` templating, and
 every agent/reviewer process gets this environment (SIRF-22 #4/#5, SIRF-23):
 
 | Var | Meaning |
@@ -154,6 +161,8 @@ every agent/reviewer process gets this environment (SIRF-22 #4/#5, SIRF-23):
 | `AMT_AGENT` | `sirius/<tree>` — the agent's own `amt` writes are attributed to the worker |
 | `SIRIUS_PHASE` | `work` \| `review` \| `fix` |
 | `SIRIUS_BASE` | the launch base commit |
+| `ANTHROPIC_MODEL`, `SIRIUS_MODEL` | (work, fix) this ticket's resolved worker model — Claude Code honors `ANTHROPIC_MODEL` over settings.json |
+| `ANTHROPIC_MODEL`, `SIRIUS_REVIEW_MODEL` | (review) the reviewer's model |
 | `SIRIUS_REVIEW_DIR`, `SIRIUS_DIFF_RANGE` | (review, fix) the tree to review, and `git diff $SIRIUS_DIFF_RANGE` |
 | `SIRIUS_ROUND` | (review, fix) 1-based round |
 | `SIRIUS_REVIEW_OUT`, `SIRIUS_REVIEW_PROMPT` | (review) where to write findings; the rendered prompt |
@@ -180,6 +189,13 @@ other stdout formats.
   "retry_budget": 3,
   "worker_concurrency": 3,
   "claim_mode": "adaptive",                // "always" | "never" | "adaptive"
+  "models": {                              // SIRF-26 — resolution: flag > config > $SIRIUS_PARENT_MODEL
+    "default": null,                       // worker model when no route matches (--model)
+    "routes": [],                          // [{"labels": ["security","auth"], "model": "<id>"}], first match wins
+    "fix_floor": null,                     // fix rounds of UN-routed tickets use this model
+    "review": null,                        // reviewer model (--review-model); default: models.default
+    "allow_default": false                 // launch with no model at all (--allow-default-model)
+  },
   "review": {                              // SIRF-23 — see §3.1
     "cmd": null,                           // or --review-cmd; null = stage off (pre-review loop exactly)
     "prompt_file": ".sirius/review-prompt.md", // an OVERRIDE; absent = the built-in default

@@ -233,6 +233,10 @@ pub struct Config {
     /// SIRF-23: the fresh-eyes review stage. Off unless `review.cmd` is set.
     #[serde(default)]
     pub review: ReviewConfig,
+    /// SIRF-26: which model each agent / reviewer runs on. `sirius run`
+    /// refuses to launch with no worker model unless explicitly allowed.
+    #[serde(default)]
+    pub models: crate::models::ModelsConfig,
 }
 
 fn default_true() -> bool {
@@ -276,6 +280,7 @@ impl Default for Config {
             agent_timeout_secs: default_agent_timeout_secs(),
             lease_ttl_secs: default_lease_ttl_secs(),
             review: ReviewConfig::default(),
+            models: crate::models::ModelsConfig::default(),
         }
     }
 }
