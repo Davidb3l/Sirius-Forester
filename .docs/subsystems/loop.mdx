@@ -44,6 +44,12 @@ Every agent and reviewer process gets `SIRIUS_ISSUE`, `SIRIUS_WORKER`, `SIRIUS_W
 
 The WORK⇄GATE loop is a reusable closure (`run_work_gate`) returning `WorkGate::Done { work_ok, gate_result, exit, log, timed_out }` or `WorkGate::Exit(outcome)` for terminal paths that already did their bookkeeping (lease lost, a WORK agent killed by the timeout). Review fix rounds reuse it with `SIRIUS_PHASE=fix`, so they get the same heartbeat, timeout, log capture, baseline diff, and retry budget. When the agent fails, the release comment names it ("agent exited 1 (see .sirius/logs/…)") rather than blaming the gate.
 
+## Models and the usage-limit pause (SIRF-26)
+
+`cmd_run` resolves the fleet's models once (`models::resolve`: `--model` > `models.default` > `$SIRIUS_PARENT_MODEL`; `--review-model` > `models.review` > the worker model) and **refuses to launch** (exit 2) with no worker model unless `--allow-default-model` — naming the model every Claude worker would otherwise silently inherit from `.claude/settings*.json` (`check_models`). It emits a `fleet start` NDJSON event with the resolved models. Per iteration, the claimed issue's Ametrite `labels` pick the worker model (`models::model_for`: first matching `models.routes` entry; fix rounds of un-routed tickets use `models.fix_floor`), and it is injected as `ANTHROPIC_MODEL` + `SIRIUS_MODEL` (reviewer: `ANTHROPIC_MODEL` + `SIRIUS_REVIEW_MODEL`) and the `{model}` placeholder; claim events carry `model` / `review_model`.
+
+All workers share `Fleet.pause`. When a FAILED agent or reviewer's last output lines carry a plan/usage-limit message (`models::usage_limit_in`), the fleet pauses: a work-phase hit returns the issue to `todo` untouched (`usage_paused`: no deadend, `fleet.paused` + `job.blocked`), a fix-round hit reverts to the last reviewed checkpoint and escalates, a reviewer hit is not retried; every worker re-checks the pause before each claim and each spawn. `sirius run` then exits **4** after a `{"event":"fleet","phase":"paused"}` event. Agent logs live under the fleet's absolute `.sirius/logs`.
+
 ## Review ⇄ fix (SIRF-23)
 
 With `review.cmd` set (or `--review-cmd`), work that passes the gate in a fleet worktree goes through `run_review_stage` (the pure contracts live in `src/review.rs`):

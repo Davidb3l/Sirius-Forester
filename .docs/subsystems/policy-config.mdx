@@ -38,6 +38,11 @@ createdBy: "claude-code"
 | `gate.test_cmd` | *unset* | full-suite command, run via `sh -c`. Unset ⇒ fail-closed |
 | `gate.fallback` | `full-suite` | `fail` / `pass-with-warning` also available |
 | `agent_timeout_secs` | `1800` | hard wall-clock cap on one agent run |
+| `models.default` | *unset* | the workers' model (`--model`; `inherit` = `$SIRIUS_PARENT_MODEL`). Unset ⇒ `sirius run` refuses unless `models.allow_default` / `--allow-default-model` |
+| `models.routes` | `[]` | `[{"labels": [...], "model": "<id>"}]` — per-ticket routing by Ametrite label, first match wins |
+| `models.fix_floor` | *unset* | fix rounds of UN-routed tickets use this model |
+| `models.review` | *unset* | the reviewer's model (`--review-model`); falls back to `models.default` |
+| `models.allow_default` | `false` | allow launching with no model (agents then use their CLI's default) |
 | `review.cmd` | *unset* | the fresh-eyes reviewer (SIRF-23); unset ⇒ no review stage. `--review-cmd` overrides it |
 | `review.prompt_file` | `.sirius/review-prompt.md` | an OVERRIDE for the built-in reviewer prompt (rendered per round); absent ⇒ the built-in default, which improves with each release |
 | `review.max_rounds` | `3` | review runs per issue (fix rounds = max_rounds − 1) |
