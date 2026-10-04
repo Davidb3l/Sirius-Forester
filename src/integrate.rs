@@ -97,6 +97,32 @@ pub struct Report {
     pub red: bool,
 }
 
+/// How a run reads to the outside — the spine event, the exit code, and the
+/// human verdict. The exit code follows the LINE: 3 while red, whatever the
+/// command did (CONTRACTS §2).
+pub fn verdict(r: &Report) -> (&'static str, u8, &'static str) {
+    let exit = if r.red { 3 } else { 0 };
+    match (r.ran, r.ok, r.red) {
+        (false, _, true) => (
+            "integration.built",
+            exit,
+            "frontier built (no integration.cmd) — still RED",
+        ),
+        (false, _, false) => (
+            "integration.built",
+            exit,
+            "frontier built (no integration.cmd)",
+        ),
+        (true, false, _) => ("integration.failed", exit, "RED"),
+        (true, true, true) => (
+            "integration.partial",
+            exit,
+            "passed over a PARTIAL discovery — still RED",
+        ),
+        (true, true, false) => ("integration.passed", exit, "GREEN"),
+    }
+}
+
 fn is_closed(status: &str) -> bool {
     matches!(status, "done" | "canceled" | "cancelled")
 }
@@ -138,9 +164,17 @@ impl Lock {
                                 ))
                             }
                             _ => {
-                                // Dead holder: remove it only if unchanged.
-                                if std::fs::read_to_string(&path).unwrap_or_default() == holder {
-                                    let _ = std::fs::remove_file(&path);
+                                // Dead holder: take it over by RENAMING it
+                                // away (atomic — only one taker wins), then
+                                // put it back if it changed underneath us.
+                                let grave = path.with_extension(format!("dead.{pid}"));
+                                if std::fs::rename(&path, &grave).is_ok() {
+                                    let moved = std::fs::read_to_string(&grave).unwrap_or_default();
+                                    if moved != holder {
+                                        // A live taker's lock: restore it.
+                                        let _ = std::fs::hard_link(&grave, &path);
+                                    }
+                                    let _ = std::fs::remove_file(&grave);
                                 }
                             }
                         }
@@ -716,6 +750,48 @@ mod tests {
             .iter()
             .any(|c| c.contains("issue comment AMT-90") && c.contains("BY HAND")));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_exit_code_and_event_follow_the_line() {
+        let r = |ran, ok, red| Report {
+            ok,
+            base_ref: "main".into(),
+            frontier: "f".into(),
+            included: vec![],
+            left_out: vec![],
+            complete: true,
+            ran,
+            exit: None,
+            timed_out: false,
+            log: None,
+            issue: None,
+            red,
+        };
+        assert_eq!(verdict(&r(true, true, false)).0, "integration.passed");
+        assert_eq!(verdict(&r(true, true, false)).1, 0);
+        assert_eq!(
+            verdict(&r(true, true, true)),
+            (
+                "integration.partial",
+                3,
+                "passed over a PARTIAL discovery — still RED"
+            )
+        );
+        assert_eq!(verdict(&r(true, false, true)).1, 3);
+        assert_eq!(
+            verdict(&r(false, true, true)).1,
+            3,
+            "untested while red is still red"
+        );
+        assert_eq!(
+            verdict(&r(false, true, false)),
+            (
+                "integration.built",
+                0,
+                "frontier built (no integration.cmd)"
+            )
+        );
     }
 
     #[test]

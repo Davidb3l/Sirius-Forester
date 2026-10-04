@@ -32,7 +32,7 @@ Parallel fleet workers each hold their own connection; WAL plus a 5-second `busy
 
 | Table | Holds |
 |---|---|
-| `meta` | `schema_version`, `created_at`, `sirius_version`; plus `integration_red` (JSON `{at, frontier, issue}`) while `sirius integrate` is red, and `held:<ISSUE>` (the commit a red frontier held back, consumed on re-claim) (SIRF-32) |
+| `meta` | `schema_version`, `created_at`, `sirius_version`; plus `integration_red` (JSON `{at, frontier, issue}`) while `sirius integrate` is red (SIRF-32) |
 | `workers` | one row per worker id (`sirius/oak`), with `status` and `last_seen_at` |
 | `iterations` | one row per loop pass: issue, entities, outcome, gate result, oracle verdicts, tokens, duration, receipt |
 | `receipts` | provenance stamps — `kind` (`issue`/`decision`), `ref`, `symbols`, `forward_ok`, `reverse_ok` |

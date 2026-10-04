@@ -422,7 +422,12 @@ pub fn run_with_plugins_dir(
 /// `--model` / `--allow-default-model`.
 pub fn models_check(ws: &Workspace) -> Check {
     const NAME: &str = "fleet_models";
-    let mut cfg = crate::config::Config::load(&ws.config_path()).unwrap_or_default();
+    // An invalid config is reported as such — never masked by defaults
+    // (every other command refuses it).
+    let mut cfg = match crate::config::Config::load(&ws.config_path()) {
+        Ok(c) => c,
+        Err(e) => return Check::advisory(NAME, false, e),
+    };
     // Normalize exactly as `sirius run` does (no flags), then validate — a
     // config `run` would refuse must not pass here.
     if let Err(e) = crate::models::resolve(&mut cfg.models, None, None, false, None)
@@ -492,6 +497,30 @@ mod tests {
             ametrite_db: None,
             hayven_dir: None,
         }
+    }
+
+    #[test]
+    fn an_invalid_config_is_reported_not_masked() {
+        let dir = std::env::temp_dir().join(format!("sirius-doctor-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".sirius")).unwrap();
+        std::fs::write(
+            dir.join(".sirius/config.json"),
+            r#"{"review":{"sequences":[{"dir":"m","key":"^\\d+"}]}}"#,
+        )
+        .unwrap();
+        let ws = Workspace {
+            root: dir.clone(),
+            ametrite_db: None,
+            hayven_dir: None,
+        };
+        let c = models_check(&ws);
+        assert!(
+            !c.pass && c.detail.contains("capture group"),
+            "{}",
+            c.detail
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

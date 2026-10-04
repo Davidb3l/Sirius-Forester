@@ -533,9 +533,12 @@ pub fn sequence_findings(
         ));
     }
     let dir = norm_dir(&spec.dir);
+    // OURS by NAME: editing an entry that already exists (a typo fix, a
+    // Diesel up.sql touch-up) is not taking a new slot.
+    let named = |set: &[Entry], e: &Entry| set.iter().any(|x| x.name == e.name);
     let added = ours
         .iter()
-        .filter(|e| !launch.contains(e) && !current.contains(e));
+        .filter(|e| !named(launch, e) && !named(current, e));
     let cur_keys = keyed(&re, current);
     let mut out = Vec::new();
     for (mine, k) in keyed(&re, added) {
@@ -567,9 +570,7 @@ pub fn sequence_findings(
         for (issue, entries) in sibs {
             // The same entry (same name AND content — e.g. the sibling's
             // work merged in) is not a collision; a same-named rewrite is.
-            let theirs = entries
-                .iter()
-                .filter(|e| !current.contains(e) && *e != mine);
+            let theirs = entries.iter().filter(|e| !named(current, e) && *e != mine);
             if let Some((s, _)) = keyed(&re, theirs)
                 .into_iter()
                 .find(|(_, sk)| cmp_keys(sk, &k) == Ordering::Equal)
@@ -750,6 +751,22 @@ mod tests {
         )
         .unwrap();
         assert!(same.is_empty(), "{same:?}");
+    }
+
+    #[test]
+    fn editing_an_existing_entry_is_not_a_collision() {
+        // Verification V2: a typo fix in 0001_a (new content, same name).
+        let mut ours = v(&["0001_a", "0002_b"]);
+        ours[0].oid = "edited".into();
+        let f = sequence_findings(
+            &spec("m"),
+            &v(&["0001_a", "0002_b"]),
+            &ours,
+            &v(&["0001_a", "0002_b"]),
+            &[],
+        )
+        .unwrap();
+        assert!(f.is_empty(), "{f:?}");
     }
 
     #[test]

@@ -758,7 +758,7 @@ pub fn run_iteration(
     // SIRF-32: work a red frontier held back is RESUMED, not redone: merge
     // the exact held commit (if its branch still points there) onto the base.
     let resumed: Option<String> = match isolate_base {
-        Some(_) => resume_held(amt, ledger, runner, &issue, worker),
+        Some(_) => resume_held(amt, runner, &issue, worker),
         None => None,
     };
 
@@ -1587,7 +1587,7 @@ pub fn run_iteration(
     // worktree, completed-on-the-board but existing nowhere. Auto-commit
     // whatever is uncommitted, then stamp the per-issue branch (branch -f is
     // safe: detached worktrees never hold the branch checked out).
-    let mut held_stamped = false;
+    let mut held_marked = false;
     if (advanced || (gated && integration_hold.is_some())) && isolate_base.is_some() {
         let _ = crate::gitrange::run_git(runner, &["add", "-A"]);
         // May legitimately fail with "nothing to commit" when the agent
@@ -1608,17 +1608,23 @@ pub fn run_iteration(
         } else {
             Err("worktree still dirty after auto-commit (missing git identity?)".to_string())
         };
+        let held_ref = held_ref(&issue);
         match &stamp {
-            // SIRF-32: held work is resumed when the issue is re-claimed —
-            // remember exactly which commit was held.
+            // SIRF-32: held work is resumed when the issue is re-claimed. The
+            // ref both marks it and keeps its commits reachable, whatever
+            // later happens to the issue branch.
             Ok(()) if !advanced => {
-                if let Ok(sha) = crate::gitrange::head_rev(runner) {
-                    ledger_warn("set_meta", ledger.set_meta(&held_key(&issue), Some(&sha)));
-                }
+                held_marked =
+                    crate::gitrange::run_git(runner, &["update-ref", &held_ref, "HEAD"]).is_ok();
+            }
+            // Completed work that resumed the held commit contains it: the
+            // marker has done its job. (Removed only now — an iteration that
+            // ends earlier keeps it for the next claim.)
+            Ok(()) if resumed.is_some() => {
+                let _ = crate::gitrange::run_git(runner, &["update-ref", "-d", &held_ref]);
             }
             _ => {}
         }
-        held_stamped = stamp.is_ok();
         if let Err(e) = stamp {
             // Without the branch the commits die with the worktree — do NOT
             // report completion over work that is about to vanish.
@@ -1638,13 +1644,13 @@ pub fn run_iteration(
     let held_back = if advanced {
         None
     } else if let (true, Some(why)) = (gated, &integration_hold) {
-        Some(if held_stamped {
+        Some(if held_marked {
             format!(
-                "sirius: released without advancing — {why}; the gated work is held on sirius/{} and is resumed when the issue is claimed again",
-                issue.to_lowercase()
+                "sirius: released without advancing — {why}; the gated work is held at {} and is resumed when the issue is claimed again",
+                held_ref(&issue)
             )
         } else {
-            format!("sirius: released without advancing — {why}; preserving the gated work FAILED (see the comment above)")
+            format!("sirius: released without advancing — {why}; holding the gated work FAILED — it will be redone")
         })
     } else if let ReviewStage::Release { why, .. } = &review {
         Some(format!(
@@ -1951,50 +1957,58 @@ fn worktree_admin<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-/// The ledger meta key remembering the commit held for `issue` (SIRF-32).
-fn held_key(issue: &str) -> String {
-    format!("held:{issue}")
+/// The ref holding the work a red frontier held back for `issue` (SIRF-32).
+fn held_ref(issue: &str) -> String {
+    format!("refs/sirius/held/{}", issue.to_lowercase())
 }
 
 /// Merge the work a red frontier held for `issue` into the freshly reset
-/// worktree. Only the exact held commit, only while `sirius/<issue>` still
-/// points at it; a conflict with the moved base starts fresh (the branch
-/// keeps the work). The held marker is consumed either way.
-fn resume_held(
-    amt: &Amt,
-    ledger: &Ledger,
-    runner: &dyn Runner,
-    issue: &str,
-    worker: &str,
-) -> Option<String> {
-    let key = held_key(issue);
-    let sha = ledger.meta(&key).ok().flatten()?;
-    ledger_warn("set_meta", ledger.set_meta(&key, None));
-    let branch = format!("sirius/{}", issue.to_lowercase());
-    let tip = crate::gitrange::run_git(
-        runner,
-        &["rev-parse", "--verify", &format!("{branch}^{{commit}}")],
-    )
-    .ok()?;
-    if tip.stdout.trim() != sha {
-        return None; // the branch moved on — not ours to resume
+/// worktree (a REAL merge in the issue's history: the repo's identity and
+/// hooks). The held ref is NOT consumed here — it is removed only once the
+/// resumed work is stamped, so an iteration that ends early resumes again
+/// next time. Held work already on the base is dropped; work that no longer
+/// merges is parked at `refs/sirius/held-conflicted/<issue>` (kept, not
+/// retried) and the issue starts fresh.
+fn resume_held(amt: &Amt, runner: &dyn Runner, issue: &str, worker: &str) -> Option<String> {
+    let held = held_ref(issue);
+    let sha = crate::gitrange::run_git(runner, &["show-ref", "--verify", "--hash", &held])
+        .ok()
+        .map(|o| o.stdout.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    let landed = crate::gitrange::run_git(runner, &["merge-base", "--is-ancestor", &sha, "HEAD"]);
+    if landed.is_ok() {
+        let _ = crate::gitrange::run_git(runner, &["update-ref", "-d", &held]);
+        return None; // already on the base — nothing to resume
     }
-    let mut args: Vec<&str> = crate::frontier::THROWAWAY_MERGE_CONFIG.to_vec();
-    args.extend(["merge", "--no-verify", "--no-edit", &sha]);
-    if crate::gitrange::run_git(runner, &args).is_ok() {
+    if crate::gitrange::run_git(runner, &["merge", "--no-edit", &sha]).is_ok() {
         let _ = amt.comment_as(
             issue,
-            &format!("sirius: resuming the work held on {branch} ({sha})"),
+            &format!("sirius: resuming the work held at {held} ({sha})"),
             worker,
         );
         return Some(sha);
     }
+    let conflicted = crate::gitrange::run_git(runner, &["diff", "--name-only", "--diff-filter=U"])
+        .map(|o| !o.stdout.trim().is_empty())
+        .unwrap_or(false);
     let _ = crate::gitrange::run_git(runner, &["merge", "--abort"]);
-    let _ = amt.comment_as(
-        issue,
-        &format!("sirius: the work held on {branch} ({sha}) no longer merges onto the base — starting fresh; the held commits stay on that branch"),
-        worker,
-    );
+    let _ = crate::gitrange::run_git(runner, &["reset", "-q", "--hard", "HEAD"]);
+    if conflicted {
+        let parked = format!("refs/sirius/held-conflicted/{}", issue.to_lowercase());
+        let _ = crate::gitrange::run_git(runner, &["update-ref", &parked, &sha]);
+        let _ = crate::gitrange::run_git(runner, &["update-ref", "-d", &held]);
+        let _ = amt.comment_as(
+            issue,
+            &format!("sirius: the held work ({sha}) no longer merges onto the base — starting fresh; the held commits are kept at {parked}"),
+            worker,
+        );
+    } else {
+        let _ = amt.comment_as(
+            issue,
+            &format!("sirius: could not merge the held work ({sha}) — starting fresh this time; it stays at {held} and is retried on the next claim"),
+            worker,
+        );
+    }
     None
 }
 
@@ -5598,7 +5612,6 @@ mod tests {
         // its branch and released to todo naming the red run.
         let m = MockRunner::new();
         program_review_iteration(&m, "AMT-88");
-        m.expect(&["git", "rev-parse", "HEAD"], 0, "heldsha\n");
         let mut c = review_cfg(3);
         c.integration.on_fail = crate::config::IntegrationOnFail::Block;
         let amt = Amt::new(&m);
@@ -5642,10 +5655,10 @@ mod tests {
             release.contains("--status todo") && release.contains("integration red at f1 (AMT-90)"),
             "{release}"
         );
-        assert_eq!(
-            led.meta("held:AMT-88").unwrap().as_deref(),
-            Some("heldsha"),
-            "the held commit is remembered for the re-claim"
+        assert!(
+            rec.iter()
+                .any(|c| c == "git update-ref refs/sirius/held/amt-88 HEAD"),
+            "the held commit is kept and marked for the re-claim: {rec:?}"
         );
         assert!(
             release.contains("resumed when the issue is claimed again"),
@@ -5653,28 +5666,32 @@ mod tests {
         );
     }
 
-    #[test]
-    fn held_work_is_resumed_on_reclaim() {
-        // SIRF-32 review N4: not redone from scratch, and not clobbered.
-        let m = MockRunner::new();
-        program_review_iteration(&m, "AMT-91");
+    /// A held commit for `issue` (lowercase ref) that is NOT on the base yet.
+    fn program_held(m: &MockRunner, key: &str) {
         m.expect(
-            &["git", "rev-parse", "--verify", "sirius/amt-91^{commit}"],
+            &[
+                "git",
+                "show-ref",
+                "--verify",
+                "--hash",
+                &format!("refs/sirius/held/{key}"),
+            ],
             0,
             "heldsha\n",
         );
+        m.expect(&["git", "merge-base", "--is-ancestor", "heldsha"], 1, "");
+    }
+
+    fn iterate(m: &MockRunner, c: &Config) -> Vec<String> {
+        let (amt, hv, fleet) = (Amt::new(m), Hayven::new(m), test_fleet("base999"));
         let led = Ledger::open_in_memory().unwrap();
-        led.set_meta("held:AMT-91", Some("heldsha")).unwrap();
-        let amt = Amt::new(&m);
-        let hv = Hayven::new(&m);
-        let fleet = test_fleet("base999");
         let mut out = Vec::new();
         run_iteration(
             &amt,
             &hv,
             &led,
-            &cfg(),
-            &m,
+            c,
+            m,
             "sirius/oak",
             Some("todo"),
             "true",
@@ -5682,10 +5699,17 @@ mod tests {
             None,
             Some(&fleet),
         );
-        let rec = m.recorded();
-        let merge = rec
-            .iter()
-            .position(|c| c.contains(" merge ") && c.ends_with("heldsha"));
+        m.recorded()
+    }
+
+    #[test]
+    fn held_work_is_resumed_on_reclaim_and_released_once_stamped() {
+        // SIRF-32 review N4: not redone from scratch, and not clobbered.
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-91");
+        program_held(&m, "amt-91");
+        let rec = iterate(&m, &cfg());
+        let merge = rec.iter().position(|c| c == "git merge --no-edit heldsha");
         let agent = rec.iter().position(|c| c.starts_with("sh -c"));
         assert!(
             merge.is_some() && merge < agent,
@@ -5695,41 +5719,129 @@ mod tests {
             env_of(&m.agent_envs()[0], "SIRIUS_RESUMED_FROM").as_deref(),
             Some("heldsha")
         );
-        assert_eq!(
-            led.meta("held:AMT-91").unwrap(),
-            None,
-            "the marker is consumed"
+        assert!(
+            rec.iter()
+                .any(|c| c == "git update-ref -d refs/sirius/held/amt-91"),
+            "stamped work contains the held commit: the marker is done"
         );
     }
 
     #[test]
-    fn a_moved_held_branch_is_not_resumed() {
+    fn a_resumed_iteration_that_ends_early_keeps_the_held_marker() {
+        // Verification V1: the marker is consumed only by a successful stamp.
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-95");
+        program_held(&m, "amt-95");
+        m.expect(&["git", "diff", "--name-only", "base999"], 0, "src/x.rs\n");
+        m.expect(&["sh", "-c", "run-suite"], 1, "test result: FAILED");
+        let mut c = cfg();
+        c.retry_budget = 1;
+        let rec = iterate(&m, &c);
+        assert!(
+            rec.iter().any(|c| c == "git merge --no-edit heldsha"),
+            "{rec:?}"
+        );
+        assert!(
+            !rec.iter()
+                .any(|c| c.starts_with("git update-ref -d refs/sirius/held/")),
+            "a failed gate must not drop the held work: {rec:?}"
+        );
+    }
+
+    #[test]
+    fn held_work_already_on_the_base_is_dropped_not_merged() {
         let m = MockRunner::new();
         program_review_iteration(&m, "AMT-92");
         m.expect(
-            &["git", "rev-parse", "--verify", "sirius/amt-92^{commit}"],
+            &[
+                "git",
+                "show-ref",
+                "--verify",
+                "--hash",
+                "refs/sirius/held/amt-92",
+            ],
             0,
-            "someoneelse\n",
+            "heldsha\n",
         );
-        let led = Ledger::open_in_memory().unwrap();
-        led.set_meta("held:AMT-92", Some("heldsha")).unwrap();
-        let (amt, hv, fleet) = (Amt::new(&m), Hayven::new(&m), test_fleet("base999"));
-        let mut out = Vec::new();
-        run_iteration(
-            &amt,
-            &hv,
-            &led,
-            &cfg(),
-            &m,
-            "sirius/oak",
-            Some("todo"),
-            "true",
-            &mut out,
-            None,
-            Some(&fleet),
-        );
-        assert!(!m.recorded().iter().any(|c| c.ends_with("heldsha")));
+        let rec = iterate(&m, &cfg());
+        assert!(!rec.iter().any(|c| c == "git merge --no-edit heldsha"));
+        assert!(rec
+            .iter()
+            .any(|c| c == "git update-ref -d refs/sirius/held/amt-92"));
         assert_eq!(env_of(&m.agent_envs()[0], "SIRIUS_RESUMED_FROM"), None);
+    }
+
+    #[test]
+    fn sequence_checks_cover_siblings_past_the_merge_cap() {
+        // Verification N3/V9: 13 in-flight siblings; the 13th (newest, NOT
+        // merged into the review tree) holds the colliding slot.
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-96");
+        checkpoint_heads(&m, &["ck1"]);
+        let refs: String = (1..=13)
+            .map(|n| format!("sirius/amt-{n}\tsib{n}\n"))
+            .collect();
+        let list: Vec<String> = (1..=13)
+            .map(|n| format!(r#"{{"id":"AMT-{n}","title":"t{n}"}}"#))
+            .collect();
+        m.expect(&["git", "for-each-ref"], 0, &refs);
+        m.expect(
+            &["amt", "--json", "issue", "list", "--status", "in_review"],
+            0,
+            &format!("[{}]", list.join(",")),
+        );
+        m.expect(
+            &["git", "ls-tree", "-z", "sib13"],
+            0,
+            &ls_tree_z("m/0001_a\nm/0002_theirs\n"),
+        );
+        m.expect(
+            &["git", "ls-tree", "-z", "ck1"],
+            0,
+            &ls_tree_z("m/0001_a\nm/0002_mine\n"),
+        );
+        for _ in 0..2 {
+            m.expect(
+                &["git", "ls-tree", "-z", "base999"],
+                0,
+                &ls_tree_z("m/0001_a\n"),
+            );
+        }
+        let fleet = test_fleet("base999");
+        let t = fleet.sirius_dir.join("worktrees").join("sirius_oak-review");
+        m.expect(
+            &["git", "-C", &t.to_string_lossy(), "rev-parse", "HEAD"],
+            0,
+            "front1\n",
+        );
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+        let mut c = review_cfg(1);
+        c.review.against = crate::config::ReviewAgainst::Frontier;
+        c.review.sequences = vec![crate::config::SequenceSpec {
+            dir: "m".into(),
+            key: r"^(\d+)".into(),
+        }];
+        let (_o, led, _nd) = run_fleet_at(&m, &c, &fleet);
+        let rounds = led.review_rounds_for_issue("AMT-96").unwrap();
+        assert_eq!(rounds[0].result, "blocking");
+        assert!(
+            rounds[0].findings.contains("in-flight AMT-13"),
+            "{}",
+            rounds[0].findings
+        );
+        assert!(
+            !m.recorded()
+                .iter()
+                .any(|c| c.contains(" merge ") && c.ends_with("sib13")),
+            "13th not merged"
+        );
+        let prompt =
+            std::fs::read_to_string(env_of(&m.agent_envs()[1], "SIRIUS_REVIEW_PROMPT").unwrap())
+                .unwrap();
+        assert!(
+            prompt.contains("1 newer in-flight issue(s) not merged"),
+            "{prompt}"
+        );
     }
 
     #[test]

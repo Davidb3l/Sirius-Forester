@@ -250,10 +250,13 @@ other stdout formats.
     "on_fail": "warn",                     // | "block": while red, `sirius run` refuses to start (exit 3),
                                            //   a running fleet stops claiming (paused, exit 4), and gated
                                            //   work is HELD: no review, no receipt, preserved on its
-                                           //   sirius/<issue> branch, released to todo (outcome released),
-                                           //   and RESUMED on re-claim (merged onto the fresh worktree
-                                           //   while the branch still points at the held commit;
-                                           //   agent env SIRIUS_RESUMED_FROM=<sha>)
+                                           //   sirius/<issue> branch AND refs/sirius/held/<issue>, released
+                                           //   to todo (outcome released), and RESUMED on re-claim: merged
+                                           //   onto the fresh worktree (repo identity + hooks), agent env
+                                           //   SIRIUS_RESUMED_FROM=<sha>. The held ref is removed only once
+                                           //   the resumed work is stamped; held work already on the base
+                                           //   is dropped; work that no longer merges is parked at
+                                           //   refs/sirius/held-conflicted/<issue> and the issue starts fresh
     "timeout_secs": 1800
   }
 }

@@ -226,11 +226,16 @@ fn kill_descendants(pid: u32) {
     if cfg!(windows) {
         return;
     }
+    // Freeze the root BEFORE the snapshot, so it cannot fork its next
+    // command between the snapshot and the kill (`a; b`: b would escape).
+    let _ = Command::new("kill")
+        .args(["-STOP", &pid.to_string()])
+        .output();
     let Ok(out) = Command::new("ps")
         .args(["-A", "-o", "pid=", "-o", "ppid="])
         .output()
     else {
-        return;
+        return; // the caller's child.kill() still ends the (stopped) root
     };
     let pairs: Vec<(u32, u32)> = String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -239,11 +244,6 @@ fn kill_descendants(pid: u32) {
             Some((it.next()??, it.next()??))
         })
         .collect();
-    // Freeze the root first so it cannot fork its next command between the
-    // snapshot and the kill (`a; b`: b would escape).
-    let _ = Command::new("kill")
-        .args(["-STOP", &pid.to_string()])
-        .output();
     let mut tree = vec![pid];
     let mut i = 0;
     while i < tree.len() {

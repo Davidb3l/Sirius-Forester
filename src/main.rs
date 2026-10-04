@@ -598,13 +598,9 @@ fn cmd_integrate(ws: &Workspace, runner: &RealRunner, clear_red: bool, json: boo
             if let Some(i) = &r.issue {
                 refs.push(spine::issue_ref(i));
             }
+            let (event, exit, label) = integrate::verdict(&r);
             spine::Spine::new(&ws.root).emit(
-                match (r.ran, r.ok, r.red) {
-                    (false, _, _) => "integration.built",
-                    (true, false, _) => "integration.failed",
-                    (true, true, true) => "integration.partial",
-                    (true, true, false) => "integration.passed",
-                },
+                event,
                 refs,
                 json!({ "frontier": r.frontier.clone(), "included": r.included.clone(), "exit": r.exit }),
             );
@@ -613,13 +609,7 @@ fn cmd_integrate(ws: &Workspace, runner: &RealRunner, clear_red: bool, json: boo
             } else {
                 println!(
                     "integration {} at {} ({} + {}){}{}",
-                    match (r.ran, r.ok, r.red) {
-                        (false, _, true) => "frontier built (no integration.cmd) — still RED",
-                        (false, _, false) => "frontier built (no integration.cmd)",
-                        (true, false, _) => "RED",
-                        (true, true, true) => "passed over a PARTIAL discovery — still RED",
-                        (true, true, false) => "GREEN",
-                    },
+                    label,
                     r.frontier,
                     r.base_ref,
                     if r.included.is_empty() {
@@ -637,13 +627,7 @@ fn cmd_integrate(ws: &Workspace, runner: &RealRunner, clear_red: bool, json: boo
                         .unwrap_or_default()
                 );
             }
-            // The exit code follows the LINE: red (however it got there)
-            // is the soft "blocked" 3 per CONTRACTS §2.
-            if r.red {
-                3
-            } else {
-                0
-            }
+            exit
         }
         Err(e) => {
             eprint_err(&e);
