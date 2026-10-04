@@ -658,6 +658,13 @@ fn cmd_escape(ws: &Workspace, runner: &RealRunner, a: EscapeArgs, json: bool) ->
         if a.issue.is_some() || a.message.is_some() {
             return usage("--automated-by retires a kind; pass only --kind and --automated-by");
         }
+        // The check must exist: retiring a kind on a typo'd path would hide
+        // it from every review with nothing catching it.
+        if by.trim().is_empty() || !ws.root.join(by).exists() {
+            return usage(&format!(
+                "--automated-by `{by}` is not a file or directory in this repo"
+            ));
+        }
         if let Err(e) = ledger.set_kind_automated(kind, by) {
             eprint_err(&format!("cannot record: {e}"));
             return 1;
@@ -681,6 +688,19 @@ fn cmd_escape(ws: &Workspace, runner: &RealRunner, a: EscapeArgs, json: bool) ->
     if !regex_is_issue(issue) {
         return usage(&format!("`{issue}` is not an issue key (PREFIX-n)"));
     }
+    if message.trim().is_empty() {
+        return usage("-m must say what escaped");
+    }
+    // The issue must exist; store its canonical key (why/list match exactly).
+    let amt = Amt::new(runner);
+    let issue = match amt.issue_show(issue) {
+        Ok(v) => v["id"].as_str().unwrap_or(issue).to_string(),
+        Err(e) => {
+            eprint_err(&format!("no such issue `{issue}`: {e}"));
+            return 1;
+        }
+    };
+    let issue = issue.as_str();
     // A fix commit must resolve NOW — it is what a canary will revert.
     let fix = match a.fix.as_deref() {
         Some(f) => match gitrange::run_git(
@@ -709,16 +729,28 @@ fn cmd_escape(ws: &Workspace, runner: &RealRunner, a: EscapeArgs, json: bool) ->
         .iter()
         .filter(|e| e.kind == kind)
         .count();
-    let automated = ledger
+    // A kind that escapes AGAIN after it was automated: its check missed
+    // this one. Un-retire it — it goes back into every review prompt.
+    let unretired = ledger
         .automated_kinds()
         .unwrap_or_default()
         .into_iter()
         .find(|(k, _)| k == kind)
         .map(|(_, b)| b);
-    let nudge = escape::nudge(kind, kind_count, automated.is_some());
+    if unretired.is_some() {
+        if let Err(e) = ledger.unset_kind_automated(kind) {
+            eprint_err(&format!("cannot un-retire `{kind}`: {e}"));
+        }
+    }
+    let nudge = match &unretired {
+        Some(by) => Some(format!(
+            "`{kind}` was automated by {by}, but this one got past it — the kind is back in the review prompt; strengthen the check, then retire it again"
+        )),
+        None => escape::nudge(kind, kind_count, false),
+    };
     let rounds = ledger.review_rounds_for_issue(issue).unwrap_or_default();
     // On the board, against the issue that shipped it, next to its review.
-    let _ = Amt::new(runner).comment_as(
+    let commented = amt.comment_as(
         issue,
         &format!(
             "sirius: ESCAPED DEFECT [{kind}] — {message}{}{} · this issue's review: {} round(s){}{}",
@@ -738,6 +770,11 @@ fn cmd_escape(ws: &Workspace, runner: &RealRunner, a: EscapeArgs, json: bool) ->
         ),
         "sirius",
     );
+    if let Err(e) = commented {
+        eprint_err(&format!(
+            "warning: recorded, but the board comment on {issue} failed: {e}"
+        ));
+    }
     spine::Spine::new(&ws.root).emit(
         "escape.recorded",
         vec![spine::issue_ref(issue)],
@@ -745,7 +782,7 @@ fn cmd_escape(ws: &Workspace, runner: &RealRunner, a: EscapeArgs, json: bool) ->
     );
     if json {
         print_json(&json!({"ok": true, "id": id, "issue": issue, "kind": kind,
-                           "kind_count": kind_count, "automated": automated, "nudge": nudge}));
+                           "kind_count": kind_count, "unretired": unretired, "nudge": nudge}));
     } else {
         println!("recorded escape #{id} [{kind}] against {issue}");
         if let Some(n) = nudge {
@@ -784,6 +821,10 @@ fn cmd_review_canary(ws: &Workspace, runner: &RealRunner, n: usize, json: bool) 
     } else {
         String::new()
     };
+    if n == 0 {
+        eprint_err("--n must be at least 1");
+        return 2;
+    }
     match canary::run(runner, &ledger, &cfg, &sirius_abs, &prompt, n) {
         Ok(r) => {
             if json {
@@ -793,14 +834,17 @@ fn cmd_review_canary(ws: &Workspace, runner: &RealRunner, n: usize, json: bool) 
                     println!("{:<8} {:<28} {}", c.result, c.source, c.detail);
                 }
                 println!(
-                    "recall {} ({}/{} caught, {} stale) · control: {} false positive(s) · reviewer model {}",
+                    "recall {} ({} caught of {} reviewed + {} reviewer error(s); {} stale) · control: {} · reviewer model {}",
                     r.recall
                         .map(|x| format!("{:.0}%", x * 100.0))
                         .unwrap_or_else(|| "n/a".into()),
                     r.caught,
                     r.total,
+                    r.errors,
                     r.stale,
-                    r.false_positives,
+                    r.false_positives
+                        .map(|n| format!("{n} false positive(s)"))
+                        .unwrap_or_else(|| "did not run".into()),
                     r.model.as_deref().unwrap_or("(default)")
                 );
             }
@@ -808,6 +852,9 @@ fn cmd_review_canary(ws: &Workspace, runner: &RealRunner, n: usize, json: bool) 
         }
         Err(e) => {
             eprint_err(&e);
+            if json {
+                print_json(&json!({"ok": false, "error": e}));
+            }
             1
         }
     }

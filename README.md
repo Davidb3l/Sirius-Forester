@@ -308,9 +308,12 @@ branch awaiting integration, merged in order (a speculative merge queue).
 - `sirius integrate` builds the frontier (`refs/sirius/frontier`) and runs
   `integration.cmd` (e.g. your e2e suite) on it **before** anything merges.
   Red files one issue naming the combined branches; with
-  `integration.on_fail: "block"` the fleet stops claiming until it is green.
+  `integration.on_fail: "block"` the fleet stops (exit 4) and refuses to
+  relaunch (exit 3) until `sirius integrate` is green — or a human runs
+  `sirius integrate --clear-red`. Work finished meanwhile is held, then resumed.
 - The reviewer always runs in a throwaway worktree, so its hooks and test runs
-  never touch the worker's tree.
+  never touch the worker's tree (one checkout per review round — seconds on a
+  large repo; ignored files such as `node_modules` are not in it).
 
 **Learn from what escapes** (SIRF-35). A defect that got past review is the
 most valuable data a review system has. Record it against the issue that
@@ -327,8 +330,10 @@ retires it from the prompt. And every escape with a fix commit becomes a
 **canary**: `sirius review-canary` reverts each fix onto the current base (the
 real bug, back) — plus any `.sirius/canaries/*.patch` you write — runs your
 reviewer on it exactly as a review round would, and reports **recall** on real
-misses, with a benign control change for false positives. Run it whenever you
-change the reviewer model or prompt.
+misses, with a benign control change for false positives. Canaries are blind
+on every channel Sirius controls (neutral issue key, no fix history, no
+same-kind escape in the prompt). Run it whenever you change the reviewer model
+or prompt.
 
 The reviewer needs only **read** tools: it delivers its findings as JSON in its
 final message (headless `claude -p` is not allowed to write files by default —

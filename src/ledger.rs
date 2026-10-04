@@ -356,6 +356,15 @@ impl Ledger {
         Ok(())
     }
 
+    /// Un-retire `kind`: its check let one through (SIRF-35).
+    pub fn unset_kind_automated(&self, kind: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "DELETE FROM escape_kinds_automated WHERE kind = ?1",
+            params![kind],
+        )?;
+        Ok(())
+    }
+
     /// `(kind, automated_by)` for every retired kind.
     pub fn automated_kinds(&self) -> rusqlite::Result<Vec<(String, String)>> {
         let mut stmt = self

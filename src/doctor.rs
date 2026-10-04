@@ -411,9 +411,51 @@ pub fn run_with_plugins_dir(
     // 7. fleet models (SIRF-26) — advisory: what the fleet would run on.
     checks.push(models_check(ws));
 
+    // 8. integration (SIRF-32) — advisory: is the line stopped, and is any
+    //    held work parked where a human must look?
+    checks.push(integration_check(ws));
+
     // Only GATING checks decide overall health; an advisory failure is a WARN.
     let ok = checks.iter().all(|c| !c.gating || c.pass);
     DoctorReport { ok, checks }
+}
+
+/// The integration red state and parked held work (SIRF-32): with
+/// `on_fail: block` a red frontier is why `sirius run` refuses to launch, so
+/// doctor must say so instead of reporting all green.
+pub fn integration_check(ws: &Workspace) -> Check {
+    const NAME: &str = "integration";
+    let red = crate::ledger::Ledger::open(&ws.ledger_path())
+        .ok()
+        .and_then(|l| crate::integrate::red_state(&l));
+    let parked = std::process::Command::new("git")
+        .current_dir(&ws.root)
+        .args([
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/sirius/held-conflicted/",
+            "refs/sirius/held-superseded/",
+        ])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
+        .unwrap_or(0);
+    let parked_note = if parked > 0 {
+        format!("; {parked} parked held-work ref(s) under refs/sirius/held-conflicted|held-superseded need a human look")
+    } else {
+        String::new()
+    };
+    match red {
+        Some(r) => Check::advisory(
+            NAME,
+            false,
+            format!(
+                "RED at {}{} — with integration.on_fail \"block\" `sirius run` refuses to launch; fix and `sirius integrate`, or `sirius integrate --clear-red`{parked_note}",
+                r.frontier,
+                r.issue.map(|i| format!(" ({i})")).unwrap_or_default()
+            ),
+        ),
+        None => Check::advisory(NAME, parked == 0, format!("not red{parked_note}")),
+    }
 }
 
 /// Check #7 (ADVISORY, SIRF-26): which models the fleet would run on. A
@@ -500,6 +542,29 @@ mod tests {
     }
 
     #[test]
+    fn a_red_integration_shows_in_doctor() {
+        // Branch review X11: doctor said all green while `run` refused.
+        let dir = std::env::temp_dir().join(format!("sirius-doctor-red-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let led = crate::ledger::Ledger::create(&dir.join(".sirius/sirius.db"), "t").unwrap();
+        let ws = Workspace {
+            root: dir.clone(),
+            ametrite_db: None,
+            hayven_dir: None,
+        };
+        assert!(integration_check(&ws).pass, "not red");
+        led.set_meta(
+            crate::integrate::RED_KEY,
+            Some(r#"{"at":"t","frontier":"f1","issue":"AMT-90"}"#),
+        )
+        .unwrap();
+        let c = integration_check(&ws);
+        assert!(!c.pass && !c.gating, "advisory, never gates `ok`");
+        assert!(c.detail.contains("RED at f1 (AMT-90)") && c.detail.contains("--clear-red"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn an_invalid_config_is_reported_not_masked() {
         let dir = std::env::temp_dir().join(format!("sirius-doctor-cfg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -566,7 +631,7 @@ mod tests {
 
         let report = run_with_plugins_dir(&ws, &m, None);
         assert!(report.ok, "checks: {:?}", report.checks);
-        assert_eq!(report.checks.len(), 7);
+        assert_eq!(report.checks.len(), 8);
         // With no plugins dir the handoff check is an advisory PASS (skipped),
         // clearly labeled — a CI box is not an incomplete install.
         let ph = report

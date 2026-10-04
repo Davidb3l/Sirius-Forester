@@ -638,10 +638,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sirius-tree-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let pidfile = dir.join("bg.pid");
-        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let script = format!("sleep 30 & echo $! > '{}'; wait", pidfile.display());
         let r = RealRunner::default();
         let opts = AgentRunOpts {
-            timeout: Duration::from_millis(500),
+            timeout: Duration::from_millis(1500),
             heartbeat_interval: Duration::from_millis(100),
             log_path: None,
             env: vec![],
@@ -651,12 +651,23 @@ mod tests {
             .unwrap();
         assert!(out.timed_out());
         let bg = std::fs::read_to_string(&pidfile).unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        let alive = Command::new("kill")
-            .args(["-0", bg.trim()])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        // A SIGKILLed child can linger as a zombie until reaped: poll, and
+        // count a zombie as dead.
+        let mut alive = true;
+        for _ in 0..40 {
+            alive = Command::new("ps")
+                .args(["-o", "stat=", "-p", bg.trim()])
+                .output()
+                .map(|o| {
+                    let st = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    o.status.success() && !st.is_empty() && !st.starts_with('Z')
+                })
+                .unwrap_or(false);
+            if !alive {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         assert!(!alive, "the background child {bg} survived the timeout");
         let _ = std::fs::remove_dir_all(&dir);
     }

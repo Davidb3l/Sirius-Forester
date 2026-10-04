@@ -73,8 +73,8 @@
       "refs": [],
       "verifiedCommit": "6784e9fe029cbfe1284b6fc3f50032283e852e59",
       "verifiedAt": "2026-10-04T04:33:03.911Z",
-      "driftSuspectSince": "",
-      "driftSuspectReason": "",
+      "driftSuspectSince": "2026-10-04T17:51:49.889Z",
+      "driftSuspectReason": "code.changed touched src/ledger.rs",
       "createdAt": 1785915503544,
       "updatedAt": 1785915503544,
       "createdBy": "claude-code"
@@ -216,5 +216,5 @@
       "createdBy": "claude-code"
     }
   ],
-  "lastUpdated": 1791088441075
+  "lastUpdated": 1791136309890
 }

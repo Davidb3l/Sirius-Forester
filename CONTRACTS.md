@@ -116,9 +116,10 @@ CREATE TABLE escape_kinds_automated (     -- a kind now caught by a real check
 CREATE TABLE canary_runs (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   model           TEXT,                   -- the reviewer model scored
-  total           INTEGER NOT NULL,       -- canaries that applied (stale ones excluded)
+  total           INTEGER NOT NULL,       -- canaries scored: reviewed + reviewer errors (stale excluded)
   caught          INTEGER NOT NULL,
-  false_positives INTEGER NOT NULL,       -- confirmed blocking findings on the control
+  false_positives INTEGER NOT NULL,       -- confirmed blocking findings on the control (0 if it did
+                                          --   not run; detail.control_ran says which)
   detail          TEXT NOT NULL,          -- JSON: per-canary results
   created_at      TEXT NOT NULL
 );
@@ -165,29 +166,44 @@ sirius gate AMT-7 [--tier safe] [--target-status in_review] [--range <git-range>
    # gate.test_cmd (full suite on any doubt); verdict = the runner's exit code.
 
 sirius escape <ISSUE> --kind <slug> -m "<what escaped>" [--found-by <who>] [--fix <commit>] [--json]
-   -> {"ok":true,"id":int,"issue":str,"kind":str,"kind_count":int,"automated":str|null,"nudge":str|null}
+   -> {"ok":true,"id":int,"issue":str,"kind":str,"kind_count":int,"unretired":str|null,"nudge":str|null}
    # SIRF-35: record a defect that got past review, against the issue that introduced it
-   # (comments there, as `sirius`); --fix makes it a canary. A kind seen twice (not yet
-   # automated) carries a nudge to encode it as a check. Spine: escape.recorded.
+   # (the issue must exist; its canonical key is stored; a comment there, as `sirius`);
+   # --fix (resolved to a full sha now) makes it a canary. Empty -m: exit 2. A kind seen
+   # twice (not yet automated) carries a nudge to encode it as a check; a kind that was
+   # automated and escapes AGAIN is un-retired ("unretired": the check that missed it).
+   # Summaries enter prompts as one line, capped at 200 chars, `$` neutralized.
+   # Spine: escape.recorded.
 sirius escape --kind <slug> --automated-by <test path> [--json]
    -> {"ok":true,"kind":str,"automated_by":str,"escapes":int}
-   # retires the kind from the review prompt — a real check now catches it
+   # retires the kind from the review prompt — a real check now catches it (the path
+   # must exist in the repo, else exit 2)
 sirius escape --list [--json]
    -> {"kinds":[{"kind","count","last_at","automated_by"|null}],
        "escapes":[{"id","issue","kind","summary","found_by","fix","at"}]}
 
 sirius review-canary [--n 10] [--json]
-   -> {"ok":bool,"base":str,"model":str|null,"total":int,"caught":int,"stale":int,
-       "recall":float|null,"false_positives":int,
-       "canaries":[{"source":"escape:<id>"|"patch:<file>","issue":str|null,"kind":str|null,
-                    "result":"caught|missed|stale|error","detail":str}]}
+   -> {"ok":true,"base":str,"model":str|null,"total":int,"caught":int,"stale":int,
+       "errors":int,"recall":float|null,"false_positives":int|null,
+       "canaries":[{"source":"escape:<id>"|"patch:<file>"|"control:built-in"|"control:<file>",
+                    "issue":str|null,"kind":str|null,
+                    "result":"caught|missed|stale|error" (control: "clean|flagged|stale|error"),
+                    "detail":str}]}
+   # on failure with --json: {"ok":false,"error":str} (exit 1); --n 0: exit 2
    # Replays up to N canaries — each escape with a fix commit (its fix REVERTED onto the
    # current base, i.e. the real bug back), plus .sirius/canaries/*.patch — through the
    # configured review.cmd exactly as a review round runs it, in a throwaway worktree.
-   # caught = a blocking finding on a file the canary changed. A canary that no longer
-   # applies is "stale" (not scored). One CONTROL (a benign doc file, or
-   # .sirius/canaries/control.patch) measures false positives. A canary's own escape is
-   # left out of its prompt's escape-pattern section. Writes a canary_runs row.
+   # caught = a blocking finding on a NON-TEST file the canary changed (reverting a fix
+   # also removes its regression test — that is not catching the bug). A canary that no
+   # longer applies is "stale" (not scored); a reviewer error is scored as a MISS:
+   # recall = caught / (total + errors). Escapes are deduplicated by fix commit; a fix
+   # that landed as a merge reverts against its mainline. One CONTROL (a trailing
+   # newline on the first reviewable tracked text file, or .sirius/canaries/control.patch)
+   # measures false positives (null if it did not run). A canary is BLIND on the channels
+   # Sirius controls: issue key CANARY-<n>, worker sirius/reviewer, commit message "wip",
+   # a parentless base commit (no fix history in `git log`), and no escape sharing its
+   # kind or fix commit in its prompt; its prompt/output/log are deleted after scoring,
+   # and trees/files of killed runs are swept. Writes a canary_runs row.
    # Exit 0 ran, 1 operational failure (incl. no review.cmd).
    # Scored per reviewer model; per-lens recall arrives with lenses (SIRF-38). There is
    # no built-in mutation catalog: mutations are language-specific — write them as
@@ -312,7 +328,11 @@ other stdout formats.
                                            //   SIRIUS_RESUMED_FROM=<sha>. The held ref is removed only once
                                            //   the resumed work is stamped; held work already on the base
                                            //   is dropped; work that no longer merges is parked at
-                                           //   refs/sirius/held-conflicted/<issue> and the issue starts fresh
+                                           //   refs/sirius/held-conflicted/<issue> and the issue starts fresh;
+                                           //   an older held commit a new hold does not contain is parked
+                                           //   at refs/sirius/held-superseded/<issue>/<sha12>. Red arriving
+                                           //   DURING a review also holds (never an unreviewed advance).
+                                           //   `sirius doctor` reports red + parked refs (advisory).
     "timeout_secs": 1800
   }
 }

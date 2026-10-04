@@ -1520,6 +1520,13 @@ pub fn run_iteration(
     if let ReviewStage::LeaseLost(reason) = &review {
         return lease_lost(out, reason, "the review");
     }
+    // SIRF-32: red may have been recorded WHILE this work was in review —
+    // re-check, and hold rather than advance onto a red frontier.
+    let integration_hold = match (&review, integration_hold) {
+        (ReviewStage::Held(why), _) => Some(why.clone()),
+        (_, None) if gated => crate::integrate::block_reason(config, ledger),
+        (_, h) => h,
+    };
     if let ReviewStage::Exit(o) = review {
         return o;
     }
@@ -1614,6 +1621,26 @@ pub fn run_iteration(
             // ref both marks it and keeps its commits reachable, whatever
             // later happens to the issue branch.
             Ok(()) if !advanced => {
+                // An older held commit this work does NOT contain (its resume
+                // failed) is parked, never overwritten into oblivion.
+                if let Ok(old) =
+                    crate::gitrange::run_git(runner, &["show-ref", "--verify", "--hash", &held_ref])
+                {
+                    let old = old.stdout.trim().to_string();
+                    let contained = crate::gitrange::run_git(
+                        runner,
+                        &["merge-base", "--is-ancestor", &old, "HEAD"],
+                    )
+                    .is_ok();
+                    if !old.is_empty() && !contained {
+                        let parked = format!(
+                            "refs/sirius/held-superseded/{}/{}",
+                            issue.to_lowercase(),
+                            &old[..old.len().min(12)]
+                        );
+                        let _ = crate::gitrange::run_git(runner, &["update-ref", &parked, &old]);
+                    }
+                }
                 held_marked =
                     crate::gitrange::run_git(runner, &["update-ref", &held_ref, "HEAD"]).is_ok();
             }
@@ -1830,6 +1857,16 @@ pub enum ReviewStage {
     /// The amt lease was refused before a reviewer spawned — the issue may
     /// now belong to someone else. The caller does the lease-lost unwind.
     LeaseLost(String),
+    /// SIRF-32: integration went red mid-review (`on_fail: block`). The work
+    /// is HELD — never escalated to an unreviewed advance.
+    Held(String),
+}
+
+/// Did the fleet stop because integration went red (not a usage limit)?
+fn integration_pause(fleet: &Fleet) -> Option<String> {
+    fleet
+        .paused()
+        .filter(|why| why.starts_with("integration red"))
 }
 
 /// One reviewer attempt's result.
@@ -2236,7 +2273,7 @@ fn review_once(
                 // identity is fine and the user's git config is not needed.
                 let mut args = vec!["-C", t_str.as_str()];
                 args.extend(crate::frontier::THROWAWAY_MERGE_CONFIG);
-                args.extend(["merge", "--no-ff", "--no-verify", "--no-edit", &head]);
+                args.extend(["merge", "--no-ff", "--no-edit", &head]);
                 let merged = crate::gitrange::run_git(cx.runner, &args);
                 if let Err(e) = merged {
                     let conflicts: Vec<String> = crate::gitrange::run_git(
@@ -2314,7 +2351,7 @@ fn review_once(
         crate::escape::patterns_section(
             &cx.ledger.escapes(None).unwrap_or_default(),
             &cx.ledger.automated_kinds().unwrap_or_default(),
-            None,
+            &|_| false,
             crate::escape::PROMPT_TOP,
         ),
     ));
@@ -2736,6 +2773,9 @@ pub fn run_review_stage(cx: &ReviewCtx, out: &mut dyn Write, fix_round: &FixRoun
                 )
             }
             _ => {
+                if let Some(why) = integration_pause(cx.fleet) {
+                    return ReviewStage::Held(why);
+                }
                 let why = format!("the review could not complete in round {round} ({last_err})");
                 return escalate(
                     cx,
@@ -2867,6 +2907,10 @@ pub fn run_review_stage(cx: &ReviewCtx, out: &mut dyn Write, fix_round: &FixRoun
                             format!("fix round {round} broke the gate and could not repair it within retry_budget; reverted to the last passing state"),
                         )
                     };
+                    // (The last reviewed checkpoint is already restored.)
+                    if let Some(why) = integration_pause(cx.fleet) {
+                        return ReviewStage::Held(why);
+                    }
                     return escalate(cx, policy, &why, rec.blocking, summary);
                 }
             }
@@ -5046,6 +5090,7 @@ mod tests {
         };
         for args in [
             &["init", "-q"][..],
+            &["config", "core.autocrlf", "false"][..],
             &["-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"][..],
             &[
                 "-c",
@@ -5754,6 +5799,73 @@ mod tests {
     }
 
     #[test]
+    fn held_again_parks_the_older_held_work_it_does_not_contain() {
+        // Branch review X8: a resume that failed without conflict, then a
+        // second hold — the first held commit must not become unreachable.
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-93");
+        m.expect(
+            &[
+                "git",
+                "show-ref",
+                "--verify",
+                "--hash",
+                "refs/sirius/held/amt-93",
+            ],
+            1,
+            "",
+        ); // nothing to resume at claim time…
+        m.expect(
+            &[
+                "git",
+                "show-ref",
+                "--verify",
+                "--hash",
+                "refs/sirius/held/amt-93",
+            ],
+            0,
+            "oldheld000001\n",
+        ); // …but one is there when holding again
+        m.expect(
+            &["git", "merge-base", "--is-ancestor", "oldheld000001"],
+            1,
+            "",
+        );
+        let mut c = review_cfg(3);
+        c.integration.on_fail = crate::config::IntegrationOnFail::Block;
+        let led = Ledger::open_in_memory().unwrap();
+        led.set_meta(
+            crate::integrate::RED_KEY,
+            Some(r#"{"at":"t","frontier":"f1","issue":"AMT-90"}"#),
+        )
+        .unwrap();
+        let (amt, hv, fleet) = (Amt::new(&m), Hayven::new(&m), test_fleet("base999"));
+        let mut out = Vec::new();
+        run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &c,
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
+            None,
+            Some(&fleet),
+        );
+        let rec = m.recorded();
+        assert!(
+            rec.iter().any(|c| c
+                == "git update-ref refs/sirius/held-superseded/amt-93/oldheld00000 oldheld000001"),
+            "{rec:?}"
+        );
+        assert!(rec
+            .iter()
+            .any(|c| c == "git update-ref refs/sirius/held/amt-93 HEAD"));
+    }
+
+    #[test]
     fn held_work_already_on_the_base_is_dropped_not_merged() {
         let m = MockRunner::new();
         program_review_iteration(&m, "AMT-92");
@@ -5894,6 +6006,117 @@ mod tests {
             .unwrap();
         let p = review_prompt(&led);
         assert!(!p.contains("migration-fork"), "{p}");
+    }
+
+    /// Turns integration red WHILE the reviewer runs (what a concurrent
+    /// `sirius integrate` does): records the red state in the ledger file and
+    /// pauses the fleet the way a sibling worker's pre-claim check would.
+    struct RedDuringReview<'a> {
+        inner: &'a MockRunner,
+        ledger_path: std::path::PathBuf,
+        pause: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    impl Runner for RedDuringReview<'_> {
+        fn run(&self, program: &str, args: &[&str]) -> std::io::Result<crate::shell::CmdOutput> {
+            self.inner.run(program, args)
+        }
+        fn run_agent(
+            &self,
+            program: &str,
+            args: &[&str],
+            opts: &AgentRunOpts,
+            hb: &mut dyn FnMut(),
+        ) -> std::io::Result<crate::shell::AgentOutcome> {
+            if opts
+                .env
+                .iter()
+                .any(|(k, v)| k == "SIRIUS_PHASE" && v == "review")
+            {
+                let l = Ledger::open(&self.ledger_path).unwrap();
+                l.set_meta(
+                    crate::integrate::RED_KEY,
+                    Some(r#"{"at":"t","frontier":"f9","issue":"AMT-90"}"#),
+                )
+                .unwrap();
+                *self.pause.lock().unwrap() =
+                    Some("integration red at f9 (AMT-90) — fix it".into());
+            }
+            self.inner.run_agent(program, args, opts, hb)
+        }
+    }
+
+    fn red_mid_review(issue: &str, reviewer_answers: bool) -> (Vec<String>, IterationOutcome) {
+        let m = MockRunner::new();
+        program_review_iteration(&m, issue);
+        checkpoint_heads(&m, &["ck1", "ck1"]);
+        if reviewer_answers {
+            m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+        }
+        let fleet = test_fleet("base999");
+        let path = fleet.sirius_dir.join("red.db");
+        let led = Ledger::create(&path, "test").unwrap();
+        let r = RedDuringReview {
+            inner: &m,
+            ledger_path: path,
+            pause: fleet.pause.clone(),
+        };
+        let mut c = review_cfg(3);
+        c.integration.on_fail = crate::config::IntegrationOnFail::Block;
+        let (amt, hv) = (Amt::new(&m), Hayven::new(&m));
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &c,
+            &r,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
+            None,
+            Some(&fleet),
+        );
+        (m.recorded(), o)
+    }
+
+    fn assert_held(rec: &[String], issue: &str) {
+        let key = issue.to_lowercase();
+        let release = rec
+            .iter()
+            .find(|c| c.starts_with("amt --json release"))
+            .unwrap();
+        assert!(
+            release.contains("--status todo"),
+            "held, not advanced: {release}"
+        );
+        assert!(release.contains("integration red at f9"), "{release}");
+        assert!(
+            !rec.iter().any(|c| c.contains("--add-label review:open")),
+            "never flagged-advanced"
+        );
+        assert!(
+            !rec.iter().any(|c| c.starts_with("amt --json decide")),
+            "no receipt"
+        );
+        assert!(rec
+            .iter()
+            .any(|c| c == &format!("git update-ref refs/sirius/held/{key} HEAD")));
+    }
+
+    #[test]
+    fn red_during_a_review_that_cannot_finish_holds_instead_of_escalating() {
+        // Branch review X1: the pause made the reviewer error out, and
+        // on_review_error (advance-flagged) advanced UNREVIEWED work.
+        let (rec, _) = red_mid_review("AMT-98", false);
+        assert_held(&rec, "AMT-98");
+    }
+
+    #[test]
+    fn red_recorded_while_a_review_finishes_clean_still_holds() {
+        let (rec, _) = red_mid_review("AMT-99", true);
+        assert_held(&rec, "AMT-99");
     }
 
     #[test]

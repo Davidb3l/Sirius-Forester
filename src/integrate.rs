@@ -61,11 +61,11 @@ pub fn block_reason(cfg: &Config, ledger: &Ledger) -> Option<String> {
         Ok(None) => None,
         Ok(Some(raw)) => Some(match serde_json::from_str::<RedState>(&raw) {
             Ok(r) => format!(
-                "integration red at {}{} — fix it and run `sirius integrate` until green",
+                "integration red at {}{} — fix it and run `sirius integrate` until green (or `sirius integrate --clear-red` to override)",
                 r.frontier,
                 r.issue.map(|i| format!(" ({i})")).unwrap_or_default()
             ),
-            Err(_) => "integration red (state unreadable) — run `sirius integrate`".into(),
+            Err(_) => "integration red (state unreadable) — run `sirius integrate` (or `--clear-red`)".into(),
         }),
         Err(e) => Some(format!(
             "integration red? the ledger cannot say ({e}) — holding until it can"

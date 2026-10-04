@@ -167,15 +167,9 @@ pub const THROWAWAY_MERGE_CONFIG: [&str; 8] = [
 fn merge_into(runner: &dyn Runner, t: &str, rev: &str, msg: &str) -> Merge {
     let mut args = vec!["-C", t];
     args.extend(THROWAWAY_MERGE_CONFIG);
-    args.extend([
-        "merge",
-        "--no-ff",
-        "--no-verify",
-        "--no-edit",
-        "-m",
-        msg,
-        rev,
-    ]);
+    // No `--no-verify` (git >= 2.24 only): the null hooksPath above
+    // already disables every hook.
+    args.extend(["merge", "--no-ff", "--no-edit", "-m", msg, rev]);
     let merged = run_git(runner, &args);
     let Err(e) = merged else {
         return Merge::Clean;
@@ -823,6 +817,9 @@ mod tests {
             };
             let repo = Repo { dir, r };
             repo.git(&["init", "-q", "-b", "main"]);
+            // Byte-exact assertions: never let a CRLF checkout (Windows'
+            // core.autocrlf=true) rewrite what the test wrote.
+            repo.git(&["config", "core.autocrlf", "false"]);
             repo
         }
         fn git(&self, args: &[&str]) -> String {
