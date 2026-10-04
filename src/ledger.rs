@@ -120,7 +120,20 @@ impl Ledger {
         self.conn.query_row("PRAGMA data_version", [], |r| r.get(0))
     }
 
-    #[allow(dead_code)] // read API used by the Console + tests
+    /// Set (`Some`) or clear (`None`) a meta row — e.g. SIRF-32's
+    /// `integration_red`, the stop-the-line state `sirius run` honors.
+    pub fn set_meta(&self, key: &str, value: Option<&str>) -> rusqlite::Result<()> {
+        match value {
+            Some(v) => self.conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [key, v],
+            ),
+            None => self.conn.execute("DELETE FROM meta WHERE key = ?1", [key]),
+        }
+        .map(|_| ())
+    }
+
     pub fn meta(&self, key: &str) -> rusqlite::Result<Option<String>> {
         self.conn
             .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
@@ -500,6 +513,17 @@ mod tests {
         assert_eq!(led.meta("schema_version").unwrap().as_deref(), Some("1"));
         assert!(led.meta("created_at").unwrap().is_some());
         assert!(led.meta("sirius_version").unwrap().is_some());
+    }
+
+    #[test]
+    fn set_meta_upserts_and_clears() {
+        let l = Ledger::open_in_memory().unwrap();
+        assert_eq!(l.meta("integration_red").unwrap(), None);
+        l.set_meta("integration_red", Some("a")).unwrap();
+        l.set_meta("integration_red", Some("b")).unwrap();
+        assert_eq!(l.meta("integration_red").unwrap().as_deref(), Some("b"));
+        l.set_meta("integration_red", None).unwrap();
+        assert_eq!(l.meta("integration_red").unwrap(), None);
     }
 
     #[test]

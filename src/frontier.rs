@@ -196,6 +196,64 @@ fn sibling_conflict(s: &Sibling, files: &[String]) -> Finding {
     }
 }
 
+/// A frontier built in a throwaway tree.
+pub struct Built {
+    /// The frontier commit (the tree's HEAD).
+    pub tip: String,
+    /// Indexes into the siblings, in merge order.
+    pub merged: Vec<usize>,
+    /// Siblings that conflict with the ones merged before them.
+    pub left_out: Vec<(Sibling, Vec<String>)>,
+}
+
+/// Reset the throwaway tree `t` to `cur` and merge every sibling not in
+/// `excluded`, in order; one that conflicts with the frontier so far is left
+/// out. Shared by the frontier review and `sirius integrate` (SIRF-32).
+pub fn build(
+    runner: &dyn Runner,
+    t: &str,
+    cur: &str,
+    sibs: &[Sibling],
+    excluded: &HashSet<usize>,
+) -> Result<Built, String> {
+    for args in [&["reset", "-q", "--hard", cur][..], &["clean", "-fdq"][..]] {
+        let full: Vec<&str> = ["-C", t].iter().chain(args).copied().collect();
+        run_git(runner, &full).map_err(|e| format!("cannot reset the frontier tree: {e}"))?;
+    }
+    let mut merged = Vec::new();
+    let mut left_out = Vec::new();
+    for (i, s) in sibs.iter().enumerate() {
+        if excluded.contains(&i) {
+            continue;
+        }
+        match merge_into(
+            runner,
+            t,
+            &s.tip,
+            &format!("sirius frontier: + {}", s.issue),
+        ) {
+            Merge::Clean => merged.push(i),
+            Merge::Conflicts(f) => left_out.push((s.clone(), f)),
+            Merge::Failed(e) => {
+                return Err(format!(
+                    "merging {} into the frontier failed: {e}",
+                    s.branch
+                ))
+            }
+        }
+    }
+    let tip = match run_git(runner, &["-C", t, "rev-parse", "HEAD"]) {
+        Ok(o) if !o.stdout.trim().is_empty() => o.stdout.trim().to_string(),
+        Ok(_) => return Err("the frontier tree has no HEAD".into()),
+        Err(e) => return Err(e),
+    };
+    Ok(Built {
+        tip,
+        merged,
+        left_out,
+    })
+}
+
 /// Build the frontier in the throwaway tree `t` (detached at `cur`) and merge
 /// the work (`head`) onto it. A conflict on a file a merged sibling touched
 /// is that sibling's: it is reported and the frontier rebuilt without it, so
@@ -204,37 +262,12 @@ pub fn prepare(runner: &dyn Runner, t: &str, cur: &str, head: &str, sibs: &[Sibl
     let mut excluded: HashSet<usize> = HashSet::new();
     let mut sibling_conflicts = Vec::new();
     loop {
-        for args in [&["reset", "-q", "--hard", cur][..], &["clean", "-fdq"][..]] {
-            let full: Vec<&str> = ["-C", t].iter().chain(args).copied().collect();
-            if let Err(e) = run_git(runner, &full) {
-                return Prepared::Failed(format!("cannot reset the frontier tree: {e}"));
-            }
-        }
-        let mut merged = Vec::new();
-        let mut left_out = Vec::new();
-        for (i, s) in sibs.iter().enumerate() {
-            if excluded.contains(&i) {
-                continue;
-            }
-            match merge_into(
-                runner,
-                t,
-                &s.tip,
-                &format!("sirius frontier: + {}", s.issue),
-            ) {
-                Merge::Clean => merged.push(i),
-                Merge::Conflicts(f) => left_out.push((s.clone(), f)),
-                Merge::Failed(e) => {
-                    return Prepared::Failed(format!(
-                        "merging {} into the frontier failed: {e}",
-                        s.branch
-                    ))
-                }
-            }
-        }
-        let frontier = match run_git(runner, &["-C", t, "rev-parse", "HEAD"]) {
-            Ok(o) if !o.stdout.trim().is_empty() => o.stdout.trim().to_string(),
-            Ok(_) => return Prepared::Failed("the frontier tree has no HEAD".into()),
+        let Built {
+            tip: frontier,
+            merged,
+            left_out,
+        } = match build(runner, t, cur, sibs, &excluded) {
+            Ok(b) => b,
             Err(e) => return Prepared::Failed(e),
         };
         match merge_into(runner, t, head, "sirius: review merge onto the frontier") {

@@ -263,6 +263,47 @@ pub struct Config {
     /// refuses to launch with no worker model unless explicitly allowed.
     #[serde(default)]
     pub models: crate::models::ModelsConfig,
+    /// SIRF-32: `sirius integrate` — the integration command run on the
+    /// frontier, and whether a red run stops the fleet.
+    #[serde(default)]
+    pub integration: IntegrationConfig,
+}
+
+/// What a red integration run does to the fleet (SIRF-32).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IntegrationOnFail {
+    /// File the issue; the fleet keeps working.
+    #[default]
+    Warn,
+    /// Stop the line: `sirius run` refuses to start and a running fleet stops
+    /// claiming until a later `sirius integrate` is green.
+    Block,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IntegrationConfig {
+    /// Run in the frontier tree via `sh -c`. `None` = build + report only.
+    #[serde(default)]
+    pub cmd: Option<String>,
+    #[serde(default)]
+    pub on_fail: IntegrationOnFail,
+    #[serde(default = "default_integration_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_integration_timeout_secs() -> u64 {
+    1800
+}
+
+impl Default for IntegrationConfig {
+    fn default() -> Self {
+        IntegrationConfig {
+            cmd: None,
+            on_fail: IntegrationOnFail::default(),
+            timeout_secs: default_integration_timeout_secs(),
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -306,6 +347,7 @@ impl Default for Config {
             agent_timeout_secs: default_agent_timeout_secs(),
             lease_ttl_secs: default_lease_ttl_secs(),
             review: ReviewConfig::default(),
+            integration: IntegrationConfig::default(),
             models: crate::models::ModelsConfig::default(),
         }
     }

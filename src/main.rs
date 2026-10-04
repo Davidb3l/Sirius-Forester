@@ -13,6 +13,7 @@ mod frontier;
 mod gate;
 mod gitrange;
 mod hayven;
+mod integrate;
 mod ledger;
 mod models;
 mod review;
@@ -61,6 +62,7 @@ fn main() -> ExitCode {
             range,
             json,
         } => cmd_gate(&ws, &runner, &issue, tier, target_status, range, json),
+        Command::Integrate { json } => cmd_integrate(&ws, &runner, json),
         Command::Run {
             workers,
             agent_cmd,
@@ -549,6 +551,97 @@ fn cmd_gate(
     }
 }
 
+// ---- integrate ---------------------------------------------------------
+
+fn cmd_integrate(ws: &Workspace, runner: &RealRunner, json: bool) -> u8 {
+    let ledger = match open_ledger(ws) {
+        Ok(l) => l,
+        Err(c) => return c,
+    };
+    let cfg = match load_config(ws) {
+        Ok(c) => c,
+        Err(c) => return c,
+    };
+    let amt = Amt::new(runner);
+    let sirius_abs = {
+        let d = ws.sirius_dir();
+        if d.is_absolute() {
+            d
+        } else {
+            std::env::current_dir().map(|c| c.join(&d)).unwrap_or(d)
+        }
+    };
+    match integrate::integrate(runner, &amt, &ledger, &cfg, &sirius_abs) {
+        Ok(r) => {
+            let mut refs = vec![];
+            if let Some(i) = &r.issue {
+                refs.push(spine::issue_ref(i));
+            }
+            spine::Spine::new(&ws.root).emit(
+                if r.ok {
+                    "integration.passed"
+                } else {
+                    "integration.failed"
+                },
+                refs,
+                json!({ "frontier": r.frontier.clone(), "included": r.included.clone(), "exit": r.exit }),
+            );
+            if json {
+                print_json(&json!(r));
+            } else {
+                println!(
+                    "integration {} at {} ({} + {}){}{}",
+                    if !r.ran {
+                        "frontier built (no integration.cmd)"
+                    } else if r.ok {
+                        "GREEN"
+                    } else {
+                        "RED"
+                    },
+                    r.frontier,
+                    r.base_ref,
+                    if r.included.is_empty() {
+                        "no siblings".to_string()
+                    } else {
+                        r.included.join(", ")
+                    },
+                    r.issue
+                        .as_ref()
+                        .map(|i| format!(" — filed/updated {i}"))
+                        .unwrap_or_default(),
+                    r.log
+                        .as_ref()
+                        .map(|l| format!(" — log {l}"))
+                        .unwrap_or_default()
+                );
+            }
+            if r.ok {
+                0
+            } else {
+                3 // soft "blocked" per CONTRACTS §2.
+            }
+        }
+        Err(e) => {
+            eprint_err(&e);
+            1
+        }
+    }
+}
+
+/// SIRF-32: with `integration.on_fail: block`, a red frontier stops the line.
+fn integration_block(cfg: &Config, ledger: &Ledger) -> Option<String> {
+    if cfg.integration.on_fail != config::IntegrationOnFail::Block {
+        return None;
+    }
+    integrate::red_state(ledger).map(|r| {
+        format!(
+            "integration red at {}{} — fix it and run `sirius integrate` until green",
+            r.frontier,
+            r.issue.map(|i| format!(" ({i})")).unwrap_or_default()
+        )
+    })
+}
+
 // ---- run ---------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
@@ -637,6 +730,13 @@ fn cmd_run(
     // One fleet per repo: a second `sirius run` would force-remove the first
     // fleet's LIVE worktrees out from under its agents. A pidfile guard —
     // stale entries (dead pid) are taken over, a live one refuses.
+    // SIRF-32: never launch onto a red frontier when the line is blocked.
+    if let Ok(l) = Ledger::open(&ws.ledger_path()) {
+        if let Some(why) = integration_block(&cfg, &l) {
+            eprint_err(&format!("refusing to launch: {why}"));
+            return 3;
+        }
+    }
     let lock_path = ws.sirius_dir().join("run.pid");
     if let Ok(prev) = std::fs::read_to_string(&lock_path) {
         let prev = prev.trim();
@@ -796,9 +896,13 @@ fn cmd_run(
                 .as_bytes(),
             )
             .ok();
-        eprint_err(&format!(
-            "fleet PAUSED — an agent hit a fleet-wide stop: \"{reason}\". Unworked issues were left in todo; fix the cause (limit reset, `claude update`, `/login`) and relaunch."
-        ));
+        eprint_err(&if reason.starts_with("integration red") {
+            format!("fleet STOPPED — {reason}; unworked issues were left in todo.")
+        } else {
+            format!(
+                "fleet PAUSED — an agent hit a fleet-wide stop: \"{reason}\". Unworked issues were left in todo; fix the cause (limit reset, `claude update`, `/login`) and relaunch."
+            )
+        });
         return 4;
     }
     u8::from(any_failed.load(std::sync::atomic::Ordering::SeqCst))
@@ -933,6 +1037,12 @@ fn worker_loop(
         if fleet.paused().is_some() {
             break;
         }
+        // SIRF-32: a red integration (on_fail: block) stops every worker
+        // from claiming — no new work lands on a frontier that is broken.
+        if let Some(why) = integration_block(cfg, &ledger) {
+            fleet.pause_with(&why);
+            break;
+        }
         // Reserve an iteration slot from the SHARED budget before claiming.
         if max_iterations > 0 && iterations.fetch_add(1, Ordering::SeqCst) >= max_iterations {
             break;
@@ -1049,6 +1159,23 @@ fn tree_names(n: u32) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_red_integration_blocks_only_when_configured_to() {
+        let led = Ledger::open_in_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.integration.on_fail = config::IntegrationOnFail::Block;
+        assert_eq!(integration_block(&cfg, &led), None, "green: no block");
+        led.set_meta(
+            integrate::RED_KEY,
+            Some(r#"{"at":"t","frontier":"f1","issue":"AMT-90"}"#),
+        )
+        .unwrap();
+        let why = integration_block(&cfg, &led).unwrap();
+        assert!(why.starts_with("integration red at f1 (AMT-90)"), "{why}");
+        cfg.integration.on_fail = config::IntegrationOnFail::Warn;
+        assert_eq!(integration_block(&cfg, &led), None, "warn never blocks");
+    }
 
     #[test]
     fn tree_names_are_stable() {

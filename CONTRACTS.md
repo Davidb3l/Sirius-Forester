@@ -137,6 +137,19 @@ sirius gate AMT-7 [--tier safe] [--target-status in_review] [--range <git-range>
    # Selects affected tests over the changed files, then RUNS them via
    # gate.test_cmd (full suite on any doubt); verdict = the runner's exit code.
 
+sirius integrate [--json]   # SIRF-32 — build the frontier, run integration.cmd on it
+   -> {"ok":bool,"base_ref":str,"frontier":str,"included":["AMT-7"],
+       "left_out":[{"issue":"AMT-9","files":[str]}],"ran":bool,"exit":int|null,
+       "timed_out":bool,"log":str|null,"issue":"AMT-12"|null,"red":bool}
+   # frontier = base_ref tip + every sibling (§3.1) merged in order, in a throwaway
+   # worktree; refs/sirius/frontier points at it. integration.cmd runs there via
+   # `sh -c` with SIRIUS_INTEGRATION_DIR, SIRIUS_FRONTIER, SIRIUS_BASE_REF. A failure
+   # files ONE issue (label integration; later failures comment on it while it is
+   # open) and records the red state in the ledger (meta `integration_red`); a pass
+   # clears it and comments on that issue. No integration.cmd = build + report only.
+   # Exit 0 green (or nothing to run), 3 red, 1 operational failure.
+   # Spine: integration.passed / integration.failed.
+
 sirius run --workers N --agent-cmd "<cmd>" [--from todo] [--review-cmd "<cmd>"]
            [--model <id>|inherit] [--review-model <id>|inherit] [--allow-default-model] --json
    # first event: {"event":"fleet","phase":"start","models":{"default","source","review","fix_floor","routes","fallback"}}
@@ -217,6 +230,12 @@ other stdout formats.
     "on_review_error": "advance-flagged",  // | "release"
     "skip_paths": ["**/*.md", "docs/**"],
     "sequences": []                        // SIRF-31: [{"dir": "drizzle", "key": "^(\\d+)"}] — off when empty
+  },
+  "integration": {                         // SIRF-32 — `sirius integrate`
+    "cmd": null,                           // e.g. "./scripts/ci.sh --e2e-required"; null = build + report only
+    "on_fail": "warn",                     // | "block": while red, `sirius run` refuses to start and a
+                                           //   running fleet stops claiming (paused, exit 4)
+    "timeout_secs": 1800
   }
 }
 ```

@@ -220,6 +220,37 @@ impl<'r> Amt<'r> {
             .ok_or_else(|| format!("amt decide returned no decision id: {v}"))
     }
 
+    /// `amt --json issue create --title <t> -b <body> --priority <p> --label …`
+    /// → the new issue's key.
+    pub fn issue_create(
+        &self,
+        title: &str,
+        body: &str,
+        priority: &str,
+        labels: &[&str],
+    ) -> Result<String, String> {
+        let mut args = vec![
+            "--json",
+            "issue",
+            "create",
+            "--title",
+            title,
+            "-b",
+            body,
+            "--priority",
+            priority,
+        ];
+        for l in labels {
+            args.push("--label");
+            args.push(l);
+        }
+        let v = self.json(&args)?;
+        v.get("id")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .ok_or_else(|| format!("amt issue create returned no id: {v}"))
+    }
+
     /// `amt --json decision show <id>`
     pub fn decision_show(&self, decision: &str) -> Result<Value, String> {
         self.json(&["--json", "decision", "show", decision])

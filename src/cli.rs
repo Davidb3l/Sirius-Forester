@@ -67,6 +67,12 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Build the integration frontier (base tip + every in-flight sibling)
+    /// and run `integration.cmd` on it before anything merges (SIRF-32).
+    Integrate {
+        #[arg(long)]
+        json: bool,
+    },
     /// Run the loop with N workers.
     Run {
         #[arg(long, default_value_t = 1)]
