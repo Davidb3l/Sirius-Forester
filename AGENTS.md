@@ -94,6 +94,22 @@ Windows, plus a bench smoke that asserts every harness produced a metric.
 
 ---
 
+## Releases are batched, not per change
+
+Pushing to `main` only runs CI. A release (signed binaries + GitHub Release)
+happens **only** when a `v*` tag is pushed (`.github/workflows/release.yml`).
+
+- **Never bump the version in a feature or fix commit.** Merge to `main`
+  freely; work accumulates there.
+- Every user-visible change adds one line under `## Unreleased` in
+  [`CHANGELOG.md`](CHANGELOG.md) (Added / Changed / Fixed).
+- A release is cut deliberately, when the human asks: ONE commit
+  `chore(release): vX.Y.Z` that bumps `Cargo.toml` and moves the Unreleased
+  lines under the new version, then the tag. Semver: a batch of fixes is a
+  patch; new commands, config keys, or contract fields are a minor.
+
+---
+
 ## `--json` is a contract, not a convenience
 
 If you add or change a `sirius` subcommand: it must accept `--json`, print
