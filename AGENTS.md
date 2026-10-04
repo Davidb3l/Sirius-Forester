@@ -105,8 +105,9 @@ happens **only** when a `v*` tag is pushed (`.github/workflows/release.yml`).
   [`CHANGELOG.md`](CHANGELOG.md) (Added / Changed / Fixed).
 - A release is cut deliberately, when the human asks: ONE commit
   `chore(release): vX.Y.Z` that bumps `Cargo.toml` and moves the Unreleased
-  lines under the new version, then the tag. Semver: a batch of fixes is a
-  patch; new commands, config keys, or contract fields are a minor.
+  lines under the new version, bumps the plugin version (`plugin.json` +
+  `marketplace.json`) when the plugin changed, then the tag. The human picks
+  the version number.
 
 ---
 

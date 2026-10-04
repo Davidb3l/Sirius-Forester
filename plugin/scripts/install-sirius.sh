@@ -218,16 +218,62 @@ print_path_hint() {
 }
 
 # ---- --check: status only, never downloads ---------------------------------
+# ---- update nudge (--check) --------------------------------------------------
+# A plugin update ships new skill text, but the binary only moves when the user
+# re-runs the installer — so app users would never hear about a new release.
+# In suite repos only, at most once a day (cached), 3 s cap, never fatal: say
+# so when the latest release is newer than the installed binary.
+# A release version: x.y.z with an optional -prerelease; a leading "v" is
+# dropped. Anything else (a garbage cache, an odd --version) is rejected.
+norm_version() { # norm_version <v> -> normalized on stdout, or fails
+  v="${1#v}"
+  printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' || return 1
+  printf '%s' "$v"
+}
+
+older_than() { # older_than A B -> true if A < B (x.y.z; a prerelease < its release)
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    pa = index(a, "-"); pb = index(b, "-");
+    ca = pa ? substr(a, 1, pa - 1) : a; cb = pb ? substr(b, 1, pb - 1) : b;
+    split(ca, x, "."); split(cb, y, ".");
+    for (i = 1; i <= 3; i++) { if ((x[i] + 0) < (y[i] + 0)) exit 0; if ((x[i] + 0) > (y[i] + 0)) exit 1 }
+    exit (pa && !pb) ? 0 : 1 }'
+}
+
+update_hint() { # update_hint <sirius binary>
+  have curl || return 0
+  installed="$(norm_version "$("$1" --version 2>/dev/null | awk '{print $2}')")" || return 0
+  cache_dir="${CLAUDE_PLUGIN_DATA:-$HOME/.cache/sirius}"
+  cache="$cache_dir/latest-release-tag"
+  latest=""
+  if [ -f "$cache" ] && [ -n "$(find "$cache" -mtime -1 2>/dev/null)" ]; then
+    # Fresh: use it (an empty file = the last lookup failed; retry tomorrow).
+    latest="$(norm_version "$(head -c 64 "$cache" 2>/dev/null)")" || latest=""
+  else
+    loc="$(curl -fsSLI --max-time 3 -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" 2>/dev/null || true)"
+    case "$loc" in
+      */releases/tag/*) latest="$(norm_version "${loc##*/releases/tag/}")" || latest="" ;;
+    esac
+    # Cache the answer — or the failure, so a dead network costs one 3 s
+    # wait a day, not one per session. Never let a write error print.
+    { mkdir -p "$cache_dir" && printf '%s' "$latest" > "$cache"; } 2>/dev/null || true
+  fi
+  [ -n "$latest" ] || return 0
+  if older_than "$installed" "$latest"; then
+    log "sirius: v$latest is out (you have $installed at $(command -v "$1" 2>/dev/null || echo "$1")) — run /sirius:install-binary to update"
+  fi
+}
+
 if [ "$MODE" = "check" ]; then
   if have sirius; then
     log "sirius: already on PATH ($(command -v sirius))"
-    if suite_repo; then suite_hint; fi
+    if suite_repo; then suite_hint; update_hint sirius || true; fi
     exit 0
   fi
   if [ -x "$BIN_DIR/sirius" ]; then
     log "sirius: installed at $BIN_DIR/sirius (not on PATH)"
     print_path_hint
-    if suite_repo; then suite_hint; fi
+    if suite_repo; then suite_hint; update_hint "$BIN_DIR/sirius" || true; fi
     exit 0
   fi
   log "sirius: not installed. Run /sirius:install-binary (or plugin/scripts/install-sirius.sh) to install it."

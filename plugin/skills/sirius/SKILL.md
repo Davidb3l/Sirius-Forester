@@ -3,13 +3,17 @@ name: sirius
 description: >-
   Drive Sirius Forester, the local-first foreman for a fleet of AI coding
   agents, in any repo that has a .sirius/ ledger beside .ametrite/ and .hayven/.
-  TWO WAYS IN. (1) START THE FOREMAN — when the human says "let's get Sirius",
+  THREE WAYS IN. (1) START THE FOREMAN — when the human says "let's get Sirius",
   "get Sirius on this repo", "Sirius this repo/Forester", "run the fleet/foreman
   here", or otherwise asks to kick off the loop, run `sirius run` (or drive one
   iteration by hand). (2) BE A WORKER — when you ARE the agent inside an
   iteration ("work an issue the Sirius way"), follow the etiquette: claim → map →
   lock → brief → work → gate → receipt → release, honoring claim order, 409
-  backoff, the gate, and a two-way receipt. If `sirius` is not installed, run
+  backoff, the gate, and a two-way receipt. (3) GUARD WHAT LANDS — "check the
+  in-flight work integrates", "run the integration check", "is the frontier
+  green", "a bug got past review / record an escape", "how good is our
+  reviewer", "run the review canaries": `sirius integrate`, `sirius escape`,
+  `sirius review-canary` (section C). If `sirius` is not installed, run
   /sirius:install-binary first.
 ---
 
@@ -279,3 +283,52 @@ hayven remember --kind decision --node <id> --scope <ids> "deadend: AMT-7 — <w
 - Do not skip the receipt because the change was "small" — coverage is measured.
 - Do not force an oracle 202/exit-3 verdict unless the project config grants a
   force budget; the default is to back off.
+
+---
+
+## C. Guard what lands — integration, escapes, canaries
+
+The review stage checks each branch on its own. Most defects that escape it
+live BETWEEN branches, or are ones the reviewer simply misses. These three
+commands cover that. Each prints one JSON object with `--json`.
+
+### Turn them on (`.sirius/config.json`, all off by default)
+- `"review": {"against": "frontier"}` — review each change merged onto the base
+  PLUS every in-flight `sirius/*` branch awaiting integration, as it will land.
+  A clash with another branch is named as a `sibling-conflict` finding.
+- `"review": {"sequences": [{"dir": "drizzle"}]}` — for migration-style dirs:
+  two branches taking the same slot become a blocking `AUTO-` conflict.
+- `"integration": {"cmd": "<your e2e / integration command>", "on_fail": "block"}`.
+
+### `sirius integrate` — "check the in-flight work integrates"
+Builds the frontier (base + every branch awaiting integration, at
+`refs/sirius/frontier`) and runs `integration.cmd` on it BEFORE anything
+merges. Report: exit `0` green, `3` red (it filed or updated one issue naming
+the branches), `1` could not run. With `on_fail: "block"`, a red frontier
+stops the fleet (exit 4) and `sirius run` refuses to launch (exit 3) until a
+later `sirius integrate` is green; work finished meanwhile is held at
+`refs/sirius/held/<issue>` and resumed when re-claimed. `sirius integrate
+--clear-red` overrides by hand — only when the human says so. `sirius doctor`
+shows the red state.
+
+### `sirius escape` — "a bug got past review"
+When anyone (you, the human, an e2e run) finds a defect in work that already
+passed review, record it against the issue that shipped it, with the commit
+that fixed it:
+```bash
+sirius escape <ISSUE> --kind <slug> -m "<what escaped>" --found-by <who> --fix <sha>
+```
+Every later review prompt checks for that pattern. When a kind has escaped
+twice you'll see a nudge to automate it; once a real check (test, lint,
+integration.cmd) catches it, retire it with
+`sirius escape --kind <slug> --automated-by <path>`. `sirius escape --list`
+shows the kinds; `sirius why <ISSUE>` shows an issue's escapes.
+
+### `sirius review-canary` — "how good is our reviewer?"
+Replays each recorded escape's fix REVERTED onto the current base (the real
+bug, back) — plus `.sirius/canaries/*.patch` — through the configured
+`review.cmd`, blind, and reports **recall** (bugs caught / canaries) and
+**false positives** on a harmless control change. It runs the reviewer once
+per canary, so it costs real tokens: ask before running it, and use `--n` to
+cap. Run it after changing the reviewer model or prompt, and compare.
+

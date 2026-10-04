@@ -5,6 +5,13 @@ release moves them under its version (see AGENTS.md → "Releases are batched").
 
 ## Unreleased
 
+## 0.1.6 — 2026-10-04
+
+### Plugin 0.2.5 (terminal and the Claude app alike)
+- New slash commands `/sirius:integrate`, `/sirius:escape`, `/sirius:review-canary`.
+- The sirius skill learns a third way in — "guard what lands" (integration, escapes, canaries) — plus fix-mode guidance for `AUTO-` and `sibling-conflict` findings.
+- The SessionStart check now says when a newer `sirius` release is out (suite repos only, at most once a day).
+
 ### Added
 - **Integration frontier** (`review.against: "frontier"`): each change is reviewed merged onto the base plus every in-flight `sirius/*` branch awaiting integration; clashes with another branch are named (`sibling-conflict` findings). (SIRF-30)
 - **Sequence-collision detector** (`review.sequences`): migration-style slots taken out of order, or claimed by an in-flight sibling or a fleet peer, become unrebuttable `AUTO-` findings. (SIRF-31)
