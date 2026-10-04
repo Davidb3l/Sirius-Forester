@@ -570,6 +570,21 @@ pub enum IterationOutcome {
     Paused(String),
 }
 
+/// Clears a worker's in-flight registration however its iteration ends —
+/// a panic included (a phantom peer would block every later slot).
+struct InflightGuard<'f> {
+    fleet: Option<&'f Fleet>,
+    worker: String,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(f) = self.fleet {
+            f.clear_inflight(&self.worker);
+        }
+    }
+}
+
 /// Run ONE iteration for a worker. Deterministic and fully mockable — the whole
 /// loop's correctness (claim order, 409 unwind, receipts) is tested through this.
 #[allow(clippy::too_many_arguments)]
@@ -590,6 +605,10 @@ pub fn run_iteration(
     // targets the user's own checkout — the reset would destroy their work.
     fleet: Option<&Fleet>,
 ) -> IterationOutcome {
+    let _inflight = InflightGuard {
+        fleet,
+        worker: worker.to_string(),
+    };
     let isolate_base: Option<&str> = fleet.map(|f| f.base.as_str());
     ledger_warn("upsert_worker", ledger.upsert_worker(worker, "working"));
 
@@ -736,6 +755,12 @@ pub fn run_iteration(
             }
         }
     }
+    // SIRF-32: work a red frontier held back is RESUMED, not redone: merge
+    // the exact held commit (if its branch still points there) onto the base.
+    let resumed: Option<String> = match isolate_base {
+        Some(_) => resume_held(amt, ledger, runner, &issue, worker),
+        None => None,
+    };
 
     // 2. MAP issue → symbols (Hayvenhurst query + impact for blast radius).
     let mut entities: Vec<String> = Vec::new();
@@ -1104,6 +1129,10 @@ pub fn run_iteration(
         ),
         kv("SIRIUS_BASE", pre_head.clone().unwrap_or_default()),
     ];
+    let mut base_env = base_env;
+    if let Some(sha) = &resumed {
+        base_env.push(kv("SIRIUS_RESUMED_FROM", sha.as_str()));
+    }
     // WORK⇄GATE as a reusable unit: the initial work pass (phase `work`) and
     // every review fix round (phase `fix`) run through the same supervision,
     // heartbeat, timeout, log capture, baseline diff, and retry budget.
@@ -1558,6 +1587,7 @@ pub fn run_iteration(
     // worktree, completed-on-the-board but existing nowhere. Auto-commit
     // whatever is uncommitted, then stamp the per-issue branch (branch -f is
     // safe: detached worktrees never hold the branch checked out).
+    let mut held_stamped = false;
     if (advanced || (gated && integration_hold.is_some())) && isolate_base.is_some() {
         let _ = crate::gitrange::run_git(runner, &["add", "-A"]);
         // May legitimately fail with "nothing to commit" when the agent
@@ -1578,6 +1608,17 @@ pub fn run_iteration(
         } else {
             Err("worktree still dirty after auto-commit (missing git identity?)".to_string())
         };
+        match &stamp {
+            // SIRF-32: held work is resumed when the issue is re-claimed —
+            // remember exactly which commit was held.
+            Ok(()) if !advanced => {
+                if let Ok(sha) = crate::gitrange::head_rev(runner) {
+                    ledger_warn("set_meta", ledger.set_meta(&held_key(&issue), Some(&sha)));
+                }
+            }
+            _ => {}
+        }
+        held_stamped = stamp.is_ok();
         if let Err(e) = stamp {
             // Without the branch the commits die with the worktree — do NOT
             // report completion over work that is about to vanish.
@@ -1597,10 +1638,14 @@ pub fn run_iteration(
     let held_back = if advanced {
         None
     } else if let (true, Some(why)) = (gated, &integration_hold) {
-        Some(format!(
-            "sirius: released without advancing — {why}; the gated work is preserved on sirius/{}",
-            issue.to_lowercase()
-        ))
+        Some(if held_stamped {
+            format!(
+                "sirius: released without advancing — {why}; the gated work is held on sirius/{} and is resumed when the issue is claimed again",
+                issue.to_lowercase()
+            )
+        } else {
+            format!("sirius: released without advancing — {why}; preserving the gated work FAILED (see the comment above)")
+        })
     } else if let ReviewStage::Release { why, .. } = &review {
         Some(format!(
             "sirius: released without advancing — review: {why}"
@@ -1906,6 +1951,53 @@ fn worktree_admin<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// The ledger meta key remembering the commit held for `issue` (SIRF-32).
+fn held_key(issue: &str) -> String {
+    format!("held:{issue}")
+}
+
+/// Merge the work a red frontier held for `issue` into the freshly reset
+/// worktree. Only the exact held commit, only while `sirius/<issue>` still
+/// points at it; a conflict with the moved base starts fresh (the branch
+/// keeps the work). The held marker is consumed either way.
+fn resume_held(
+    amt: &Amt,
+    ledger: &Ledger,
+    runner: &dyn Runner,
+    issue: &str,
+    worker: &str,
+) -> Option<String> {
+    let key = held_key(issue);
+    let sha = ledger.meta(&key).ok().flatten()?;
+    ledger_warn("set_meta", ledger.set_meta(&key, None));
+    let branch = format!("sirius/{}", issue.to_lowercase());
+    let tip = crate::gitrange::run_git(
+        runner,
+        &["rev-parse", "--verify", &format!("{branch}^{{commit}}")],
+    )
+    .ok()?;
+    if tip.stdout.trim() != sha {
+        return None; // the branch moved on — not ours to resume
+    }
+    let mut args: Vec<&str> = crate::frontier::THROWAWAY_MERGE_CONFIG.to_vec();
+    args.extend(["merge", "--no-verify", "--no-edit", &sha]);
+    if crate::gitrange::run_git(runner, &args).is_ok() {
+        let _ = amt.comment_as(
+            issue,
+            &format!("sirius: resuming the work held on {branch} ({sha})"),
+            worker,
+        );
+        return Some(sha);
+    }
+    let _ = crate::gitrange::run_git(runner, &["merge", "--abort"]);
+    let _ = amt.comment_as(
+        issue,
+        &format!("sirius: the work held on {branch} ({sha}) no longer merges onto the base — starting fresh; the held commits stay on that branch"),
+        worker,
+    );
+    None
+}
+
 /// Blocking `conflict` findings: the work does not merge onto `r` at `cur`.
 fn base_conflict_findings(round: u32, r: &str, cur: &str, files: &[String]) -> Vec<Finding> {
     let short = &cur[..cur.len().min(10)];
@@ -2012,20 +2104,8 @@ fn review_once(
     let frontier_mode = rc.against == crate::config::ReviewAgainst::Frontier;
     fleet.register_inflight(cx.worker, cx.issue, &head);
     let (sibs, sibs_complete) = if frontier_mode || !rc.sequences.is_empty() {
-        let status_of = |issue: &str| {
-            cx.amt.issue_show(issue).map(|v| {
-                let s = |k: &str| v[k].as_str().unwrap_or_default().to_string();
-                (s("status"), s("title"))
-            })
-        };
-        let d = crate::frontier::siblings(
-            cx.runner,
-            &status_of,
-            &tip,
-            cx.issue,
-            &cx.config.target_status,
-            crate::frontier::MAX_SIBLINGS,
-        );
+        let awaiting = crate::frontier::awaiting(cx.amt, &cx.config.target_status);
+        let d = crate::frontier::siblings(cx.runner, &awaiting, &tip, cx.issue);
         (d.sibs, d.complete)
     } else {
         (Vec::new(), true)
@@ -2069,7 +2149,10 @@ fn review_once(
             }
         };
         let t_str = t.to_string_lossy().to_string();
-        match crate::frontier::prepare(cx.runner, &t_str, &tip, &head, &sibs) {
+        // Merge only the oldest MAX_SIBLINGS (next in line); the sequence
+        // check above already covered every sibling.
+        let merge_sibs = &sibs[..sibs.len().min(crate::frontier::MAX_SIBLINGS)];
+        match crate::frontier::prepare(cx.runner, &t_str, &tip, &head, merge_sibs) {
             crate::frontier::Prepared::Ready {
                 frontier,
                 merged,
@@ -2082,18 +2165,18 @@ fn review_once(
                 )
                 .unwrap_or_default();
                 let branches: Vec<&str> = merged.iter().map(|s| s.branch.as_str()).collect();
+                let mut summary =
+                    crate::frontier::render_siblings(&merged, &left_out, &sibling_conflicts, &ours);
+                if sibs.len() > merge_sibs.len() {
+                    summary.push_str(&format!(
+                        "\n- … and {} newer in-flight issue(s) not merged into the review tree",
+                        sibs.len() - merge_sibs.len()
+                    ));
+                }
                 frontier_env = vec![
                     kv("SIRIUS_FRONTIER", frontier.as_str()),
                     kv("SIRIUS_SIBLING_BRANCHES", branches.join(",")),
-                    kv(
-                        "SIRIUS_SIBLINGS",
-                        crate::frontier::render_siblings(
-                            &merged,
-                            &left_out,
-                            &sibling_conflicts,
-                            &ours,
-                        ),
-                    ),
+                    kv("SIRIUS_SIBLINGS", summary),
                 ];
                 diff_range = format!("{frontier}..HEAD");
                 auto.extend(sibling_conflicts);
@@ -5005,9 +5088,9 @@ mod tests {
     fn program_sibling(m: &MockRunner) {
         m.expect(&["git", "for-each-ref"], 0, "sirius/amt-7\tsib7\n");
         m.expect(
-            &["amt", "--json", "issue", "show", "AMT-7"],
+            &["amt", "--json", "issue", "list", "--status", "in_review"],
             0,
-            r#"{"id":"AMT-7","status":"in_review","title":"Other work"}"#,
+            r#"[{"id":"AMT-7","status":"in_review","title":"Other work"}]"#,
         );
         m.expect(
             &["git", "diff", "--name-only", "base999...sib7"],
@@ -5127,24 +5210,28 @@ mod tests {
     }
 
     /// `dir` m/ at the launch base (also the current tip — no base_ref).
+    /// `git ls-tree -z` records for newline-separated paths (oid = path, so
+    /// a same-named entry is the same content).
+    fn ls_tree_z(paths: &str) -> String {
+        paths
+            .lines()
+            .map(|p| format!("100644 blob {p}\t{p}\0"))
+            .collect()
+    }
+
     fn program_sequence_round(m: &MockRunner, head: &str, head_entries: &str) {
-        let z = |names: &str| names.replace('\n', "\0");
         program_sibling(m);
         m.expect(
-            &["git", "ls-tree", "-z", "--name-only", "sib7"],
+            &["git", "ls-tree", "-z", "sib7"],
             0,
-            &z("m/0001_a\nm/0002_theirs\n"),
+            &ls_tree_z("m/0001_a\nm/0002_theirs\n"),
         );
-        m.expect(
-            &["git", "ls-tree", "-z", "--name-only", head],
-            0,
-            &z(head_entries),
-        );
+        m.expect(&["git", "ls-tree", "-z", head], 0, &ls_tree_z(head_entries));
         for _ in 0..2 {
             m.expect(
-                &["git", "ls-tree", "-z", "--name-only", "base999"],
+                &["git", "ls-tree", "-z", "base999"],
                 0,
-                &z("m/0001_a\n"),
+                &ls_tree_z("m/0001_a\n"),
             );
         }
     }
@@ -5430,22 +5517,21 @@ mod tests {
         let m = MockRunner::new();
         program_review_iteration(&m, "AMT-86");
         checkpoint_heads(&m, &["ck1"]);
-        let z = |n: &str| n.replace('\n', "\0");
         m.expect(
-            &["git", "ls-tree", "-z", "--name-only", "peer1"],
+            &["git", "ls-tree", "-z", "peer1"],
             0,
-            &z("m/0001_a\nm/0002_rowan\n"),
+            &ls_tree_z("m/0001_a\nm/0002_rowan\n"),
         );
         m.expect(
-            &["git", "ls-tree", "-z", "--name-only", "ck1"],
+            &["git", "ls-tree", "-z", "ck1"],
             0,
-            &z("m/0001_a\nm/0002_oak\n"),
+            &ls_tree_z("m/0001_a\nm/0002_oak\n"),
         );
         for _ in 0..2 {
             m.expect(
-                &["git", "ls-tree", "-z", "--name-only", "base999"],
+                &["git", "ls-tree", "-z", "base999"],
                 0,
-                &z("m/0001_a\n"),
+                &ls_tree_z("m/0001_a\n"),
             );
         }
         m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
@@ -5466,7 +5552,14 @@ mod tests {
         );
         // rowan, registered FIRST, does not see oak (first come owns the slot).
         assert!(fleet.peers_before("sirius/rowan").is_empty());
-        assert_eq!(fleet.peers_before("sirius/oak").len(), 1);
+        // oak's iteration is over: its registration is gone (drop guard),
+        // and only rowan — still under review — remains.
+        assert!(fleet.peers_before("sirius/oak").is_empty());
+        fleet.register_inflight("sirius/elm", "AMT-71", "elm1");
+        assert_eq!(
+            fleet.peers_before("sirius/elm"),
+            vec![("AMT-70".to_string(), "peer1".to_string())]
+        );
     }
 
     #[test]
@@ -5480,11 +5573,7 @@ mod tests {
         program_sequence_round(&m, "ck1", "m/0001_a\nm/0002_mine\n");
         // Round 2: the sibling's status cannot be read.
         m.expect(&["git", "for-each-ref"], 0, "sirius/amt-7\tsib7\n");
-        m.expect(
-            &["amt", "--json", "issue", "show", "AMT-7"],
-            1,
-            "database is locked",
-        );
+        m.expect(&["amt", "--json", "issue", "list"], 1, "database is locked");
         m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
         m.on_phase_write("fix", "SIRIUS_FIX_OUT", r#"{"responses":[]}"#);
         m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
@@ -5509,6 +5598,7 @@ mod tests {
         // its branch and released to todo naming the red run.
         let m = MockRunner::new();
         program_review_iteration(&m, "AMT-88");
+        m.expect(&["git", "rev-parse", "HEAD"], 0, "heldsha\n");
         let mut c = review_cfg(3);
         c.integration.on_fail = crate::config::IntegrationOnFail::Block;
         let amt = Amt::new(&m);
@@ -5552,6 +5642,94 @@ mod tests {
             release.contains("--status todo") && release.contains("integration red at f1 (AMT-90)"),
             "{release}"
         );
+        assert_eq!(
+            led.meta("held:AMT-88").unwrap().as_deref(),
+            Some("heldsha"),
+            "the held commit is remembered for the re-claim"
+        );
+        assert!(
+            release.contains("resumed when the issue is claimed again"),
+            "{release}"
+        );
+    }
+
+    #[test]
+    fn held_work_is_resumed_on_reclaim() {
+        // SIRF-32 review N4: not redone from scratch, and not clobbered.
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-91");
+        m.expect(
+            &["git", "rev-parse", "--verify", "sirius/amt-91^{commit}"],
+            0,
+            "heldsha\n",
+        );
+        let led = Ledger::open_in_memory().unwrap();
+        led.set_meta("held:AMT-91", Some("heldsha")).unwrap();
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let fleet = test_fleet("base999");
+        let mut out = Vec::new();
+        run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &cfg(),
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
+            None,
+            Some(&fleet),
+        );
+        let rec = m.recorded();
+        let merge = rec
+            .iter()
+            .position(|c| c.contains(" merge ") && c.ends_with("heldsha"));
+        let agent = rec.iter().position(|c| c.starts_with("sh -c"));
+        assert!(
+            merge.is_some() && merge < agent,
+            "held work merged before the agent runs: {rec:?}"
+        );
+        assert_eq!(
+            env_of(&m.agent_envs()[0], "SIRIUS_RESUMED_FROM").as_deref(),
+            Some("heldsha")
+        );
+        assert_eq!(
+            led.meta("held:AMT-91").unwrap(),
+            None,
+            "the marker is consumed"
+        );
+    }
+
+    #[test]
+    fn a_moved_held_branch_is_not_resumed() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-92");
+        m.expect(
+            &["git", "rev-parse", "--verify", "sirius/amt-92^{commit}"],
+            0,
+            "someoneelse\n",
+        );
+        let led = Ledger::open_in_memory().unwrap();
+        led.set_meta("held:AMT-92", Some("heldsha")).unwrap();
+        let (amt, hv, fleet) = (Amt::new(&m), Hayven::new(&m), test_fleet("base999"));
+        let mut out = Vec::new();
+        run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &cfg(),
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
+            None,
+            Some(&fleet),
+        );
+        assert!(!m.recorded().iter().any(|c| c.ends_with("heldsha")));
+        assert_eq!(env_of(&m.agent_envs()[0], "SIRIUS_RESUMED_FROM"), None);
     }
 
     #[test]

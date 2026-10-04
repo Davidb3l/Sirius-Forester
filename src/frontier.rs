@@ -17,13 +17,12 @@ use crate::review::{fnv1a, Finding};
 use crate::shell::Runner;
 use regex::Regex;
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-/// At most this many siblings are merged into a REVIEW frontier.
+/// At most this many siblings (the oldest — next in line to merge) are
+/// merged into a REVIEW frontier. Sequence checks and `sirius integrate`
+/// always use every sibling.
 pub const MAX_SIBLINGS: usize = 12;
-/// At most this many unmerged `sirius/*` branches are looked at — completed
-/// branches are never deleted, and each one costs an `amt issue show`.
-pub const SCAN_LIMIT: usize = 50;
 
 /// Another issue's completed branch awaiting integration.
 #[derive(Debug, Clone, PartialEq)]
@@ -44,35 +43,54 @@ fn lines(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// Answers an issue's `(status, title)`.
-pub type StatusOf<'a> = dyn Fn(&str) -> Result<(String, String), String> + 'a;
+/// Every issue awaiting integration (`target_status`), key → title — ONE
+/// `amt issue list`, not an `issue show` per branch: completed branches are
+/// never deleted, so a per-branch scan grows without bound, and a branch
+/// whose issue was deleted is simply not awaiting anything.
+pub fn awaiting(
+    amt: &crate::amt::Amt,
+    target_status: &str,
+) -> Result<HashMap<String, String>, String> {
+    let rows = amt.issue_list_status(target_status)?;
+    Ok(rows
+        .iter()
+        .filter_map(|v| {
+            let id = v["id"].as_str()?;
+            Some((
+                id.to_uppercase(),
+                v["title"].as_str().unwrap_or_default().to_string(),
+            ))
+        })
+        .collect())
+}
 
 /// The siblings of `own_issue`: local `sirius/*` branches not merged into
-/// `cur` whose issue is in `target_status` (awaiting integration — this also
-/// drops squash-merged or abandoned work, whose branches stay "unmerged"
-/// forever), oldest completion first. `status_of(issue)` answers
-/// `(status, title)`.
+/// `cur` whose issue is in `awaiting` (this also drops squash-merged or
+/// abandoned work, whose branches stay "unmerged" forever), oldest
+/// completion first. `awaiting` is `Err` when the board could not be read.
 ///
-/// At most `max` siblings are kept — the OLDEST (next in line to merge);
-/// the rest are named in `dropped`. `complete` is `false` when a failed
-/// `for-each-ref`, an issue `status_of` could not answer, or a scan that hit
-/// its limit means siblings may be missing — facts built on an incomplete
-/// discovery must not be read as "the collision went away" (fail closed).
+/// `complete` is `false` only on a TRANSIENT failure (the board or git could
+/// not answer): facts built on it must not be read as "the collision went
+/// away" (fail closed) — and it heals on the next round.
 pub fn siblings(
     runner: &dyn Runner,
-    status_of: &StatusOf,
+    awaiting: &Result<HashMap<String, String>, String>,
     cur: &str,
     own_issue: &str,
-    target_status: &str,
-    max: usize,
 ) -> Discovery {
+    let awaiting = match awaiting {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("sirius: cannot read the board ({e}) — reviewing without siblings");
+            return Discovery::default();
+        }
+    };
     let own = format!("sirius/{}", own_issue.to_lowercase());
     let out = match run_git(
         runner,
         &[
             "for-each-ref",
-            "--sort=-committerdate",
-            &format!("--count={SCAN_LIMIT}"),
+            "--sort=committerdate",
             &format!("--no-merged={cur}"),
             "--format=%(refname:short)%09%(objectname)",
             "refs/heads/sirius/",
@@ -81,17 +99,11 @@ pub fn siblings(
         Ok(o) => o,
         Err(e) => {
             eprintln!("sirius: cannot list sibling branches ({e}) — reviewing without them");
-            return Discovery {
-                sibs: vec![],
-                dropped: vec![],
-                complete: false,
-            };
+            return Discovery::default();
         }
     };
-    let refs = lines(&out.stdout);
-    let mut complete = refs.len() < SCAN_LIMIT;
-    let mut found = Vec::new();
-    for line in refs {
+    let mut sibs = Vec::new();
+    for line in lines(&out.stdout) {
         let Some((branch, tip)) = line.split_once('\t') else {
             continue;
         };
@@ -102,39 +114,23 @@ pub fn siblings(
             continue;
         };
         let issue = key.to_uppercase();
-        let (status, title) = match status_of(&issue) {
-            Ok(st) => st,
-            Err(e) => {
-                eprintln!("sirius: cannot read {issue}'s status ({e}) — treated as unknown");
-                complete = false;
-                continue;
-            }
-        };
-        if status != target_status {
+        let Some(title) = awaiting.get(&issue) else {
             continue;
-        }
+        };
         let files = run_git(runner, &["diff", "--name-only", &format!("{cur}...{tip}")])
             .map(|o| lines(&o.stdout))
             .unwrap_or_default();
-        found.push(Sibling {
+        sibs.push(Sibling {
             issue,
-            title,
+            title: title.clone(),
             branch: branch.to_string(),
             tip: tip.to_string(),
             files,
         });
     }
-    // Scanned newest first; keep the OLDEST `max`, in completion order.
-    found.reverse();
-    let dropped = if found.len() > max {
-        found.split_off(max).into_iter().map(|s| s.issue).collect()
-    } else {
-        Vec::new()
-    };
     Discovery {
-        sibs: found,
-        dropped,
-        complete,
+        sibs,
+        complete: true,
     }
 }
 
@@ -142,8 +138,6 @@ pub fn siblings(
 #[derive(Debug, Clone, Default)]
 pub struct Discovery {
     pub sibs: Vec<Sibling>,
-    /// In `target_status` but over the cap (newest first dropped).
-    pub dropped: Vec<String>,
     pub complete: bool,
 }
 
@@ -467,20 +461,32 @@ fn norm_dir(dir: &str) -> &str {
     dir.trim_start_matches("./").trim_end_matches('/')
 }
 
-/// The direct children of `dir` at `rev` (names only). A missing dir is
-/// empty; a git failure is an error (never "no entries"). `-z` keeps names
-/// with special characters unquoted.
-pub fn seq_entries(runner: &dyn Runner, rev: &str, dir: &str) -> Result<Vec<String>, String> {
+/// One sequence entry: its name and its content (blob/tree id) — two
+/// entries with the SAME name but different content still collide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub name: String,
+    pub oid: String,
+}
+
+/// The direct children of `dir` at `rev`. A missing dir is empty; a git
+/// failure is an error (never "no entries"). `-z` keeps names unquoted.
+pub fn seq_entries(runner: &dyn Runner, rev: &str, dir: &str) -> Result<Vec<Entry>, String> {
     let prefix = format!("{}/", norm_dir(dir));
-    let out = run_git(
-        runner,
-        &["ls-tree", "-z", "--name-only", rev, "--", &prefix],
-    )?;
+    let out = run_git(runner, &["ls-tree", "-z", rev, "--", &prefix])?;
     Ok(out
         .stdout
         .split('\0')
-        .filter_map(|p| p.strip_prefix(&prefix).map(String::from))
-        .filter(|n| !n.is_empty())
+        .filter_map(|rec| {
+            // "<mode> <type> <oid>\t<path>"
+            let (meta, path) = rec.split_once('\t')?;
+            let oid = meta.split_whitespace().nth(2)?;
+            let name = path.strip_prefix(&prefix)?;
+            (!name.is_empty()).then(|| Entry {
+                name: name.to_string(),
+                oid: oid.to_string(),
+            })
+        })
         .collect())
 }
 
@@ -491,19 +497,19 @@ fn cmp_keys(a: &str, b: &str) -> Ordering {
     }
 }
 
-fn keyed(re: &Regex, names: &[String]) -> Vec<(String, String)> {
-    names
-        .iter()
-        .filter_map(|n| {
-            re.captures(n)
+fn keyed<'e>(re: &Regex, entries: impl IntoIterator<Item = &'e Entry>) -> Vec<(&'e Entry, String)> {
+    entries
+        .into_iter()
+        .filter_map(|e| {
+            re.captures(&e.name)
                 .and_then(|c| c.get(1))
-                .map(|k| (n.clone(), k.as_str().to_string()))
+                .map(|k| (e, k.as_str().to_string()))
         })
         .collect()
 }
 
-/// The sequence entries one sibling contributes: `(issue, entry names)`.
-pub type SiblingEntries = (String, Vec<String>);
+/// The sequence entries one sibling contributes: `(issue, entries)`.
+pub type SiblingEntries = (String, Vec<Entry>);
 
 /// Collisions for one sequence. `launch` / `ours` / `current` are the dir's
 /// entries at the launch base, the work, and the current base tip; each
@@ -512,9 +518,9 @@ pub type SiblingEntries = (String, Vec<String>);
 /// base's entries along — those are not this branch's to number).
 pub fn sequence_findings(
     spec: &SequenceSpec,
-    launch: &[String],
-    ours: &[String],
-    current: &[String],
+    launch: &[Entry],
+    ours: &[Entry],
+    current: &[Entry],
     sibs: &[SiblingEntries],
 ) -> Result<Vec<Finding>, String> {
     let re =
@@ -527,15 +533,13 @@ pub fn sequence_findings(
         ));
     }
     let dir = norm_dir(&spec.dir);
-    let added: Vec<String> = ours
+    let added = ours
         .iter()
-        .filter(|n| !launch.contains(n) && !current.contains(n))
-        .cloned()
-        .collect();
+        .filter(|e| !launch.contains(e) && !current.contains(e));
     let cur_keys = keyed(&re, current);
     let mut out = Vec::new();
-    for (name, k) in keyed(&re, &added) {
-        let path = format!("{dir}/{name}");
+    for (mine, k) in keyed(&re, added) {
+        let path = format!("{dir}/{}", mine.name);
         // The base's highest entry at or after our slot.
         if let Some((c, _)) = cur_keys
             .iter()
@@ -548,21 +552,25 @@ pub fn sequence_findings(
                 confidence: "confirmed".into(),
                 file: Some(path.clone()),
                 line: None,
-                summary: format!("`{path}` does not come after `{dir}/{c}`, already on the base"),
+                summary: format!(
+                    "`{path}` does not come after `{dir}/{}`, already on the base",
+                    c.name
+                ),
                 scenario: format!(
-                    "the base already has `{c}` at or after slot {k}: this entry was generated on an older parent, and merged as is the sequence forks"
+                    "the base already has `{}` at or after slot {k}: this entry was generated on an older parent, and merged as is the sequence forks",
+                    c.name
                 ),
                 fix: "merge the current base, delete this entry, and regenerate it on top".into(),
                 response: None,
             });
         }
         for (issue, entries) in sibs {
-            let theirs: Vec<String> = entries
+            // The same entry (same name AND content — e.g. the sibling's
+            // work merged in) is not a collision; a same-named rewrite is.
+            let theirs = entries
                 .iter()
-                .filter(|n| !current.contains(n) && *n != &name)
-                .cloned()
-                .collect();
-            if let Some((s, _)) = keyed(&re, &theirs)
+                .filter(|e| !current.contains(e) && *e != mine);
+            if let Some((s, _)) = keyed(&re, theirs)
                 .into_iter()
                 .find(|(_, sk)| cmp_keys(sk, &k) == Ordering::Equal)
             {
@@ -573,7 +581,8 @@ pub fn sequence_findings(
                     file: Some(path.clone()),
                     line: None,
                     summary: format!(
-                        "`{path}` claims sequence slot {k}, which in-flight {issue} also claims (`{dir}/{s}`)"
+                        "`{path}` claims sequence slot {k}, which in-flight {issue} also claims (`{dir}/{}`)",
+                        s.name
                     ),
                     scenario: format!(
                         "{issue} is awaiting integration with its own entry at slot {k}; once both merge, the sequence has two entries on one parent"
@@ -632,8 +641,14 @@ mod tests {
     use super::*;
     use crate::shell::RealRunner;
 
-    fn v(names: &[&str]) -> Vec<String> {
-        names.iter().map(|s| s.to_string()).collect()
+    fn v(names: &[&str]) -> Vec<Entry> {
+        names
+            .iter()
+            .map(|s| Entry {
+                name: s.to_string(),
+                oid: "x".into(),
+            })
+            .collect()
     }
 
     fn spec(dir: &str) -> SequenceSpec {
@@ -708,6 +723,33 @@ mod tests {
         )
         .unwrap();
         assert!(f.is_empty(), "{f:?}");
+    }
+
+    #[test]
+    fn a_same_named_entry_with_different_content_collides() {
+        // Review N10: deterministic generator names (`0002_add_x`) in two
+        // parallel workers — same name, different migration.
+        let mut theirs = v(&["0001_a", "0002_add_x"]);
+        theirs[1].oid = "other".into();
+        let f = sequence_findings(
+            &spec("m"),
+            &v(&["0001_a"]),
+            &v(&["0001_a", "0002_add_x"]),
+            &v(&["0001_a"]),
+            &[("SIRF-12".into(), theirs)],
+        )
+        .unwrap();
+        assert_eq!(f.len(), 1, "{f:?}");
+        // The SAME entry (their work merged into ours) is not a collision.
+        let same = sequence_findings(
+            &spec("m"),
+            &v(&["0001_a"]),
+            &v(&["0001_a", "0002_add_x"]),
+            &v(&["0001_a"]),
+            &[("SIRF-12".into(), v(&["0001_a", "0002_add_x"]))],
+        )
+        .unwrap();
+        assert!(same.is_empty(), "{same:?}");
     }
 
     #[test]
@@ -811,12 +853,13 @@ mod tests {
         }
     }
 
-    fn in_review(issue: &str) -> Result<(String, String), String> {
-        match issue {
-            "SIRF-1" | "SIRF-2" => Ok(("in_review".into(), format!("{issue} title"))),
-            "SIRF-3" => Ok(("done".into(), "merged by squash".into())),
-            _ => Err("no such issue".into()),
-        }
+    /// SIRF-1/2 await integration; SIRF-3 is done (squash-merged); a
+    /// branch whose issue is gone (sirius/sirf-7) is simply not awaiting.
+    fn awaiting_map() -> Result<HashMap<String, String>, String> {
+        Ok([("SIRF-1", "one"), ("SIRF-2", "two"), ("SIRF-9", "ours")]
+            .into_iter()
+            .map(|(k, t)| (k.to_string(), t.to_string()))
+            .collect())
     }
 
     #[test]
@@ -827,19 +870,17 @@ mod tests {
         repo.branch("sirius/sirf-1", &base, &[("one.txt", "1\n")]);
         repo.branch("sirius/sirf-2", &base, &[("two.txt", "2\n")]);
         repo.branch("sirius/sirf-3", &base, &[("three.txt", "3\n")]); // done (squashed)
+        repo.branch("sirius/sirf-7", &base, &[("seven.txt", "7\n")]); // issue deleted
         repo.branch("sirius/sirf-9", &base, &[("nine.txt", "9\n")]); // our own
         let merged_in = repo.branch("sirius/sirf-4", &base, &[("four.txt", "4\n")]);
         repo.git(&["merge", "-q", "--no-ff", "--no-edit", &merged_in]); // already in main
         let cur = repo.git(&["rev-parse", "main"]);
-        let d = siblings(
-            &repo.r,
-            &in_review,
-            &cur,
-            "SIRF-9",
-            "in_review",
-            MAX_SIBLINGS,
+        let d = siblings(&repo.r, &awaiting_map(), &cur, "SIRF-9");
+        assert!(
+            d.complete,
+            "stale and orphaned branches never make it incomplete"
         );
-        assert!(d.complete && d.dropped.is_empty());
+        assert!(!siblings(&repo.r, &Err("busy".into()), &cur, "SIRF-9").complete);
         let s = d.sibs;
         let issues: Vec<&str> = s.iter().map(|s| s.issue.as_str()).collect();
         assert_eq!(issues.len(), 2, "{issues:?}");

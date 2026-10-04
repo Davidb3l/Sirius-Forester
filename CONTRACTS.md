@@ -137,9 +137,9 @@ sirius gate AMT-7 [--tier safe] [--target-status in_review] [--range <git-range>
    # Selects affected tests over the changed files, then RUNS them via
    # gate.test_cmd (full suite on any doubt); verdict = the runner's exit code.
 
-sirius integrate [--json]   # SIRF-32 — build the frontier, run integration.cmd on it
+sirius integrate [--clear-red] [--json]   # SIRF-32 — build the frontier, run integration.cmd on it
    -> {"ok":bool,"base_ref":str,"frontier":str,"included":["AMT-7"],
-       "left_out":[{"issue":"AMT-9","files":[str]}],"dropped":[str],"complete":bool,
+       "left_out":[{"issue":"AMT-9","files":[str]}],"complete":bool,
        "ran":bool,"exit":int|null,"timed_out":bool,"log":str|null,
        "issue":"AMT-12"|null,"red":bool}
    # frontier = base_ref tip + every sibling (§3.1) merged in order, in a throwaway
@@ -147,14 +147,20 @@ sirius integrate [--json]   # SIRF-32 — build the frontier, run integration.cm
    # `sh -c` with SIRIUS_INTEGRATION_DIR, SIRIUS_FRONTIER, SIRIUS_BASE_REF. A failure
    # records the red state in the ledger (meta `integration_red`) FIRST, then files
    # ONE issue (label integration; later failures comment on it while it is open or
-   # unreadable). Only a pass over a COMPLETE frontier (every sibling awaiting
-   # integration merged: none left_out, none dropped, discovery complete) clears it
-   # and comments on that issue; a partial pass says so and stays red. No
+   # unreadable). Siblings = every unmerged sirius/* branch whose issue is in
+   # target_status, from ONE `amt issue list` (stale or orphaned branches are simply
+   # not awaiting). Only a pass over a COMPLETE discovery (board and git answered)
+   # clears red and comments on the issue; a pass over a transiently incomplete one
+   # says so and stays red (the next run heals it). left_out siblings (textual
+   # conflicts between siblings — the merge order's problem) do not keep it red. No
    # integration.cmd = build + report only — never green, red state untouched.
+   # --clear-red: a human override — clears the red state without a green run,
+   # comments BY HAND on the issue -> {"ok":true,"cleared":true,"issue":str|null}.
    # One integrate per repo (.sirius/integrate.lock, pid; a dead holder is taken over).
    # A timed-out command's whole process tree is killed.
-   # Exit 0 passed (or nothing to run), 3 red, 1 operational failure (incl. lock held).
-   # Spine: integration.passed / integration.failed.
+   # Exit follows the LINE: 3 while red (failed, partial, or untested-while-red), 0
+   # otherwise, 1 operational failure (incl. lock held).
+   # Spine: integration.passed / .failed / .partial / .built (nothing ran) / .cleared.
    # Not (yet) implemented from SIRF-32's sketch: `integration.after_each`.
 
 sirius run --workers N --agent-cmd "<cmd>" [--from todo] [--review-cmd "<cmd>"]
@@ -244,7 +250,10 @@ other stdout formats.
     "on_fail": "warn",                     // | "block": while red, `sirius run` refuses to start (exit 3),
                                            //   a running fleet stops claiming (paused, exit 4), and gated
                                            //   work is HELD: no review, no receipt, preserved on its
-                                           //   sirius/<issue> branch, released to todo (outcome released)
+                                           //   sirius/<issue> branch, released to todo (outcome released),
+                                           //   and RESUMED on re-claim (merged onto the fresh worktree
+                                           //   while the branch still points at the held commit;
+                                           //   agent env SIRIUS_RESUMED_FROM=<sha>)
     "timeout_secs": 1800
   }
 }
@@ -316,7 +325,8 @@ sibling that conflicts with the work on its own is a `sibling-conflict` finding
 merge. Throwaway merges run no repo hooks (`--no-verify`, a null `core.hooksPath`) and
 no rerere. Extra reviewer env:
 `SIRIUS_FRONTIER` (the frontier commit), `SIRIUS_SIBLING_BRANCHES` (comma list of
-merged siblings), `SIRIUS_SIBLINGS` (rendered summary: issue, title, branch, files,
+merged siblings), `SIRIUS_SIBLINGS` (rendered summary of the oldest 12 merged — every sibling still counts
+for sequence checks — with issue, title, branch, files,
 overlap with this diff — also a prompt placeholder, appended to the prompt when a
 custom template lacks it).
 
@@ -330,8 +340,9 @@ contested slot. A violation is a `conflict`/`confirmed` finding with a stable `A
 id, recomputed every round — a fact, not an opinion: a rebuttal cannot close it (a
 vanished one counts as fixed, never as an accepted rebuttal), regenerating the entry
 does. If a round cannot recompute the facts completely (git or amt errors), the
-previous round's `AUTO-` findings stay open. `key` must have a capture group; `dir`
-may start with `./`. Computed for every `against` mode.
+previous round's `AUTO-` findings stay open. Entries compare by name AND content (a
+same-named entry with different content collides). `key` must have a capture group
+(checked when the config loads); `dir` may start with `./`. Computed for every `against` mode.
 
 One issue comment per round and per fix (as `sirius/<tree>`), a `review_rounds`
 ledger row per attempt, spine events `review.started` / `review.finding` /

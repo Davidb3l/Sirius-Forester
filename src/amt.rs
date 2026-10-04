@@ -220,6 +220,17 @@ impl<'r> Amt<'r> {
             .ok_or_else(|| format!("amt decide returned no decision id: {v}"))
     }
 
+    /// `amt --json issue list --status <s> --limit 100000` — every issue in
+    /// one status (SIRF-30: the issues awaiting integration).
+    pub fn issue_list_status(&self, status: &str) -> Result<Vec<Value>, String> {
+        let v = self.json(&[
+            "--json", "issue", "list", "--status", status, "--limit", "100000",
+        ])?;
+        v.as_array()
+            .cloned()
+            .ok_or_else(|| format!("amt issue list returned no array: {v}"))
+    }
+
     /// `amt --json issue create --title <t> -b <body> --priority <p> --label …`
     /// → the new issue's key.
     pub fn issue_create(

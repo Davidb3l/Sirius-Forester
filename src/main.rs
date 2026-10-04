@@ -62,7 +62,7 @@ fn main() -> ExitCode {
             range,
             json,
         } => cmd_gate(&ws, &runner, &issue, tier, target_status, range, json),
-        Command::Integrate { json } => cmd_integrate(&ws, &runner, json),
+        Command::Integrate { clear_red, json } => cmd_integrate(&ws, &runner, clear_red, json),
         Command::Run {
             workers,
             agent_cmd,
@@ -553,7 +553,7 @@ fn cmd_gate(
 
 // ---- integrate ---------------------------------------------------------
 
-fn cmd_integrate(ws: &Workspace, runner: &RealRunner, json: bool) -> u8 {
+fn cmd_integrate(ws: &Workspace, runner: &RealRunner, clear_red: bool, json: bool) -> u8 {
     let ledger = match open_ledger(ws) {
         Ok(l) => l,
         Err(c) => return c,
@@ -571,6 +571,27 @@ fn cmd_integrate(ws: &Workspace, runner: &RealRunner, json: bool) -> u8 {
             std::env::current_dir().map(|c| c.join(&d)).unwrap_or(d)
         }
     };
+    if clear_red {
+        return match integrate::clear_red(&amt, &ledger, &sirius_abs) {
+            Ok(issue) => {
+                spine::Spine::new(&ws.root).emit(
+                    "integration.cleared",
+                    issue.iter().map(|i| spine::issue_ref(i)).collect(),
+                    json!({ "by": "hand" }),
+                );
+                if json {
+                    print_json(&json!({"ok": true, "cleared": true, "issue": issue}));
+                } else {
+                    println!("integration red state cleared by hand");
+                }
+                0
+            }
+            Err(e) => {
+                eprint_err(&e);
+                1
+            }
+        };
+    }
     match integrate::integrate(runner, &amt, &ledger, &cfg, &sirius_abs) {
         Ok(r) => {
             let mut refs = vec![];
@@ -578,10 +599,11 @@ fn cmd_integrate(ws: &Workspace, runner: &RealRunner, json: bool) -> u8 {
                 refs.push(spine::issue_ref(i));
             }
             spine::Spine::new(&ws.root).emit(
-                if r.ok {
-                    "integration.passed"
-                } else {
-                    "integration.failed"
+                match (r.ran, r.ok, r.red) {
+                    (false, _, _) => "integration.built",
+                    (true, false, _) => "integration.failed",
+                    (true, true, true) => "integration.partial",
+                    (true, true, false) => "integration.passed",
                 },
                 refs,
                 json!({ "frontier": r.frontier.clone(), "included": r.included.clone(), "exit": r.exit }),
@@ -591,12 +613,12 @@ fn cmd_integrate(ws: &Workspace, runner: &RealRunner, json: bool) -> u8 {
             } else {
                 println!(
                     "integration {} at {} ({} + {}){}{}",
-                    if !r.ran {
-                        "frontier built (no integration.cmd)"
-                    } else if r.ok {
-                        "GREEN"
-                    } else {
-                        "RED"
+                    match (r.ran, r.ok, r.red) {
+                        (false, _, true) => "frontier built (no integration.cmd) — still RED",
+                        (false, _, false) => "frontier built (no integration.cmd)",
+                        (true, false, _) => "RED",
+                        (true, true, true) => "passed over a PARTIAL discovery — still RED",
+                        (true, true, false) => "GREEN",
                     },
                     r.frontier,
                     r.base_ref,
@@ -615,10 +637,12 @@ fn cmd_integrate(ws: &Workspace, runner: &RealRunner, json: bool) -> u8 {
                         .unwrap_or_default()
                 );
             }
-            if r.ok {
-                0
+            // The exit code follows the LINE: red (however it got there)
+            // is the soft "blocked" 3 per CONTRACTS §2.
+            if r.red {
+                3
             } else {
-                3 // soft "blocked" per CONTRACTS §2.
+                0
             }
         }
         Err(e) => {
@@ -967,6 +991,15 @@ fn load_review_prompt(ws: &Workspace, cfg: &Config) -> Result<String, String> {
 /// dependency: `ps -p <pid>` exit status. Only used to detect a stale fleet
 /// pidfile, so a false "alive" merely makes the operator remove the file.
 fn libc_kill_probe(pid: i32) -> bool {
+    // Windows has no `ps` (and MSYS `ps` cannot see native pids): every live
+    // holder read as dead and every lock was taken over (SIRF-32 review).
+    if cfg!(windows) {
+        let filter = format!("PID eq {pid}");
+        return RealRunner::default()
+            .run("tasklist", &["/FI", &filter, "/NH", "/FO", "CSV"])
+            .map(|o| o.success() && o.stdout.contains(&format!("\"{pid}\"")))
+            .unwrap_or(false);
+    }
     RealRunner::default()
         .run("ps", &["-p", &pid.to_string()])
         .map(|o| o.success())
@@ -1049,8 +1082,6 @@ fn worker_loop(
             Some(spine),
             Some(fleet),
         );
-        // Stamped + released (or abandoned): no longer a peer under review.
-        fleet.clear_inflight(name);
         match outcome {
             run::IterationOutcome::NoWork { retry_after } => {
                 // An idle probe did no work — refund its budget slot so

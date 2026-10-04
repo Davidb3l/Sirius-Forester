@@ -367,11 +367,31 @@ impl Config {
     pub fn load(path: &Path) -> Result<Config, String> {
         match std::fs::read_to_string(path) {
             Ok(s) => {
-                serde_json::from_str(&s).map_err(|e| format!("invalid {}: {e}", path.display()))
+                let c: Config = serde_json::from_str(&s)
+                    .map_err(|e| format!("invalid {}: {e}", path.display()))?;
+                c.validate()
+                    .map_err(|e| format!("invalid {}: {e}", path.display()))?;
+                Ok(c)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(format!("cannot read {}: {e}", path.display())),
         }
+    }
+
+    /// Reject configs that would silently disable a check (SIRF-31: a
+    /// sequence key without a capture group never matches anything).
+    pub fn validate(&self) -> Result<(), String> {
+        for s in &self.review.sequences {
+            let re = regex::Regex::new(&s.key)
+                .map_err(|e| format!("review.sequences key `{}`: {e}", s.key))?;
+            if re.captures_len() < 2 {
+                return Err(format!(
+                    "review.sequences key `{}` has no capture group — wrap the key part in ( )",
+                    s.key
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The committed-defaults JSON, pretty-printed. Used by `sirius init` to
@@ -437,6 +457,10 @@ mod tests {
             Config::default().review.sequences.is_empty(),
             "off by default"
         );
+        let bad: Config =
+            serde_json::from_str(r#"{"review":{"sequences":[{"dir":"m","key":"^\\d+"}]}}"#)
+                .unwrap();
+        assert!(bad.validate().unwrap_err().contains("capture group"));
     }
 
     #[test]

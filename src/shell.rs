@@ -239,6 +239,11 @@ fn kill_descendants(pid: u32) {
             Some((it.next()??, it.next()??))
         })
         .collect();
+    // Freeze the root first so it cannot fork its next command between the
+    // snapshot and the kill (`a; b`: b would escape).
+    let _ = Command::new("kill")
+        .args(["-STOP", &pid.to_string()])
+        .output();
     let mut tree = vec![pid];
     let mut i = 0;
     while i < tree.len() {
@@ -251,7 +256,8 @@ fn kill_descendants(pid: u32) {
         );
         i += 1;
     }
-    let victims: Vec<String> = tree[1..].iter().map(u32::to_string).collect();
+    // The root too: a stopped root would otherwise wait for its CONT.
+    let victims: Vec<String> = tree.iter().map(u32::to_string).collect();
     if !victims.is_empty() {
         let _ = Command::new("kill").arg("-KILL").args(&victims).output();
     }

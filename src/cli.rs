@@ -70,6 +70,9 @@ pub enum Command {
     /// Build the integration frontier (base tip + every in-flight sibling)
     /// and run `integration.cmd` on it before anything merges (SIRF-32).
     Integrate {
+        /// Clear a red state BY HAND (no green run) and say so on its issue.
+        #[arg(long)]
+        clear_red: bool,
         #[arg(long)]
         json: bool,
     },
