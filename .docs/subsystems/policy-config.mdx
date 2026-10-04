@@ -48,11 +48,15 @@ createdBy: "claude-code"
 | `review.prompt_file` | `.sirius/review-prompt.md` | an OVERRIDE for the built-in reviewer prompt (rendered per round); absent ⇒ the built-in default, which improves with each release |
 | `review.max_rounds` | `3` | review runs per issue (fix rounds = max_rounds − 1) |
 | `review.block_on` | `["bug","conflict"]` | kinds that block when `confidence == "confirmed"` |
-| `review.against` | `current-base-merge` | or `launch-base` |
+| `review.against` | `current-base-merge` | or `launch-base`, or `frontier` (SIRF-30: merged onto the base tip + the oldest 12 in-flight sibling branches) |
 | `review.base_ref` | *unset* | default: the branch HEAD pointed to at launch |
 | `review.timeout_secs` | `1500` | hard cap on one reviewer run |
 | `review.on_exhausted` / `on_review_error` | `advance-flagged` | or `release` |
 | `review.skip_paths` | `["**/*.md","docs/**"]` | a diff touching only these skips review |
+| `review.sequences` | `[]` | SIRF-31: `[{"dir": "drizzle", "key": "^(\\d+)"}]` — migration-style dirs checked for slot collisions with the base and every in-flight sibling/peer; `key` must have a capture group (validated at load) |
+| `integration.cmd` | *unset* | SIRF-32: run by `sirius integrate` on the frontier; unset ⇒ build + report only |
+| `integration.on_fail` | `warn` | or `block`: while red, `sirius run` refuses to launch, the fleet stops claiming, and gated work is held |
+| `integration.timeout_secs` | `1800` | hard cap on one integration run (the whole process tree is killed) |
 | `lease_ttl_secs` | `900` | amt/hayven lease TTL |
 
 `backoff_delay_ms(attempt)` is `base << attempt`, clamped to `max_ms`: 500, 1000, 2000, 4000, 8000, then flat.
