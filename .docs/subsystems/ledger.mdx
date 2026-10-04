@@ -37,7 +37,7 @@ Parallel fleet workers each hold their own connection; WAL plus a 5-second `busy
 | `iterations` | one row per loop pass: issue, entities, outcome, gate result, oracle verdicts, tokens, duration, receipt |
 | `receipts` | provenance stamps — `kind` (`issue`/`decision`), `ref`, `symbols`, `forward_ok`, `reverse_ok` |
 | `policy_events` | why the policy engine did what it did |
-| `review_rounds` | one row per review attempt (SIRF-23): issue, worker, round, result (`clean`/`blocking`/`error`/`tampered`), confirmed/notes counts, findings JSON |
+| `review_rounds` | one row per review attempt (SIRF-23): issue, worker, round, result (`clean`/`blocking`/`error`/`tampered`, or `fell_back` when a fleet stop on the primary tier switched the review to the fallback reviewer), confirmed/notes counts, findings JSON |
 
 `review_rounds` is **additive**: `ADDITIVE_TABLES` runs on `create` and on every `open` (`CREATE TABLE IF NOT EXISTS`), so ledgers made by older binaries gain it without a re-init, `schema_version` stays 1, and older binaries never read it.
 
