@@ -43,6 +43,9 @@ pub struct Fleet {
     /// limit. Shared by every worker of the fleet: once set, nobody claims
     /// again — the board is left alone instead of churned through.
     pub pause: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// SIRF-27: set (to the triggering message) once the fleet switched to
+    /// `models.fallback`. Shared like `pause`.
+    pub fallback: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl Fleet {
@@ -57,6 +60,75 @@ impl Fleet {
     pub fn paused(&self) -> Option<String> {
         self.pause.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
+
+    /// Is the fleet running on its fallback tier?
+    pub fn on_fallback(&self) -> bool {
+        self.fallback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    /// Switch the fleet to its fallback tier; true for the FIRST switcher.
+    fn switch_to_fallback(&self, reason: &str) -> bool {
+        let mut f = self.fallback.lock().unwrap_or_else(|e| e.into_inner());
+        if f.is_none() {
+            *f = Some(reason.to_string());
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// What a usage-limit hit does (SIRF-27).
+enum LimitAction {
+    /// Retry on the fallback tier (the agent ran on the primary tier and a
+    /// fallback exists). `first` = this hit made the switch.
+    Fallback { first: bool },
+    /// Pause the whole fleet (no fallback, or it ran on the fallback already).
+    Pause,
+}
+
+/// Decide by the tier the failed agent ACTUALLY ran on: a hit on the primary
+/// tier switches (even if a sibling already switched — that hit was still a
+/// primary one); a hit on the fallback tier has nowhere left to go.
+fn on_usage_limit(
+    fleet: &Fleet,
+    cfg: &Config,
+    ran_on_fallback: bool,
+    stop: &crate::models::FleetStop,
+) -> LimitAction {
+    // A logged-out CLI fails on EVERY tier — falling back would only waste a
+    // spawn per worker and misreport the cause. Pause straight away.
+    let tier_specific = stop.kind != crate::models::StopKind::Login;
+    if tier_specific && !ran_on_fallback && cfg.models.fallback.is_some() {
+        LimitAction::Fallback {
+            first: fleet.switch_to_fallback(&stop.line),
+        }
+    } else {
+        fleet.pause_with(&stop.line);
+        LimitAction::Pause
+    }
+}
+
+/// Announce the switch to the fallback tier (once per fleet): NDJSON + stderr.
+fn announce_fallback(out: &mut dyn Write, worker: &str, issue: &str, line: &str, cfg: &Config) {
+    let fb = crate::models::active(&cfg.models, true);
+    let _ = out.write_all(
+        format!(
+            "{}\n",
+            json!({"event": "fleet", "phase": "fallback", "worker": worker, "issue": issue,
+                   "reason": line,
+                   "models": {"default": fb.default, "review": crate::models::review_model(fb)}})
+        )
+        .as_bytes(),
+    );
+    eprintln!(
+        "sirius: fleet stop (\"{line}\") — the fleet switched to its FALLBACK models (workers {}, reviewer {})",
+        fb.default.as_deref().unwrap_or("?"),
+        crate::models::review_model(fb).as_deref().unwrap_or("?")
+    );
 }
 
 /// Fill `{issue}` / `{worker}` / `{model}` in an agent or reviewer command
@@ -510,9 +582,11 @@ pub fn run_iteration(
                 .collect()
         })
         .unwrap_or_default();
-    let model_work = crate::models::model_for(&config.models, &labels, "work");
-    let model_fix = crate::models::model_for(&config.models, &labels, "fix");
-    let model_review = crate::models::review_model(&config.models);
+    // The tier in force at claim time (shown on the claim event); each spawn
+    // re-reads it, since the fleet may switch to its fallback mid-iteration.
+    let claim_tier = crate::models::active(&config.models, fleet.is_some_and(Fleet::on_fallback));
+    let model_work = crate::models::model_for(claim_tier, &labels, "work");
+    let model_review = crate::models::review_model(claim_tier);
     // A failed start_iteration is warned (not fatal) and leaves iter_id = -1;
     // `iter_ref` keeps that sentinel OUT of policy_events rows, whose FK on
     // iterations(id) would reject -1 — another formerly-silent write failure.
@@ -892,7 +966,7 @@ pub fn run_iteration(
             worker,
             Some("todo"),
             Some(&format!(
-                "sirius: fleet paused — a usage limit was hit (\"{line}\"). {issue} is back in todo untouched; restart the fleet once the limit resets."
+                "sirius: fleet paused — a fleet-wide stop (\"{line}\"). {issue} is back in todo untouched; restart the fleet once the limit resets."
             )),
         );
         emit_event(
@@ -1018,11 +1092,13 @@ pub fn run_iteration(
             // SIRF-26: an explicit model, never the CLI's silent global
             // default. ANTHROPIC_MODEL steers Claude Code (it wins over
             // settings.json — verified); SIRIUS_MODEL serves other agents.
-            let phase_model = if phase == "fix" {
-                model_fix.as_deref()
-            } else {
-                model_work.as_deref()
-            };
+            let ran_on_fallback = fleet.is_some_and(Fleet::on_fallback);
+            let phase_model = crate::models::model_for(
+                crate::models::active(&config.models, ran_on_fallback),
+                &labels,
+                if phase == "fix" { "fix" } else { "work" },
+            );
+            let phase_model = phase_model.as_deref();
             if let Some(m) = phase_model {
                 env.push(kv("ANTHROPIC_MODEL", m));
                 env.push(kv("SIRIUS_MODEL", m));
@@ -1030,11 +1106,17 @@ pub fn run_iteration(
             env.extend(extra_env.iter().cloned());
             let log_path = agent_log_path(
                 fleet,
-                &if phase == "work" {
-                    issue.clone()
-                } else {
-                    format!("{issue}-{phase}-r{round}")
-                },
+                &format!(
+                    "{}{}",
+                    if phase == "work" {
+                        issue.clone()
+                    } else {
+                        format!("{issue}-{phase}-r{round}")
+                    },
+                    // A fallback retry runs within the same second as the
+                    // failed primary attempt — keep both logs as evidence.
+                    if ran_on_fallback { "-fb" } else { "" }
+                ),
             );
             let opts = AgentRunOpts {
                 timeout: Duration::from_secs(config.agent_timeout_secs),
@@ -1054,7 +1136,7 @@ pub fn run_iteration(
             let spawn_err = work.as_ref().err().map(|e| e.to_string());
             last_exit = agent_code;
             last_log = log_path.clone();
-            let mut ev = json!({"agent_ok": work_ok, "timed_out": timed_out, "exit": agent_code, "attempt": attempt + 1, "spawn_error": spawn_err});
+            let mut ev = json!({"agent_ok": work_ok, "timed_out": timed_out, "exit": agent_code, "attempt": attempt + 1, "spawn_error": spawn_err, "model": phase_model, "tier": if ran_on_fallback { "fallback" } else { "primary" }});
             if phase != "work" {
                 ev["round"] = json!(round);
             }
@@ -1065,16 +1147,33 @@ pub fn run_iteration(
             // Lydgr fleet bounced its board after the limit hit). Pause the
             // whole fleet; leave this issue in `todo` untouched.
             if !work_ok {
-                let limit = fleet.and_then(|f| {
+                let hit = fleet.zip(
                     log_path
                         .as_ref()
                         .and_then(|p| std::fs::read_to_string(p).ok())
-                        .and_then(|log| crate::models::usage_limit_in(&log))
-                        .map(|l| {
-                            f.pause_with(&l);
-                            l
-                        })
-                });
+                        .and_then(|log| crate::models::fleet_stop(&log)),
+                );
+                let limit = match hit {
+                    Some((f, stop)) => match on_usage_limit(f, config, ran_on_fallback, &stop) {
+                        // SIRF-27: retry THIS phase right away on the fallback
+                        // tier — no release, no re-claim, leases kept. Bounded:
+                        // a second hit runs on the fallback and pauses.
+                        LimitAction::Fallback { first } => {
+                            let line = &stop.line;
+                            if first {
+                                announce_fallback(out, worker, &issue, line, config);
+                                emit_spine(
+                                    "fleet.fallback",
+                                    vec![crate::spine::issue_ref(&issue)],
+                                    json!({"issue": issue.as_str(), "reason": line}),
+                                );
+                            }
+                            continue;
+                        }
+                        LimitAction::Pause => Some(stop.line),
+                    },
+                    None => None,
+                };
                 if let Some(line) = limit {
                     if phase == "work" {
                         return WorkGate::Exit(usage_paused(out, &line));
@@ -1614,6 +1713,12 @@ enum ReviewOnce {
         detail: String,
     },
     LeaseLost(String),
+    /// SIRF-27: the reviewer hit a usage limit on the primary tier and the
+    /// fleet switched to its fallback — retry the review on the fallback.
+    FellBack {
+        line: String,
+        first: bool,
+    },
 }
 
 /// What the reviewer must leave alone, as text: the HEAD commit, the porcelain
@@ -1720,7 +1825,7 @@ fn review_once(
     if let Some(line) = fleet.paused() {
         return ReviewOnce::Failed {
             result: RoundResult::Error,
-            detail: format!("fleet paused on a usage limit (\"{line}\") — review not started"),
+            detail: format!("fleet paused (\"{line}\") — review not started"),
         };
     }
     let head = match checkpoint(cx, round) {
@@ -1734,7 +1839,12 @@ fn review_once(
     };
     let reviews_dir = fleet.sirius_dir.join("reviews");
     let _ = std::fs::create_dir_all(&reviews_dir);
-    let stem = format!("{}-r{round}-t{try_n}-{}", safe_name(cx.issue), unix_secs());
+    let stem = format!(
+        "{}-r{round}-t{try_n}{}-{}",
+        safe_name(cx.issue),
+        if fleet.on_fallback() { "-fb" } else { "" },
+        unix_secs()
+    );
 
     // Which tree to review: the worker's own, or a throwaway merge of the
     // work onto the CURRENT base tip (catches clashes with work merged since
@@ -1865,7 +1975,9 @@ fn review_once(
         prompt_path.display().to_string(),
     ));
     // SIRF-26: the reviewer's model, explicit (ideally not the workers').
-    let review_model = crate::models::review_model(&cx.config.models);
+    let review_on_fallback = fleet.on_fallback();
+    let review_model =
+        crate::models::review_model(crate::models::active(&cx.config.models, review_on_fallback));
     if let Some(m) = &review_model {
         env.push(kv("ANTHROPIC_MODEL", m.as_str()));
         env.push(kv("SIRIUS_REVIEW_MODEL", m.as_str()));
@@ -1933,13 +2045,22 @@ fn review_once(
             .log_path
             .as_ref()
             .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|log| crate::models::usage_limit_in(&log));
-        if let Some(line) = limit {
-            cx.fleet.pause_with(&line);
-            return ReviewOnce::Failed {
-                result: RoundResult::Error,
-                detail: format!("the reviewer hit a usage limit — fleet paused (\"{line}\")"),
-            };
+            .and_then(|log| crate::models::fleet_stop(&log));
+        if let Some(stop) = limit {
+            let line = stop.line.clone();
+            match on_usage_limit(cx.fleet, cx.config, review_on_fallback, &stop) {
+                LimitAction::Fallback { first } => {
+                    return ReviewOnce::FellBack { line, first };
+                }
+                LimitAction::Pause => {
+                    return ReviewOnce::Failed {
+                        result: RoundResult::Error,
+                        detail: format!(
+                            "the reviewer hit a fleet-wide stop — fleet paused (\"{line}\")"
+                        ),
+                    };
+                }
+            }
         }
     }
     // The findings file, OR the reviewer's final message: a headless reviewer
@@ -2105,8 +2226,45 @@ pub fn run_review_stage(cx: &ReviewCtx, out: &mut dyn Write, fix_round: &FixRoun
         // Up to two attempts per round: a review error is retried once.
         let mut got: Option<ReviewOnce> = None;
         let mut last_err = String::new();
-        for try_n in 0..2 {
-            match review_once(cx, review_cmd, round, try_n, prev_path.as_deref()) {
+        let mut try_n: u32 = 0;
+        while try_n < 2 {
+            let this_try = try_n;
+            try_n += 1;
+            match review_once(cx, review_cmd, round, this_try, prev_path.as_deref()) {
+                ReviewOnce::FellBack { line, first } => {
+                    // SIRF-27: the same review again, on the fallback reviewer
+                    // — not a failed try. Bounded: a second hit pauses. The
+                    // primary attempt still leaves a trace (event + ledger).
+                    emit_event(
+                        out,
+                        worker,
+                        Some(issue),
+                        "review",
+                        json!({"round": round, "result": "fell_back", "confirmed": 0, "notes": 0, "detail": line}),
+                    );
+                    ledger_warn(
+                        "insert_review_round",
+                        cx.ledger.insert_review_round(
+                            cx.iter_ref,
+                            issue,
+                            worker,
+                            round,
+                            "fell_back",
+                            0,
+                            0,
+                            &json!({"fell_back": line}),
+                        ),
+                    );
+                    if first {
+                        announce_fallback(out, worker, issue, &line, cx.config);
+                        spine_emit(
+                            cx,
+                            "fleet.fallback",
+                            json!({"issue": issue, "phase": "review", "reason": line}),
+                        );
+                    }
+                    try_n = this_try;
+                }
                 ReviewOnce::Failed { result, detail } => {
                     emit_event(
                         out,
@@ -2282,7 +2440,7 @@ pub fn run_review_stage(cx: &ReviewCtx, out: &mut dyn Write, fix_round: &FixRoun
                     let (policy, why) = if let Some(line) = paused {
                         (
                             rc.on_review_error,
-                            format!("the fleet hit a usage limit during fix round {round} (\"{line}\") — fleet paused; reverted to the last reviewed state"),
+                            format!("the fleet hit a fleet-wide stop during fix round {round} (\"{line}\") — fleet paused; reverted to the last reviewed state"),
                         )
                     } else if timed_out {
                         (
@@ -2366,6 +2524,7 @@ mod tests {
             sirius_dir: dir,
             review_prompt: crate::review::DEFAULT_PROMPT.into(),
             pause: Default::default(),
+            fallback: Default::default(),
         }
     }
 
@@ -3633,6 +3792,7 @@ mod tests {
             fix_floor: Some("claude-opus-5-5".into()),
             review: Some("claude-fable-5-1".into()),
             allow_default: false,
+            fallback: None,
         }
     }
 
@@ -3807,7 +3967,7 @@ mod tests {
         );
         assert!(
             rec.iter()
-                .any(|c| c.contains("hit a usage limit during fix round 1")),
+                .any(|c| c.contains("hit a fleet-wide stop during fix round 1")),
             "the escalation names the limit: {rec:?}"
         );
         // The reviewed, gate-passing work is kept (advance-flagged default).
@@ -3864,6 +4024,268 @@ mod tests {
                 .any(|c| c.ends_with("claude -p x --model claude-fable-5-1")),
             "{:?}",
             m.recorded()
+        );
+    }
+
+    /// The owner's two-tier policy (SIRF-27).
+    fn tiered() -> crate::models::ModelsConfig {
+        serde_json::from_str(
+            r#"{"default":"claude-opus-5-5",
+                "routes":[{"labels":["simple"],"model":"claude-sonnet-5-5"}],
+                "review":"claude-fable-5-1",
+                "fallback":{"default":"claude-sonnet-5-5","review":"claude-opus-5-5"}}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_primary_tier_limit_retries_on_the_fallback_models_without_pausing() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-90");
+        m.push(MockResponse::new(&["sh", "-c", "true"], 1, "", "")); // opus: limit
+        m.on_phase_stdout("work", LIMIT);
+        // (the retry on the fallback tier succeeds — benign default)
+        let mut c = cfg();
+        c.models = tiered();
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let fleet = test_fleet("base999");
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &c,
+            &m,
+            "sirius/oak",
+            None,
+            "true",
+            &mut out,
+            None,
+            Some(&fleet),
+        );
+        assert_eq!(o, IterationOutcome::Completed, "no pause, no bounce");
+        assert!(fleet.paused().is_none());
+        assert!(fleet.on_fallback());
+        let envs = m.agent_envs();
+        assert_eq!(
+            phases(&m),
+            vec!["work", "work"],
+            "the SAME phase, retried in place"
+        );
+        assert_eq!(
+            env_of(&envs[0], "ANTHROPIC_MODEL").as_deref(),
+            Some("claude-opus-5-5")
+        );
+        assert_eq!(
+            env_of(&envs[1], "ANTHROPIC_MODEL").as_deref(),
+            Some("claude-sonnet-5-5")
+        );
+        let nd = String::from_utf8(out).unwrap();
+        assert!(nd.contains("\"phase\":\"fallback\""), "{nd}");
+        assert!(released_with(&m, "in_review"));
+        // Not released to todo first: retried in place, leases kept.
+        assert_eq!(
+            m.recorded()
+                .iter()
+                .filter(|c| c.starts_with("amt --json release"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_fable_reviewer_limit_retries_the_review_on_the_fallback_reviewer() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-91");
+        checkpoint_heads(&m, &["ck1", "ck1"]);
+        // Fable reviewer exits 1 at its limit; the Opus retry reviews clean.
+        m.push(MockResponse::new(
+            &["sh", "-c", "cd \"$SIRIUS_REVIEW_DIR\" || exit 1; reviewer"],
+            1,
+            "",
+            "",
+        ));
+        m.on_phase_stdout(
+            "review",
+            "You've reached your Fable 5.1 limit. Run /usage-credits to continue.\n",
+        );
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN); // consumed by the failed try
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+        let mut c = review_cfg(3);
+        c.models = tiered();
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let fleet = test_fleet("base999");
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &c,
+            &m,
+            "sirius/oak",
+            None,
+            "true",
+            &mut out,
+            None,
+            Some(&fleet),
+        );
+        assert_eq!(o, IterationOutcome::Completed);
+        assert!(fleet.paused().is_none() && fleet.on_fallback());
+        let envs = m.agent_envs();
+        assert_eq!(phases(&m), vec!["work", "review", "review"]);
+        assert_eq!(
+            env_of(&envs[1], "ANTHROPIC_MODEL").as_deref(),
+            Some("claude-fable-5-1")
+        );
+        assert_eq!(
+            env_of(&envs[2], "ANTHROPIC_MODEL").as_deref(),
+            Some("claude-opus-5-5")
+        );
+        // The primary attempt leaves a trace.
+        assert_eq!(
+            led.review_rounds_for_issue("AMT-91").unwrap()[0].result,
+            "fell_back"
+        );
+        // A REAL review happened: not flagged, not "did not complete".
+        assert!(!m
+            .recorded()
+            .iter()
+            .any(|c| c.contains("--add-label review:open")));
+        let decide = m
+            .recorded()
+            .into_iter()
+            .find(|c| c.starts_with("amt --json decide"))
+            .unwrap();
+        assert!(decide.contains("review: 1 round"), "{decide}");
+    }
+
+    #[test]
+    fn a_fix_round_limit_on_the_primary_tier_retries_the_fix_on_the_fallback() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-93");
+        m.expect(&["git", "diff", "--name-only", "base999"], 0, "src/x.rs\n"); // fix gate
+        checkpoint_heads(&m, &["ck1", "ck2"]);
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", BUG);
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+        m.push(MockResponse::new(&["sh", "-c", "true"], 0, "", "")); // work ok
+        m.push(MockResponse::new(&["sh", "-c", "true"], 1, "", "")); // fix: limit
+        m.on_phase_stdout("fix", LIMIT);
+        let mut c = review_cfg(3);
+        c.models = tiered();
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let fleet = test_fleet("base999");
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &c,
+            &m,
+            "sirius/oak",
+            None,
+            "true",
+            &mut out,
+            None,
+            Some(&fleet),
+        );
+        assert_eq!(o, IterationOutcome::Completed);
+        assert!(fleet.on_fallback() && fleet.paused().is_none());
+        assert_eq!(phases(&m), vec!["work", "review", "fix", "fix", "review"]);
+        let envs = m.agent_envs();
+        // The fix ran first on the primary floor (opus default), then on the
+        // fallback tier (sonnet); the re-review used the fallback reviewer.
+        assert_eq!(
+            env_of(&envs[2], "ANTHROPIC_MODEL").as_deref(),
+            Some("claude-opus-5-5")
+        );
+        assert_eq!(
+            env_of(&envs[3], "ANTHROPIC_MODEL").as_deref(),
+            Some("claude-sonnet-5-5")
+        );
+        assert_eq!(
+            env_of(&envs[4], "ANTHROPIC_MODEL").as_deref(),
+            Some("claude-opus-5-5")
+        );
+        let nd = String::from_utf8(out).unwrap();
+        assert!(
+            nd.contains("\"tier\":\"primary\"") && nd.contains("\"tier\":\"fallback\""),
+            "{nd}"
+        );
+    }
+
+    #[test]
+    fn a_logged_out_cli_pauses_straight_away_even_with_a_fallback() {
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-94");
+        m.push(MockResponse::new(&["sh", "-c", "true"], 1, "", ""));
+        m.on_phase_stdout("work", "Not logged in · Please run /login\n");
+        let mut c = cfg();
+        c.models = tiered();
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let fleet = test_fleet("base999");
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &c,
+            &m,
+            "sirius/oak",
+            None,
+            "true",
+            &mut out,
+            None,
+            Some(&fleet),
+        );
+        assert!(matches!(o, IterationOutcome::Paused(_)), "{o:?}");
+        assert!(
+            !fleet.on_fallback(),
+            "falling back cannot fix a logged-out CLI"
+        );
+        assert_eq!(phases(&m), vec!["work"]);
+    }
+
+    #[test]
+    fn a_limit_on_the_fallback_tier_pauses() {
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-92");
+        m.push(MockResponse::new(&["sh", "-c", "true"], 1, "", ""));
+        m.on_phase_stdout("work", LIMIT);
+        let mut c = cfg();
+        c.models = tiered();
+        let fleet = test_fleet("base999");
+        *fleet.fallback.lock().unwrap() = Some("earlier".into()); // already switched
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &c,
+            &m,
+            "sirius/oak",
+            None,
+            "true",
+            &mut out,
+            None,
+            Some(&fleet),
+        );
+        assert!(matches!(o, IterationOutcome::Paused(_)), "{o:?}");
+        assert_eq!(phases(&m), vec!["work"], "nowhere left to fall back to");
+        assert_eq!(
+            env_of(&m.agent_envs()[0], "ANTHROPIC_MODEL").as_deref(),
+            Some("claude-sonnet-5-5"),
+            "ran on the fallback tier"
         );
     }
 

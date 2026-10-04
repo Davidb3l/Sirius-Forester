@@ -91,7 +91,7 @@ CREATE TABLE review_rounds (
   issue_ref    TEXT NOT NULL,
   worker_id    TEXT,
   round        INTEGER NOT NULL,          -- 1-based review round
-  result       TEXT NOT NULL,             -- clean|blocking|error|tampered
+  result       TEXT NOT NULL,             -- clean|blocking|error|tampered|fell_back
   confirmed    INTEGER NOT NULL DEFAULT 0, -- blocking findings this round
   notes        INTEGER NOT NULL DEFAULT 0, -- non-blocking findings
   findings     TEXT,                      -- JSON {findings,notes} (or {error})
@@ -139,10 +139,16 @@ sirius gate AMT-7 [--tier safe] [--target-status in_review] [--range <git-range>
 
 sirius run --workers N --agent-cmd "<cmd>" [--from todo] [--review-cmd "<cmd>"]
            [--model <id>|inherit] [--review-model <id>|inherit] [--allow-default-model] --json
-   # first event: {"event":"fleet","phase":"start","models":{"default","source","review","fix_floor","routes"}}
+   # first event: {"event":"fleet","phase":"start","models":{"default","source","review","fix_floor","routes","fallback"}}
+   # SIRF-27: {"event":"fleet","phase":"fallback","worker","issue","reason","models":{"default","review"}} once,
+   #   when a fleet stop on the primary tier switches the WHOLE fleet to models.fallback; the
+   #   failed phase is retried in place on the fallback tier (review: a "fell_back" review event)
+   # work/fix events carry "model" and "tier":"primary|fallback"
    # claim events carry "model" (this ticket's worker model) and "review_model"
    # exit 2 when no worker model resolves (unless --allow-default-model / models.allow_default);
-   # exit 4 = PAUSED: an agent hit a usage/plan limit (its LAST output lines say so); every
+   # exit 4 = PAUSED: a fleet stop with nowhere to fall back — a usage/plan limit or an
+   # unsupported model on the fallback tier (or with no fallback), or a logged-out CLI
+   # ("Please run /login", never a fallback); judged on the failed run's LAST lines; every
    # worker stopped claiming/spawning, unworked issues stay in todo. Last event:
    # {"event":"fleet","phase":"paused","reason":str}; spine: fleet.paused (+ job.blocked)
    # streams NDJSON iteration events to stdout, one object per line:
@@ -194,7 +200,9 @@ other stdout formats.
     "routes": [],                          // [{"labels": ["security","auth"], "model": "<id>"}], first match wins
     "fix_floor": null,                     // fix rounds of UN-routed tickets use this model
     "review": null,                        // reviewer model (--review-model); default: models.default
-    "allow_default": false                 // launch with no model at all (--allow-default-model)
+    "allow_default": false,                // launch with no model at all (--allow-default-model)
+    "fallback": null                       // SIRF-27: {"default": "<id>", "review": "<id>", ...} — the tier the
+                                           // fleet switches to on a usage limit / unsupported model (one level)
   },
   "review": {                              // SIRF-23 — see §3.1
     "cmd": null,                           // or --review-cmd; null = stage off (pre-review loop exactly)

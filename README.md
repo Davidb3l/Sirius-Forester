@@ -284,8 +284,12 @@ default. The model reaches agents as `ANTHROPIC_MODEL` (Claude Code honors it
 over settings.json) plus `SIRIUS_MODEL` and a `{model}` placeholder. Tickets
 can be routed to models by Ametrite label (`models.routes`; fix rounds use at
 least `models.fix_floor`), and the resolved model is in every `claim` event and
-in `sirius doctor`. If any agent hits a usage/plan limit, the whole fleet
-**pauses** (exit `4`) instead of bouncing the board.
+in `sirius doctor`. If any agent hits a usage/plan limit (or a model the
+CLI is too old to run), the whole fleet switches to an optional **fallback
+tier** (`models.fallback`) and retries in place — e.g. Opus implements and Fable
+reviews, and when the Fable allotment runs out Sonnet implements and Opus
+reviews. With no fallback left, it **pauses** (exit `4`) instead of bouncing the
+board; a logged-out CLI always pauses.
 
 The reviewer needs only **read** tools: it delivers its findings as JSON in its
 final message (headless `claude -p` is not allowed to write files by default —

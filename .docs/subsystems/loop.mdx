@@ -9,8 +9,8 @@ evidence: []
 refs: []
 verifiedCommit: "7febf1c09370f3b08c6897deb1c6a4b379ffeac2"
 verifiedAt: "2026-10-04T01:10:54.261Z"
-driftSuspectSince: ""
-driftSuspectReason: ""
+driftSuspectSince: "2026-10-04T01:11:34.463Z"
+driftSuspectReason: "code.changed touched src/run.rs"
 createdAt: 1785915503544
 updatedAt: 1785916461329
 createdBy: "claude-code"
@@ -48,7 +48,7 @@ The WORK⇄GATE loop is a reusable closure (`run_work_gate`) returning `WorkGate
 
 `cmd_run` resolves the fleet's models once (`models::resolve`: `--model` > `models.default` > `$SIRIUS_PARENT_MODEL`; `--review-model` > `models.review` > the worker model) and **refuses to launch** (exit 2) with no worker model unless `--allow-default-model` — naming the model every Claude worker would otherwise silently inherit from `.claude/settings*.json` (`check_models`). It emits a `fleet start` NDJSON event with the resolved models. Per iteration, the claimed issue's Ametrite `labels` pick the worker model (`models::model_for`: first matching `models.routes` entry; fix rounds of un-routed tickets use `models.fix_floor`), and it is injected as `ANTHROPIC_MODEL` + `SIRIUS_MODEL` (reviewer: `ANTHROPIC_MODEL` + `SIRIUS_REVIEW_MODEL`) and the `{model}` placeholder; claim events carry `model` / `review_model`.
 
-All workers share `Fleet.pause`. When a FAILED agent or reviewer's last output lines carry a plan/usage-limit message (`models::usage_limit_in`), the fleet pauses: a work-phase hit returns the issue to `todo` untouched (`usage_paused`: no deadend, `fleet.paused` + `job.blocked`), a fix-round hit reverts to the last reviewed checkpoint and escalates, a reviewer hit is not retried; every worker re-checks the pause before each claim and each spawn. `sirius run` then exits **4** after a `{"event":"fleet","phase":"paused"}` event. Agent logs live under the fleet's absolute `.sirius/logs`.
+All workers share `Fleet.pause` and `Fleet.fallback`. When a FAILED agent or reviewer's last output lines carry a fleet stop (`models::fleet_stop`: a usage/plan limit, a model this CLI version cannot run, or a logged-out CLI), `on_usage_limit` decides by the tier the agent RAN on: a limit/unsupported-model hit on the primary tier with a `models.fallback` configured switches the WHOLE fleet to the fallback tier (announced once: NDJSON `{"event":"fleet","phase":"fallback"}`, spine `fleet.fallback`) and retries the failed phase **in place** on it (work/fix: the WORK⇄GATE loop continues without consuming an attempt; review: a `fell_back` review event + ledger row, then the same try again). Models are re-resolved per spawn from `models::active`. A hit on the fallback tier, with no fallback, or a logged-out CLI pauses the fleet: a work-phase hit returns the issue to `todo` untouched (`usage_paused`: no deadend, `fleet.paused` + `job.blocked`), a fix-round hit reverts to the last reviewed checkpoint and escalates, a reviewer hit is not retried; every worker re-checks the pause before each claim and each spawn. `sirius run` then exits **4** after a `{"event":"fleet","phase":"paused"}` event. Agent logs live under the fleet's absolute `.sirius/logs`.
 
 ## Review ⇄ fix (SIRF-23)
 

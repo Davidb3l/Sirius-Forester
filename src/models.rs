@@ -15,7 +15,9 @@
 //!   * injected as `ANTHROPIC_MODEL` (Claude Code honors it over settings.json
 //!     — verified) plus `SIRIUS_MODEL` / `SIRIUS_REVIEW_MODEL` and a `{model}`
 //!     placeholder for non-Claude agents;
-//!   * a usage-limit message in a failed agent's output pauses the fleet.
+//!   * a fleet-stop message in a failed agent's output (usage limit,
+//!     unsupported model, logged-out CLI) switches the fleet to its fallback
+//!     tier, or pauses it.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -50,6 +52,49 @@ pub struct ModelsConfig {
     /// whatever their CLI defaults to). Same as `--allow-default-model`.
     #[serde(default)]
     pub allow_default: bool,
+    /// SIRF-27: a second tier the WHOLE fleet switches to when an agent on
+    /// this (primary) tier hits a usage limit — instead of pausing. Same
+    /// shape; its own `fallback` is ignored. A limit hit while already on the
+    /// fallback pauses the fleet. Each launch starts on the primary tier, so
+    /// a restored allotment is used again automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<Box<ModelsConfig>>,
+}
+
+/// The tier in force: the fallback once the fleet switched (and one exists).
+pub fn active(cfg: &ModelsConfig, on_fallback: bool) -> &ModelsConfig {
+    match (&cfg.fallback, on_fallback) {
+        (Some(fb), true) => fb,
+        _ => cfg,
+    }
+}
+
+/// Blank strings are "unset" everywhere — `ANTHROPIC_MODEL=""` would
+/// silently fall back to the CLI default (the incident, by another door).
+fn normalize(cfg: &mut ModelsConfig) {
+    let blank = |m: &Option<String>| m.as_deref().is_some_and(|x| x.trim().is_empty());
+    if blank(&cfg.default) {
+        cfg.default = None;
+    }
+    if blank(&cfg.review) {
+        cfg.review = None;
+    }
+    if blank(&cfg.fix_floor) {
+        cfg.fix_floor = None;
+    }
+    cfg.routes.retain(|r| !r.model.trim().is_empty());
+}
+
+/// A fallback tier must name its own worker model — otherwise un-routed
+/// tickets on the fallback would silently use the CLI default.
+pub fn validate(cfg: &ModelsConfig) -> Result<(), String> {
+    match &cfg.fallback {
+        Some(fb) if fb.default.is_none() => Err(
+            "models.fallback has no `default` — a fallback tier must name its own worker model"
+                .into(),
+        ),
+        _ => Ok(()),
+    }
 }
 
 /// What `--model` / `--review-model` may say: an explicit id, or `inherit`
@@ -96,16 +141,11 @@ pub fn resolve(
     if let Some(r) = flag_value(flag_review, parent, "--review-model")? {
         cfg.review = Some(r);
     }
-    // An empty string is "unset", everywhere — `ANTHROPIC_MODEL=""` would
-    // silently fall back to the CLI default (the incident, by another door).
-    let blank = |m: &Option<String>| m.as_deref().is_some_and(|x| x.trim().is_empty());
-    if blank(&cfg.review) {
-        cfg.review = None;
+    normalize(cfg);
+    if let Some(fb) = cfg.fallback.as_mut() {
+        normalize(fb);
+        fb.fallback = None; // one level only
     }
-    if blank(&cfg.fix_floor) {
-        cfg.fix_floor = None;
-    }
-    cfg.routes.retain(|r| !r.model.trim().is_empty());
     cfg.allow_default |= allow_default_flag;
     Ok(source)
 }
@@ -141,11 +181,16 @@ pub fn named_models(cfg: &ModelsConfig) -> Vec<String> {
             }
         }
     };
-    push(&cfg.default);
-    push(&cfg.fix_floor);
-    push(&cfg.review);
-    for r in &cfg.routes {
-        push(&Some(r.model.clone()));
+    let tiers: Vec<&ModelsConfig> = std::iter::once(cfg)
+        .chain(cfg.fallback.as_deref())
+        .collect();
+    for t in tiers {
+        push(&t.default);
+        push(&t.fix_floor);
+        push(&t.review);
+        for r in &t.routes {
+            push(&Some(r.model.clone()));
+        }
     }
     out
 }
@@ -181,25 +226,71 @@ pub fn claude_default_model(root: &Path, home: Option<&Path>) -> Option<(String,
     None
 }
 
-/// Find a usage/plan-limit message in a FAILED agent's output. Only the LAST
-/// few non-empty lines count (Sirius's `[sirius] agent exit` trailer
-/// skipped): a CLI stopped by a limit prints that and exits, while the same
-/// words EARLIER in a log are just content — a wrapper running tests after
-/// the agent, quota errors in the code under work. Deliberately narrow
-/// phrasing too: an agent building a rate-limiter says "rate limit" all day;
-/// these are the CLI telling US to stop. Returns the matching line.
-pub fn usage_limit_in(log: &str) -> Option<String> {
-    let re = regex::Regex::new(
+/// Find a FLEET-STOP message in a FAILED agent's output: the CLI telling
+/// us every further run will fail the same way — a usage/plan limit, a model
+/// this CLI version cannot run ("does not support this model … update"), or a
+/// logged-out CLI ("Not logged in · Please run /login"). All three are
+/// handled alike: fall back to the next tier, then pause — never churn the
+/// board. Only the LAST few non-empty lines count (Sirius's `[sirius] agent
+/// exit` trailer skipped): the same words EARLIER in a log are content — a
+/// wrapper running tests after the agent, quota errors in the code under
+/// work. Phrasing is deliberately narrow: an agent building a rate-limiter
+/// says "rate limit" all day. Returns the matching line.
+#[cfg(test)]
+pub fn fleet_stop_in(log: &str) -> Option<String> {
+    fleet_stop(log).map(|s| s.line)
+}
+
+/// Why every further run would fail the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopKind {
+    /// A usage/plan limit — tier-specific: another model may still work.
+    Limit,
+    /// This CLI version cannot run the model — tier-specific too.
+    Model,
+    /// The CLI is logged out — NOT tier-specific: pause, don't fall back.
+    Login,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetStop {
+    pub line: String,
+    pub kind: StopKind,
+}
+
+/// Classify a fleet stop in a failed agent's last lines (see `fleet_stop_in`).
+/// Phrases are anchored to how the CLI says them — `please run /login`
+/// (not "not logged in": an auth app's failing test prints that), and the
+/// unsupported-model error only with its update instruction.
+pub fn fleet_stop(log: &str) -> Option<FleetStop> {
+    let limit = regex::Regex::new(
         r"(?i)(you(?:'|’)?ve (?:reached|hit) your .{0,60}limit|(?:usage|session|weekly|\d+[- ]hour) limit (?:reached|exceeded)|/usage-credits|credit balance is too low|out of usage)",
     )
     .ok()?;
+    let model =
+        regex::Regex::new(r"(?i)does not support this model.{0,160}(?:claude update|or newer)")
+            .ok()?;
+    let login = regex::Regex::new(r"(?i)please run /login").ok()?;
     log.lines()
         .rev()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with("[sirius] agent exit"))
         .take(5)
-        .find(|l| re.is_match(l))
-        .map(String::from)
+        .find_map(|l| {
+            let kind = if login.is_match(l) {
+                StopKind::Login
+            } else if model.is_match(l) {
+                StopKind::Model
+            } else if limit.is_match(l) {
+                StopKind::Limit
+            } else {
+                return None;
+            };
+            Some(FleetStop {
+                line: l.to_string(),
+                kind,
+            })
+        })
 }
 
 #[cfg(test)]
@@ -222,6 +313,7 @@ mod tests {
             fix_floor: Some("claude-opus-5-5".into()),
             review: Some("claude-fable-5-1".into()),
             allow_default: false,
+            fallback: None,
         }
     }
 
@@ -299,6 +391,54 @@ mod tests {
     }
 
     #[test]
+    fn the_owner_policy_two_tiers() {
+        // Normal: Opus implements, Sonnet for simple tickets, Fable reviews.
+        // Fable exhausted: Sonnet implements, Opus reviews.
+        let c: ModelsConfig = serde_json::from_str(
+            r#"{"default":"claude-opus-5-5",
+                "routes":[{"labels":["simple"],"model":"claude-sonnet-5-5"}],
+                "review":"claude-fable-5-1",
+                "fallback":{"default":"claude-sonnet-5-5","review":"claude-opus-5-5"}}"#,
+        )
+        .unwrap();
+        validate(&c).unwrap();
+        let l = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let p = active(&c, false);
+        assert_eq!(
+            model_for(p, &l(&["bug"]), "work").as_deref(),
+            Some("claude-opus-5-5")
+        );
+        assert_eq!(
+            model_for(p, &l(&["simple"]), "work").as_deref(),
+            Some("claude-sonnet-5-5")
+        );
+        assert_eq!(review_model(p).as_deref(), Some("claude-fable-5-1"));
+        let f = active(&c, true);
+        assert_eq!(
+            model_for(f, &l(&["bug"]), "work").as_deref(),
+            Some("claude-sonnet-5-5")
+        );
+        assert_eq!(
+            model_for(f, &l(&["simple"]), "fix").as_deref(),
+            Some("claude-sonnet-5-5")
+        );
+        assert_eq!(review_model(f).as_deref(), Some("claude-opus-5-5"));
+        // Without a fallback, "active" is always the primary.
+        let mut none = c.clone();
+        none.fallback = None;
+        assert_eq!(
+            review_model(active(&none, true)).as_deref(),
+            Some("claude-fable-5-1")
+        );
+        // Every tier's models are visible for alias checks.
+        assert!(named_models(&c).contains(&"claude-opus-5-5".to_string()));
+        // A fallback must name its worker model.
+        let bad: ModelsConfig =
+            serde_json::from_str(r#"{"default":"x-1","fallback":{"review":"y-1"}}"#).unwrap();
+        assert!(validate(&bad).is_err());
+    }
+
+    #[test]
     fn empty_strings_are_unset_everywhere() {
         let mut c = ModelsConfig {
             default: Some("claude-sonnet-5-5".into()),
@@ -309,6 +449,7 @@ mod tests {
             fix_floor: Some("".into()),
             review: Some("".into()),
             allow_default: false,
+            fallback: None,
         };
         resolve(&mut c, None, None, false, None).unwrap();
         assert!(c.routes.is_empty() && c.fix_floor.is_none() && c.review.is_none());
@@ -348,25 +489,51 @@ mod tests {
     }
 
     #[test]
-    fn usage_limit_text_is_found_only_when_the_cli_says_stop() {
+    fn fleet_stop_text_is_found_only_when_the_cli_says_stop() {
         let lydgr = "Ignoring 15 permissions.allow entries...\nYou've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.\n\n[sirius] agent exit: 1\n";
         assert_eq!(
-            usage_limit_in(lydgr).as_deref(),
+            fleet_stop_in(lydgr).as_deref(),
             Some("You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.")
         );
-        assert!(usage_limit_in("Credit balance is too low").is_some());
+        assert!(fleet_stop_in("Credit balance is too low").is_some());
         // An agent WORKING on rate limiting is not a usage limit.
-        assert!(usage_limit_in("Implemented the rate limit middleware (429 on burst).").is_none());
-        assert!(usage_limit_in("").is_none());
+        assert!(fleet_stop_in("Implemented the rate limit middleware (429 on burst).").is_none());
+        assert!(fleet_stop_in("").is_none());
         // Curly apostrophe and other CLI phrasings.
-        assert!(usage_limit_in("You’ve hit your limit · resets 5pm").is_some());
-        assert!(usage_limit_in("5-hour limit reached ∙ resets 3am").is_some());
+        assert!(fleet_stop_in("You’ve hit your limit · resets 5pm").is_some());
+        assert!(fleet_stop_in("5-hour limit reached ∙ resets 3am").is_some());
         // The same words EARLY in a long failed log are content, not a stop.
         let early = format!(
             "usage limit exceeded in fixture\n{}",
             "test line\n".repeat(20)
         );
-        assert!(usage_limit_in(&early).is_none());
+        assert!(fleet_stop_in(&early).is_none());
+        // An outdated CLI that cannot run the model (captured live,
+        // 2026-10-04) and a logged-out CLI (SIRF-22 #7) are stops too...
+        let outdated = "API Error: 400 Claude Code 2.1.198 does not support this model; version 2.1.280 or newer is required. Run 'claude update', or update the Claude desktop app, then try again.\n\n[sirius] agent exit: 1\n";
+        assert_eq!(fleet_stop(outdated).unwrap().kind, StopKind::Model);
+        assert_eq!(
+            fleet_stop("Not logged in · Please run /login\n")
+                .unwrap()
+                .kind,
+            StopKind::Login
+        );
+        assert_eq!(
+            fleet_stop("Invalid API key · Please run /login\n")
+                .unwrap()
+                .kind,
+            StopKind::Login
+        );
+        assert_eq!(
+            fleet_stop("You've reached your Fable 5 limit.\n")
+                .unwrap()
+                .kind,
+            StopKind::Limit
+        );
+        // ...but an app's own words are not: a failing auth test, or an
+        // LLM-routing app's error without the CLI's update instruction.
+        assert!(fleet_stop("FAIL: expected 401 when user not logged in\n").is_none());
+        assert!(fleet_stop("router error: provider does not support this model\n").is_none());
     }
 
     #[test]

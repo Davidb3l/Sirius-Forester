@@ -58,7 +58,8 @@ they want the foreman working the board on the current repo.
      hours and burned the weekly limit). It is exported to agents as
      `ANTHROPIC_MODEL`. Per-ticket routing by label lives in `.sirius/config.json`
      `models.routes` (e.g. `security` → a heavier model); fix rounds of
-     un-routed tickets use `models.fix_floor`.
+     un-routed tickets use `models.fix_floor`. A `models.fallback` tier takes
+     over fleet-wide when a usage limit (or an unsupported model) hits.
    - `--review-model <id>` — the reviewer's model; prefer a DIFFERENT model
      than the workers' so the review does not share the author's blind spots.
    - `--review-cmd '<command>'` (recommended) — a FRESH reviewer that checks each

@@ -422,7 +422,15 @@ pub fn run_with_plugins_dir(
 /// `--model` / `--allow-default-model`.
 pub fn models_check(ws: &Workspace) -> Check {
     const NAME: &str = "fleet_models";
-    let cfg = crate::config::Config::load(&ws.config_path()).unwrap_or_default();
+    let mut cfg = crate::config::Config::load(&ws.config_path()).unwrap_or_default();
+    // Normalize exactly as `sirius run` does (no flags), then validate — a
+    // config `run` would refuse must not pass here.
+    if let Err(e) = crate::models::resolve(&mut cfg.models, None, None, false, None)
+        .map(|_| ())
+        .and_then(|()| crate::models::validate(&cfg.models))
+    {
+        return Check::advisory(NAME, false, format!("invalid models config: {e}"));
+    }
     let m = &cfg.models;
     let routes: Vec<String> = m
         .routes
@@ -442,6 +450,16 @@ pub fn models_check(ws: &Workspace) -> Check {
             routes.join(", ")
         }
     );
+    let describe = match m.fallback.as_deref() {
+        Some(fb) => format!(
+            "{describe}; FALLBACK on a fleet stop (usage limit / unsupported model): default {}, review {}",
+            fb.default.as_deref().unwrap_or("(none)"),
+            crate::models::review_model(fb)
+                .as_deref()
+                .unwrap_or("(none)")
+        ),
+        None => describe,
+    };
     if m.default.as_deref().is_some_and(|d| !d.trim().is_empty()) {
         return Check::advisory(NAME, true, describe);
     }

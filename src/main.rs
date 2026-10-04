@@ -721,6 +721,8 @@ fn cmd_run(
     let ledger_path = ws.ledger_path();
     // SIRF-26: one pause flag for the whole fleet (a usage limit stops all).
     let pause: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
+    // SIRF-27: one fallback switch for the whole fleet, too.
+    let fallback: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
     let fleets: Vec<run::Fleet> = assignments
         .iter()
         .map(|(_, wt_path)| run::Fleet {
@@ -730,6 +732,7 @@ fn cmd_run(
             sirius_dir: sirius_abs.clone(),
             review_prompt: review_prompt.clone(),
             pause: pause.clone(),
+            fallback: fallback.clone(),
         })
         .collect();
     // Emitted once every launch check has passed — visible from the first event on (the claim events carry it per ticket).
@@ -743,6 +746,7 @@ fn cmd_run(
                         "default": cfg.models.default, "source": model_source,
                         "review": models::review_model(&cfg.models),
                         "fix_floor": cfg.models.fix_floor, "routes": cfg.models.routes,
+                        "fallback": cfg.models.fallback,
                     },
                 })
             )
@@ -774,6 +778,11 @@ fn cmd_run(
         let _ = repo_runner.run("git", &["worktree", "remove", "--force", &wt_str]);
     }
     let _ = std::fs::remove_file(&lock_path);
+    if fleets.first().is_some_and(run::Fleet::on_fallback)
+        && fleets.first().and_then(run::Fleet::paused).is_none()
+    {
+        eprint_err("note: this run finished on the FALLBACK models (a fleet-wide stop was hit on the primary tier); the next launch starts on the primary tier again");
+    }
     // Exit 4 = the fleet PAUSED on a usage limit (CONTRACTS §2): nothing is
     // broken, so a wrapper can wait for the limit to reset and relaunch.
     if let Some(reason) = fleets.first().and_then(run::Fleet::paused) {
@@ -787,7 +796,7 @@ fn cmd_run(
             )
             .ok();
         eprint_err(&format!(
-            "fleet PAUSED — an agent hit a usage limit: \"{reason}\". Unworked issues were left in todo; relaunch after the limit resets."
+            "fleet PAUSED — an agent hit a fleet-wide stop: \"{reason}\". Unworked issues were left in todo; fix the cause (limit reset, `claude update`, `/login`) and relaunch."
         ));
         return 4;
     }
@@ -805,6 +814,7 @@ struct RunModels {
 /// worker model every un-routed agent silently inherits its CLI's default —
 /// the Lydgr incident. Name what it WOULD be, and require an explicit opt-in.
 fn check_models(ws: &Workspace, cfg: &Config, agent_cmd: &str) -> Result<(), String> {
+    models::validate(&cfg.models)?;
     let uses_placeholder = agent_cmd.contains("{model}")
         || cfg
             .review
