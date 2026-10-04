@@ -220,6 +220,16 @@ with `SIRIUS_PHASE=fix` (check it first — `work` means a fresh start):
 - A `sibling-conflict` note names another issue's branch awaiting integration
   that edits the same lines. It does not block by default; check both changes
   still agree, and leave the textual merge to whichever lands second.
+
+### Escapes — when a defect gets PAST review
+If you (or the main session, an e2e run, a human) find a bug in work that
+already passed review, record it against the issue that shipped it, with the
+commit that fixed it:
+`sirius escape <ISSUE> --kind <slug> -m "<what escaped>" --found-by <who> --fix <sha>`.
+Future review prompts will check for that pattern, and the fix becomes a
+`sirius review-canary` test of the reviewer. When a real check (test, lint,
+integration.cmd) now catches the kind, retire it:
+`sirius escape --kind <slug> --automated-by <path>`.
 - You are re-gated afterwards. Don't trade a passing gate for a fix — if your
   fix breaks tests, Sirius reverts to the last passing state and flags the issue.
 

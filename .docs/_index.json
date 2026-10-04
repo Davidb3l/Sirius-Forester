@@ -20,8 +20,8 @@
       "refs": [],
       "verifiedCommit": "6784e9fe029cbfe1284b6fc3f50032283e852e59",
       "verifiedAt": "2026-10-04T04:33:03.897Z",
-      "driftSuspectSince": "",
-      "driftSuspectReason": "",
+      "driftSuspectSince": "2026-10-04T04:34:01.074Z",
+      "driftSuspectReason": "code.changed touched src/main.rs",
       "createdAt": 1785915503544,
       "updatedAt": 1785915503544,
       "createdBy": "claude-code"
@@ -104,8 +104,8 @@
       "refs": [],
       "verifiedCommit": "6784e9fe029cbfe1284b6fc3f50032283e852e59",
       "verifiedAt": "2026-10-04T04:33:03.924Z",
-      "driftSuspectSince": "",
-      "driftSuspectReason": "",
+      "driftSuspectSince": "2026-10-04T04:34:01.074Z",
+      "driftSuspectReason": "code.changed touched src/run.rs, src/frontier.rs, src/integrate.rs",
       "createdAt": 1785915503544,
       "updatedAt": 1785916461329,
       "createdBy": "claude-code"
@@ -216,5 +216,5 @@
       "createdBy": "claude-code"
     }
   ],
-  "lastUpdated": 1791088383936
+  "lastUpdated": 1791088441075
 }

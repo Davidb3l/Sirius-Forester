@@ -306,6 +306,89 @@ impl Ledger {
         rows.collect()
     }
 
+    // ---- escapes + canaries (SIRF-35) --------------------------------------
+
+    /// Record a defect that got past review, against the issue that made it.
+    pub fn insert_escape(
+        &self,
+        issue: &str,
+        kind: &str,
+        summary: &str,
+        found_by: Option<&str>,
+        fix_commit: Option<&str>,
+    ) -> rusqlite::Result<i64> {
+        self.conn.execute(
+            "INSERT INTO escapes (issue_ref, kind, summary, found_by, fix_commit, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![issue, kind, summary, found_by, fix_commit, now_iso8601()],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Escapes, newest first — all, or one issue's.
+    pub fn escapes(&self, issue: Option<&str>) -> rusqlite::Result<Vec<EscapeRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, issue_ref, kind, summary, found_by, fix_commit, created_at
+               FROM escapes WHERE ?1 IS NULL OR issue_ref = ?1 ORDER BY id DESC",
+        )?;
+        let rows = stmt.query_map(params![issue], |r| {
+            Ok(EscapeRow {
+                id: r.get(0)?,
+                issue: r.get(1)?,
+                kind: r.get(2)?,
+                summary: r.get(3)?,
+                found_by: r.get(4)?,
+                fix_commit: r.get(5)?,
+                created_at: r.get(6)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Retire `kind` from the review prompt: a real check now catches it.
+    pub fn set_kind_automated(&self, kind: &str, by: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO escape_kinds_automated (kind, automated_by, created_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(kind) DO UPDATE SET automated_by = excluded.automated_by",
+            params![kind, by, now_iso8601()],
+        )?;
+        Ok(())
+    }
+
+    /// `(kind, automated_by)` for every retired kind.
+    pub fn automated_kinds(&self) -> rusqlite::Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT kind, automated_by FROM escape_kinds_automated ORDER BY kind")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// One `sirius review-canary` run.
+    pub fn insert_canary_run(
+        &self,
+        model: Option<&str>,
+        total: usize,
+        caught: usize,
+        false_positives: usize,
+        detail: &serde_json::Value,
+    ) -> rusqlite::Result<i64> {
+        self.conn.execute(
+            "INSERT INTO canary_runs (model, total, caught, false_positives, detail, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                model,
+                total as i64,
+                caught as i64,
+                false_positives as i64,
+                detail.to_string(),
+                now_iso8601()
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
     /// Count how many of the LAST `limit` policy events (of any kind) are of
     /// `kind` — used by adaptive claiming (M5) to read contention from recent
     /// history. The filter must apply AFTER the window: the old form filtered
@@ -336,6 +419,18 @@ pub struct ReviewRoundRow {
     pub worker: Option<String>,
 }
 
+/// One recorded escape (SIRF-35).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct EscapeRow {
+    pub id: i64,
+    pub issue: String,
+    pub kind: String,
+    pub summary: String,
+    pub found_by: Option<String>,
+    pub fix_commit: Option<String>,
+    pub created_at: String,
+}
+
 /// Tables added after schema v1 shipped. Purely additive and idempotent —
 /// applied at create AND on every open (see `Ledger::open`), so no version
 /// bump is needed and older binaries are unaffected.
@@ -353,6 +448,30 @@ const ADDITIVE_TABLES: &str = r#"
       created_at   TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS review_rounds_issue ON review_rounds(issue_ref);
+    CREATE TABLE IF NOT EXISTS escapes (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      issue_ref    TEXT NOT NULL,
+      kind         TEXT NOT NULL,
+      summary      TEXT NOT NULL,
+      found_by     TEXT,
+      fix_commit   TEXT,
+      created_at   TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS escapes_issue ON escapes(issue_ref);
+    CREATE TABLE IF NOT EXISTS escape_kinds_automated (
+      kind         TEXT PRIMARY KEY,
+      automated_by TEXT NOT NULL,
+      created_at   TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS canary_runs (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      model           TEXT,
+      total           INTEGER NOT NULL,
+      caught          INTEGER NOT NULL,
+      false_positives INTEGER NOT NULL,
+      detail          TEXT NOT NULL,
+      created_at      TEXT NOT NULL
+    );
 "#;
 
 /// Apply the full CONTRACTS §1 schema and seed the meta rows.
@@ -524,6 +643,39 @@ mod tests {
         assert_eq!(l.meta("integration_red").unwrap().as_deref(), Some("b"));
         l.set_meta("integration_red", None).unwrap();
         assert_eq!(l.meta("integration_red").unwrap(), None);
+    }
+
+    #[test]
+    fn escapes_kinds_and_canary_runs_round_trip() {
+        let l = Ledger::open_in_memory().unwrap();
+        l.insert_escape(
+            "AMT-1",
+            "migration-fork",
+            "forked",
+            Some("e2e"),
+            Some("abc"),
+        )
+        .unwrap();
+        l.insert_escape("AMT-2", "money-float", "floats", None, None)
+            .unwrap();
+        let all = l.escapes(None).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].issue, "AMT-2", "newest first");
+        let one = l.escapes(Some("AMT-1")).unwrap();
+        assert_eq!(one[0].fix_commit.as_deref(), Some("abc"));
+        l.set_kind_automated("money-float", "tests/money.rs")
+            .unwrap();
+        l.set_kind_automated("money-float", "tests/money2.rs")
+            .unwrap();
+        assert_eq!(
+            l.automated_kinds().unwrap(),
+            vec![("money-float".to_string(), "tests/money2.rs".to_string())]
+        );
+        assert!(
+            l.insert_canary_run(Some("m"), 3, 2, 0, &serde_json::json!([]))
+                .unwrap()
+                > 0
+        );
     }
 
     #[test]

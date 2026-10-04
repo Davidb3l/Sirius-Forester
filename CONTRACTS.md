@@ -97,6 +97,31 @@ CREATE TABLE review_rounds (
   findings     TEXT,                      -- JSON {findings,notes} (or {error})
   created_at   TEXT NOT NULL
 );
+
+-- SIRF-35: defects that got past review, and what they taught it.
+CREATE TABLE escapes (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  issue_ref    TEXT NOT NULL,             -- the issue whose work introduced the defect
+  kind         TEXT NOT NULL,             -- slug, e.g. 'migration-fork'
+  summary      TEXT NOT NULL,             -- what escaped
+  found_by     TEXT,                      -- main-session|integration|human|e2e|<free>
+  fix_commit   TEXT,                      -- the commit that fixed it (a canary source)
+  created_at   TEXT NOT NULL
+);
+CREATE TABLE escape_kinds_automated (     -- a kind now caught by a real check
+  kind         TEXT PRIMARY KEY,
+  automated_by TEXT NOT NULL,             -- the test/check path
+  created_at   TEXT NOT NULL
+);
+CREATE TABLE canary_runs (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  model           TEXT,                   -- the reviewer model scored
+  total           INTEGER NOT NULL,       -- canaries that applied (stale ones excluded)
+  caught          INTEGER NOT NULL,
+  false_positives INTEGER NOT NULL,       -- confirmed blocking findings on the control
+  detail          TEXT NOT NULL,          -- JSON: per-canary results
+  created_at      TEXT NOT NULL
+);
 ```
 
 The Console reads these tables directly (read-only) for the fleet board and history views.
@@ -127,7 +152,9 @@ sirius why <symbol> --json  -> {"symbol":str,"issues":[{"ref":"AMT-7","title":st
                                 "decisions":[{"ref":"D-3","summary":str}]}
 sirius why AMT-7 --json     -> {"ref":"AMT-7","symbols":[str],"decisions":[str],
                                 "review":[{"round":int,"result":str,"confirmed":int,"notes":int,
-                                           "worker":str,"at":str,"findings":{...}}]}
+                                           "worker":str,"at":str,"findings":{...}}],
+                                "escapes":[{"id":int,"kind":str,"summary":str,"found_by":str|null,
+                                            "fix":str|null,"at":str}]}
 
 sirius gate AMT-7 [--tier safe] [--target-status in_review] [--range <git-range>] --json
    -> {"ok":bool,"issue":"AMT-7","tier":"safe","gate":"pass|fail",
@@ -136,6 +163,35 @@ sirius gate AMT-7 [--tier safe] [--target-status in_review] [--range <git-range>
        "tests_selected":int,"comment_filed":bool}
    # Selects affected tests over the changed files, then RUNS them via
    # gate.test_cmd (full suite on any doubt); verdict = the runner's exit code.
+
+sirius escape <ISSUE> --kind <slug> -m "<what escaped>" [--found-by <who>] [--fix <commit>] [--json]
+   -> {"ok":true,"id":int,"issue":str,"kind":str,"kind_count":int,"automated":str|null,"nudge":str|null}
+   # SIRF-35: record a defect that got past review, against the issue that introduced it
+   # (comments there, as `sirius`); --fix makes it a canary. A kind seen twice (not yet
+   # automated) carries a nudge to encode it as a check. Spine: escape.recorded.
+sirius escape --kind <slug> --automated-by <test path> [--json]
+   -> {"ok":true,"kind":str,"automated_by":str,"escapes":int}
+   # retires the kind from the review prompt — a real check now catches it
+sirius escape --list [--json]
+   -> {"kinds":[{"kind","count","last_at","automated_by"|null}],
+       "escapes":[{"id","issue","kind","summary","found_by","fix","at"}]}
+
+sirius review-canary [--n 10] [--json]
+   -> {"ok":bool,"base":str,"model":str|null,"total":int,"caught":int,"stale":int,
+       "recall":float|null,"false_positives":int,
+       "canaries":[{"source":"escape:<id>"|"patch:<file>","issue":str|null,"kind":str|null,
+                    "result":"caught|missed|stale|error","detail":str}]}
+   # Replays up to N canaries — each escape with a fix commit (its fix REVERTED onto the
+   # current base, i.e. the real bug back), plus .sirius/canaries/*.patch — through the
+   # configured review.cmd exactly as a review round runs it, in a throwaway worktree.
+   # caught = a blocking finding on a file the canary changed. A canary that no longer
+   # applies is "stale" (not scored). One CONTROL (a benign doc file, or
+   # .sirius/canaries/control.patch) measures false positives. A canary's own escape is
+   # left out of its prompt's escape-pattern section. Writes a canary_runs row.
+   # Exit 0 ran, 1 operational failure (incl. no review.cmd).
+   # Scored per reviewer model; per-lens recall arrives with lenses (SIRF-38). There is
+   # no built-in mutation catalog: mutations are language-specific — write them as
+   # .sirius/canaries/*.patch (git apply format, against the base).
 
 sirius integrate [--clear-red] [--json]   # SIRF-32 — build the frontier, run integration.cmd on it
    -> {"ok":bool,"base_ref":str,"frontier":str,"included":["AMT-7"],
@@ -332,6 +388,11 @@ merged siblings), `SIRIUS_SIBLINGS` (rendered summary of the oldest 12 merged �
 for sequence checks — with issue, title, branch, files,
 overlap with this diff — also a prompt placeholder, appended to the prompt when a
 custom template lacks it).
+
+**Known escape patterns (SIRF-35).** `$SIRIUS_ESCAPES` (a prompt placeholder, appended
+when a custom template lacks it) lists the repo's recorded escape kinds that are NOT yet
+automated — top 8 by count, then recency — with the latest summary of each, so every
+review checks the diff for what got past review before. "(none)" when there are none.
 
 **Sequence collisions (SIRF-31).** For each `review.sequences` entry, the direct
 children of `dir` whose name matches `key` (capture group 1; numeric when both parse)

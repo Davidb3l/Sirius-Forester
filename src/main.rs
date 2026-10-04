@@ -6,9 +6,11 @@
 
 mod amt;
 mod bridge;
+mod canary;
 mod cli;
 mod config;
 mod doctor;
+mod escape;
 mod frontier;
 mod gate;
 mod gitrange;
@@ -62,6 +64,30 @@ fn main() -> ExitCode {
             range,
             json,
         } => cmd_gate(&ws, &runner, &issue, tier, target_status, range, json),
+        Command::Escape {
+            issue,
+            kind,
+            message,
+            found_by,
+            fix,
+            automated_by,
+            list,
+            json,
+        } => cmd_escape(
+            &ws,
+            &runner,
+            EscapeArgs {
+                issue,
+                kind,
+                message,
+                found_by,
+                fix,
+                automated_by,
+                list,
+            },
+            json,
+        ),
+        Command::ReviewCanary { n, json } => cmd_review_canary(&ws, &runner, n, json),
         Command::Integrate { clear_red, json } => cmd_integrate(&ws, &runner, clear_red, json),
         Command::Run {
             workers,
@@ -370,13 +396,20 @@ fn cmd_why(ws: &Workspace, runner: &RealRunner, target: &str, json: bool) -> u8 
         match bridge::why_issue(&amt, target) {
             Ok(w) => {
                 // The review history (SIRF-23), when this repo has a ledger.
-                let rounds = if ws.ledger_path().exists() {
-                    Ledger::open(&ws.ledger_path())
-                        .and_then(|l| l.review_rounds_for_issue(target))
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
+                let ledger = ws
+                    .ledger_path()
+                    .exists()
+                    .then(|| Ledger::open(&ws.ledger_path()).ok())
+                    .flatten();
+                let rounds = ledger
+                    .as_ref()
+                    .and_then(|l| l.review_rounds_for_issue(target).ok())
+                    .unwrap_or_default();
+                // SIRF-35: what escaped this issue's review.
+                let escapes = ledger
+                    .as_ref()
+                    .and_then(|l| l.escapes(Some(target)).ok())
+                    .unwrap_or_default();
                 if json {
                     let review: Vec<Value> = rounds
                         .iter()
@@ -390,7 +423,10 @@ fn cmd_why(ws: &Workspace, runner: &RealRunner, target: &str, json: bool) -> u8 
                         })
                         .collect();
                     print_json(
-                        &json!({"ref": w.r#ref, "symbols": w.symbols, "decisions": w.decisions, "review": review}),
+                        &json!({"ref": w.r#ref, "symbols": w.symbols, "decisions": w.decisions, "review": review,
+                                "escapes": escapes.iter().map(|e| json!({"id": e.id, "kind": e.kind,
+                                    "summary": e.summary, "found_by": e.found_by, "fix": e.fix_commit,
+                                    "at": e.created_at})).collect::<Vec<_>>()}),
                     );
                 } else {
                     println!(
@@ -406,6 +442,9 @@ fn cmd_why(ws: &Workspace, runner: &RealRunner, target: &str, json: bool) -> u8 
                             r.confirmed,
                             r.notes
                         );
+                    }
+                    for e in &escapes {
+                        println!("  ESCAPED [{}]: {} ({})", e.kind, e.summary, e.created_at);
                     }
                 }
                 0
@@ -543,6 +582,229 @@ fn cmd_gate(
             } else {
                 3 // soft "blocked" per CONTRACTS §2.
             }
+        }
+        Err(e) => {
+            eprint_err(&e);
+            1
+        }
+    }
+}
+
+// ---- escape + review-canary (SIRF-35) --------------------------------------
+
+struct EscapeArgs {
+    issue: Option<String>,
+    kind: Option<String>,
+    message: Option<String>,
+    found_by: Option<String>,
+    fix: Option<String>,
+    automated_by: Option<String>,
+    list: bool,
+}
+
+fn cmd_escape(ws: &Workspace, runner: &RealRunner, a: EscapeArgs, json: bool) -> u8 {
+    let ledger = match open_ledger(ws) {
+        Ok(l) => l,
+        Err(c) => return c,
+    };
+    let usage = |m: &str| {
+        eprint_err(m);
+        2
+    };
+    if a.list {
+        let escapes = ledger.escapes(None).unwrap_or_default();
+        let automated = ledger.automated_kinds().unwrap_or_default();
+        let mut kinds: Vec<Value> = Vec::new();
+        for e in &escapes {
+            if kinds.iter().any(|k| k["kind"] == e.kind.as_str()) {
+                continue;
+            }
+            let count = escapes.iter().filter(|x| x.kind == e.kind).count();
+            let by = automated.iter().find(|(k, _)| k == &e.kind).map(|(_, b)| b);
+            kinds.push(json!({"kind": e.kind, "count": count, "last_at": e.created_at, "automated_by": by}));
+        }
+        kinds.sort_by(|x, y| y["count"].as_u64().cmp(&x["count"].as_u64()));
+        let rows: Vec<Value> = escapes
+            .iter()
+            .map(|e| {
+                json!({"id": e.id, "issue": e.issue, "kind": e.kind, "summary": e.summary,
+                            "found_by": e.found_by, "fix": e.fix_commit, "at": e.created_at})
+            })
+            .collect();
+        if json {
+            print_json(&json!({"kinds": kinds, "escapes": rows}));
+        } else {
+            for k in &kinds {
+                println!(
+                    "{:<24} {}×{}",
+                    k["kind"].as_str().unwrap_or_default(),
+                    k["count"],
+                    k["automated_by"]
+                        .as_str()
+                        .map(|b| format!("  (automated by {b})"))
+                        .unwrap_or_default()
+                );
+            }
+        }
+        return 0;
+    }
+    let Some(kind) = a.kind.as_deref() else {
+        return usage("--kind is required (or --list)");
+    };
+    if let Err(e) = escape::validate_kind(kind) {
+        return usage(&e);
+    }
+    if let Some(by) = a.automated_by.as_deref() {
+        if a.issue.is_some() || a.message.is_some() {
+            return usage("--automated-by retires a kind; pass only --kind and --automated-by");
+        }
+        if let Err(e) = ledger.set_kind_automated(kind, by) {
+            eprint_err(&format!("cannot record: {e}"));
+            return 1;
+        }
+        let n = ledger
+            .escapes(None)
+            .unwrap_or_default()
+            .iter()
+            .filter(|e| e.kind == kind)
+            .count();
+        if json {
+            print_json(&json!({"ok": true, "kind": kind, "automated_by": by, "escapes": n}));
+        } else {
+            println!("{kind}: retired from the review prompt — automated by {by}");
+        }
+        return 0;
+    }
+    let (Some(issue), Some(message)) = (a.issue.as_deref(), a.message.as_deref()) else {
+        return usage("recording an escape needs <ISSUE>, --kind and -m \"<what escaped>\"");
+    };
+    if !regex_is_issue(issue) {
+        return usage(&format!("`{issue}` is not an issue key (PREFIX-n)"));
+    }
+    // A fix commit must resolve NOW — it is what a canary will revert.
+    let fix = match a.fix.as_deref() {
+        Some(f) => match gitrange::run_git(
+            runner,
+            &["rev-parse", "--verify", &format!("{f}^{{commit}}")],
+        ) {
+            Ok(o) => Some(o.stdout.trim().to_string()),
+            Err(e) => {
+                eprint_err(&format!("--fix `{f}` is not a commit: {e}"));
+                return 1;
+            }
+        },
+        None => None,
+    };
+    let id = match ledger.insert_escape(issue, kind, message, a.found_by.as_deref(), fix.as_deref())
+    {
+        Ok(id) => id,
+        Err(e) => {
+            eprint_err(&format!("cannot record the escape: {e}"));
+            return 1;
+        }
+    };
+    let kind_count = ledger
+        .escapes(None)
+        .unwrap_or_default()
+        .iter()
+        .filter(|e| e.kind == kind)
+        .count();
+    let automated = ledger
+        .automated_kinds()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(k, _)| k == kind)
+        .map(|(_, b)| b);
+    let nudge = escape::nudge(kind, kind_count, automated.is_some());
+    let rounds = ledger.review_rounds_for_issue(issue).unwrap_or_default();
+    // On the board, against the issue that shipped it, next to its review.
+    let _ = Amt::new(runner).comment_as(
+        issue,
+        &format!(
+            "sirius: ESCAPED DEFECT [{kind}] — {message}{}{} · this issue's review: {} round(s){}{}",
+            a.found_by
+                .as_deref()
+                .map(|f| format!(" (found by {f})"))
+                .unwrap_or_default(),
+            fix.as_deref()
+                .map(|f| format!(" · fixed in {f}"))
+                .unwrap_or_default(),
+            rounds.len(),
+            rounds
+                .last()
+                .map(|r| format!(", last {}", r.result))
+                .unwrap_or_default(),
+            nudge.as_deref().map(|n| format!("\n\n{n}")).unwrap_or_default()
+        ),
+        "sirius",
+    );
+    spine::Spine::new(&ws.root).emit(
+        "escape.recorded",
+        vec![spine::issue_ref(issue)],
+        json!({ "kind": kind, "fix": fix, "found_by": a.found_by }),
+    );
+    if json {
+        print_json(&json!({"ok": true, "id": id, "issue": issue, "kind": kind,
+                           "kind_count": kind_count, "automated": automated, "nudge": nudge}));
+    } else {
+        println!("recorded escape #{id} [{kind}] against {issue}");
+        if let Some(n) = nudge {
+            println!("{n}");
+        }
+    }
+    0
+}
+
+fn cmd_review_canary(ws: &Workspace, runner: &RealRunner, n: usize, json: bool) -> u8 {
+    let ledger = match open_ledger(ws) {
+        Ok(l) => l,
+        Err(c) => return c,
+    };
+    let cfg = match load_config(ws) {
+        Ok(c) => c,
+        Err(c) => return c,
+    };
+    let sirius_abs = {
+        let d = ws.sirius_dir();
+        if d.is_absolute() {
+            d
+        } else {
+            std::env::current_dir().map(|c| c.join(&d)).unwrap_or(d)
+        }
+    };
+    // The prompt a real review would get (override or built-in).
+    let prompt = if cfg.review.cmd.is_some() {
+        match load_review_prompt(ws, &cfg) {
+            Ok(p) => p,
+            Err(e) => {
+                eprint_err(&e);
+                return 1;
+            }
+        }
+    } else {
+        String::new()
+    };
+    match canary::run(runner, &ledger, &cfg, &sirius_abs, &prompt, n) {
+        Ok(r) => {
+            if json {
+                print_json(&json!(r));
+            } else {
+                for c in &r.canaries {
+                    println!("{:<8} {:<28} {}", c.result, c.source, c.detail);
+                }
+                println!(
+                    "recall {} ({}/{} caught, {} stale) · control: {} false positive(s) · reviewer model {}",
+                    r.recall
+                        .map(|x| format!("{:.0}%", x * 100.0))
+                        .unwrap_or_else(|| "n/a".into()),
+                    r.caught,
+                    r.total,
+                    r.stale,
+                    r.false_positives,
+                    r.model.as_deref().unwrap_or("(default)")
+                );
+            }
+            0
         }
         Err(e) => {
             eprint_err(&e);

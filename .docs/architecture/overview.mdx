@@ -9,8 +9,8 @@ evidence: []
 refs: []
 verifiedCommit: "6784e9fe029cbfe1284b6fc3f50032283e852e59"
 verifiedAt: "2026-10-04T04:33:03.897Z"
-driftSuspectSince: ""
-driftSuspectReason: ""
+driftSuspectSince: "2026-10-04T04:34:01.074Z"
+driftSuspectReason: "code.changed touched src/main.rs"
 createdAt: 1785915503544
 updatedAt: 1785915503544
 createdBy: "claude-code"
@@ -45,7 +45,7 @@ Sirius never opens either parent's SQLite for writing. The console (`web/`) read
 | Module | Role | Doc |
 |---|---|---|
 | `src/main.rs` | Command dispatch, `--json` envelopes, exit codes | this doc |
-| `src/cli.rs` | Clap definitions for the seven subcommands | this doc |
+| `src/cli.rs` | Clap definitions for the nine subcommands | this doc |
 | `src/workspace.rs` | Walks up from cwd to find `.ametrite/` and `.hayven/` | this doc |
 | `src/ledger.rs` | The SQLite ledger — schema, receipts, iterations, policy events | [subsystems/ledger](../subsystems/ledger) |
 | `src/config.rs` | `.sirius/config.json` policy engine | [subsystems/policy-config](../subsystems/policy-config) |
@@ -60,11 +60,13 @@ Sirius never opens either parent's SQLite for writing. The console (`web/`) read
 | `src/models.rs` | Fleet model selection (SIRF-26): launch-time resolution + refusal, per-ticket label routing, fix floor, alias check, usage-limit detection | [subsystems/loop](../subsystems/loop) |
 | `src/review.rs` | The review stage's pure half: findings/fix JSON contracts, blocking rule, skip globs, prompt rendering, round bookkeeping | [subsystems/loop](../subsystems/loop) |
 | `src/frontier.rs` | The integration frontier (SIRF-30): sibling discovery, frontier build + sibling-conflict attribution, and the sequence-collision detector (SIRF-31) | [subsystems/loop](../subsystems/loop) |
+| `src/escape.rs` | Escapes (SIRF-35), pure half: kind slugs, the `$SIRIUS_ESCAPES` prompt section, the automate-this nudge | [subsystems/loop](../subsystems/loop) |
+| `src/canary.rs` | `sirius review-canary` (SIRF-35): replay escapes' reverted fixes + patch canaries through the reviewer, score recall and false positives | [subsystems/loop](../subsystems/loop) |
 | `src/integrate.rs` | `sirius integrate` (SIRF-32): run `integration.cmd` on the frontier, red/green state, stop-the-line | [subsystems/loop](../subsystems/loop) |
 
 ## Subcommands
 
-`src/cli.rs` defines exactly seven (`Init`, `Doctor`, `Link`, `Why`, `Gate`, `Integrate`, `Run`). Every one takes `--json`.
+`src/cli.rs` defines exactly nine (`Init`, `Doctor`, `Link`, `Why`, `Gate`, `Escape`, `ReviewCanary`, `Integrate`, `Run`). Every one takes `--json`.
 
 ```
 sirius init            create .sirius/sirius.db beside an existing .ametrite/
@@ -72,6 +74,8 @@ sirius doctor          five contract facts live + plugin-handoff advisory
 sirius link <AMT-n>    stamp two-way provenance (--decision D-n for decisions)
 sirius why <target>    explain a symbol's issues/decisions, or an issue's symbols
 sirius gate <AMT-n>    select affected tests, run them, advance on pass
+sirius escape <AMT-n>  record a defect that got past review (--automated-by retires a kind; --list)
+sirius review-canary   replay escapes + patch canaries through the reviewer, report recall
 sirius integrate       build the integration frontier, run integration.cmd on it (red → issue + optional stop-the-line)
 sirius run             the loop, --workers N --agent-cmd "<cmd>" --model <id> [--review-cmd "<cmd>"] [--review-model <id>]
 ```

@@ -2308,6 +2308,16 @@ fn review_once(
         kv("SIRIUS_REVIEW_OUT", out_path.display().to_string()),
     ]);
     vars.extend(frontier_env);
+    // SIRF-35: what got past review before, live kinds only.
+    vars.push(kv(
+        "SIRIUS_ESCAPES",
+        crate::escape::patterns_section(
+            &cx.ledger.escapes(None).unwrap_or_default(),
+            &cx.ledger.automated_kinds().unwrap_or_default(),
+            None,
+            crate::escape::PROMPT_TOP,
+        ),
+    ));
     let mut rendered = crate::review::render_prompt(
         &fleet.review_prompt,
         &[
@@ -2317,14 +2327,20 @@ fn review_once(
         .concat(),
     );
     // A custom template predating SIRF-30 still learns what is in flight.
-    let siblings_text = env_value(&vars, "SIRIUS_SIBLINGS");
-    let has_placeholder = fleet.review_prompt.contains("$SIRIUS_SIBLINGS")
-        || fleet.review_prompt.contains("${SIRIUS_SIBLINGS}");
-    if siblings_text != "(none)" && !has_placeholder {
-        rendered.push_str(&format!(
-            "\n\nOther in-flight changes (other issues' branches awaiting integration):\n{siblings_text}\n"
-        ));
-    }
+    crate::review::append_missing_section(
+        &mut rendered,
+        &fleet.review_prompt,
+        "SIRIUS_ESCAPES",
+        env_value(&vars, "SIRIUS_ESCAPES"),
+        crate::review::ESCAPES_HEADING,
+    );
+    crate::review::append_missing_section(
+        &mut rendered,
+        &fleet.review_prompt,
+        "SIRIUS_SIBLINGS",
+        env_value(&vars, "SIRIUS_SIBLINGS"),
+        "Other in-flight changes (other issues' branches awaiting integration):",
+    );
     let prompt_path = reviews_dir.join(format!("{stem}-prompt.md"));
     let _ = std::fs::write(&prompt_path, rendered);
     let mut env = vars;
@@ -2424,23 +2440,12 @@ fn review_once(
     // for a reviewer that EXITED CLEANLY — its final message. A failed
     // reviewer's log may hold an echoed template or quoted findings; reading
     // those as its answer would fake a review.
-    let from_file = std::fs::read_to_string(&out_path).ok().map(|r| {
-        if crate::review::parse_review(&r, round).is_ok() {
-            r
-        } else {
-            crate::review::findings_json_in(&r).unwrap_or(r)
-        }
-    });
-    let from_log = || {
-        if exit != Some(0) {
-            return None;
-        }
-        opts.log_path
-            .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|log| crate::review::findings_json_in(&log))
-    };
-    let raw = match from_file.or_else(from_log) {
+    let raw = match crate::review::read_review_output(
+        &out_path,
+        opts.log_path.as_deref(),
+        exit == Some(0),
+        round,
+    ) {
         Some(r) => r,
         None => {
             return ReviewOnce::Failed {
@@ -5842,6 +5847,53 @@ mod tests {
             prompt.contains("1 newer in-flight issue(s) not merged"),
             "{prompt}"
         );
+    }
+
+    #[test]
+    fn escapes_reach_the_next_review_prompt_until_automated() {
+        // SIRF-35 Done-when: two `migration-fork` escapes appear in the next
+        // rendered review prompt; marking the kind automated removes them.
+        let led = Ledger::open_in_memory().unwrap();
+        led.insert_escape(
+            "LYD-13",
+            "migration-fork",
+            "snapshot chain forked",
+            None,
+            None,
+        )
+        .unwrap();
+        led.insert_escape("LYD-52", "migration-fork", "two 0042s", None, None)
+            .unwrap();
+        let review_prompt = |led: &Ledger| {
+            let m = MockRunner::new();
+            program_review_iteration(&m, "AMT-97");
+            checkpoint_heads(&m, &["ck1"]);
+            m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+            let (amt, hv, fleet) = (Amt::new(&m), Hayven::new(&m), test_fleet("base999"));
+            let mut out = Vec::new();
+            run_iteration(
+                &amt,
+                &hv,
+                led,
+                &review_cfg(3),
+                &m,
+                "sirius/oak",
+                Some("todo"),
+                "true",
+                &mut out,
+                None,
+                Some(&fleet),
+            );
+            let env = &m.agent_envs()[1];
+            std::fs::read_to_string(env_of(env, "SIRIUS_REVIEW_PROMPT").unwrap()).unwrap()
+        };
+        let p = review_prompt(&led);
+        assert!(p.contains("- migration-fork (2×"), "{p}");
+        assert!(p.contains("two 0042s"), "the latest summary: {p}");
+        led.set_kind_automated("migration-fork", "tests/migrations.rs")
+            .unwrap();
+        let p = review_prompt(&led);
+        assert!(!p.contains("migration-fork"), "{p}");
     }
 
     #[test]

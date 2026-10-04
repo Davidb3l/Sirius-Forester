@@ -312,6 +312,24 @@ branch awaiting integration, merged in order (a speculative merge queue).
 - The reviewer always runs in a throwaway worktree, so its hooks and test runs
   never touch the worker's tree.
 
+**Learn from what escapes** (SIRF-35). A defect that got past review is the
+most valuable data a review system has. Record it against the issue that
+shipped it:
+
+```bash
+sirius escape LYD-52 --kind migration-fork -m "two branches both took slot 0042" --found-by e2e --fix <fix-sha>
+```
+
+Every later review prompt lists the repo's live escape patterns. A kind that
+escapes twice is nudged toward a real check; once one exists,
+`sirius escape --kind migration-fork --automated-by tests/migrations.rs`
+retires it from the prompt. And every escape with a fix commit becomes a
+**canary**: `sirius review-canary` reverts each fix onto the current base (the
+real bug, back) — plus any `.sirius/canaries/*.patch` you write — runs your
+reviewer on it exactly as a review round would, and reports **recall** on real
+misses, with a benign control change for false positives. Run it whenever you
+change the reviewer model or prompt.
+
 The reviewer needs only **read** tools: it delivers its findings as JSON in its
 final message (headless `claude -p` is not allowed to write files by default —
 and a reviewer that cannot write cannot tamper). The built-in adversarial

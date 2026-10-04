@@ -67,6 +67,40 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Record a defect that got past review (SIRF-35), retire a kind that a
+    /// real check now catches (`--kind K --automated-by PATH`), or `--list`.
+    Escape {
+        /// The issue whose work introduced the defect.
+        issue: Option<String>,
+        /// A slug for the defect class, e.g. `migration-fork`.
+        #[arg(long)]
+        kind: Option<String>,
+        /// What escaped.
+        #[arg(short = 'm', long = "message")]
+        message: Option<String>,
+        /// Who caught it: main-session | integration | human | e2e | …
+        #[arg(long)]
+        found_by: Option<String>,
+        /// The commit that fixed it — makes it a review canary.
+        #[arg(long)]
+        fix: Option<String>,
+        /// Retire `--kind` from the review prompt: this check now catches it.
+        #[arg(long)]
+        automated_by: Option<String>,
+        #[arg(long)]
+        list: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Measure reviewer recall: replay recorded escapes (their fixes
+    /// reverted) and `.sirius/canaries/*.patch` through review.cmd (SIRF-35).
+    ReviewCanary {
+        /// At most this many canaries.
+        #[arg(long, default_value_t = 10)]
+        n: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// Build the integration frontier (base tip + every in-flight sibling)
     /// and run `integration.cmd` on it before anything merges (SIRF-32).
     Integrate {

@@ -37,6 +37,9 @@ Focus on: correctness against the spec, regressions in callers of anything the d
 Other in-flight changes (other issues' branches awaiting integration; when this review runs against the frontier they are already merged into $SIRIUS_REVIEW_DIR). Review only this issue's diff, but if it breaks once both land — a shared invariant, a contract, producer/consumer parity — report that as a "bug" naming the other issue:
 $SIRIUS_SIBLINGS
 
+Known escape patterns in this repo — defects that got past review here before. Check this diff for each one specifically:
+$SIRIUS_ESCAPES
+
 This is review round $SIRIUS_ROUND. If $SIRIUS_REVIEW_FINDINGS names a file, it holds the PREVIOUS round's findings with the worker's response to each ("fixed" or "rebutted"). Verify every one: report it in "previous" as "resolved" (the fix works), "accepted" (the rebuttal is right — it was not a bug), or "unresolved" (still broken, or the rebuttal is wrong — then also list it again in "findings" under its ORIGINAL id, e.g. "R1-1", never a new one). Use new ids (R$SIRIUS_ROUND-n) only for NEW findings.
 
 Deliver the review as JSON — your FINAL message must be exactly this JSON object and nothing else (no prose before or after it, no request for permissions). If you are able to write files, also write the same JSON to $SIRIUS_REVIEW_OUT; if not, the final message alone is enough:
@@ -232,6 +235,55 @@ pub fn findings_json_in(log: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The heading under which `$SIRIUS_ESCAPES` is appended to a custom prompt.
+pub const ESCAPES_HEADING: &str =
+    "Known escape patterns in this repo — defects that got past review here before. Check this diff for each one specifically:";
+
+/// A custom template that predates a section still gets it: append
+/// `heading` + `value` when the template has no `$NAME` / `${NAME}` and the
+/// value says something.
+pub fn append_missing_section(
+    rendered: &mut String,
+    template: &str,
+    name: &str,
+    value: &str,
+    heading: &str,
+) {
+    let has = template.contains(&format!("${name}")) || template.contains(&format!("${{{name}}}"));
+    if !has && value != "(none)" && !value.is_empty() {
+        rendered.push_str(&format!("\n\n{heading}\n{value}\n"));
+    }
+}
+
+/// The reviewer's findings JSON: `$SIRIUS_REVIEW_OUT` if it wrote one (the
+/// file wins; prose or fences around it are tolerated), else — only for a
+/// reviewer that EXITED CLEANLY — its final message from the captured log.
+/// A failed reviewer's log may hold an echoed template or quoted findings;
+/// reading those as its answer would fake a review. Shared by review rounds
+/// and canaries, so a canary scores the reviewer exactly as a round reads it.
+pub fn read_review_output(
+    out_path: &std::path::Path,
+    log_path: Option<&std::path::Path>,
+    exited_ok: bool,
+    round: u32,
+) -> Option<String> {
+    let from_file = std::fs::read_to_string(out_path).ok().map(|r| {
+        if parse_review(&r, round).is_ok() {
+            r
+        } else {
+            findings_json_in(&r).unwrap_or(r)
+        }
+    });
+    from_file.or_else(|| {
+        if !exited_ok {
+            return None;
+        }
+        log_path
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|log| findings_json_in(&log))
+    })
 }
 
 /// FNV-1a 64 — a dependency-free fingerprint for recognizing shipped prompts.
@@ -640,6 +692,7 @@ mod tests {
             ("SIRIUS_REVIEW_OUT".into(), "/o.json".into()),
             ("SIRIUS_WORKTREE".into(), "/w".into()),
             ("SIRIUS_SIBLINGS".into(), "(none)".into()),
+            ("SIRIUS_ESCAPES".into(), "(none)".into()),
         ];
         let r = render_prompt(DEFAULT_PROMPT, &all);
         assert!(!r.contains("$SIRIUS_"), "unrendered placeholder in:\n{r}");
