@@ -3,14 +3,14 @@ id: sf-sub-loop
 title: "The Loop — sirius run"
 path: "subsystems/loop"
 tags: ["loop", "rust", "coordination", "claims"]
-relatedFiles: ["src/run.rs"]
+relatedFiles: ["src/run.rs", "src/frontier.rs", "src/integrate.rs"]
 anchors: [{"file":"src/ledger.rs","symbol":"count_policy_events"}]
 evidence: []
 refs: []
 verifiedCommit: "bb6391d2a1c514e1effe6c1f7bf1ed6bebb2c7bf"
 verifiedAt: "2026-10-04T01:39:09.427Z"
-driftSuspectSince: ""
-driftSuspectReason: ""
+driftSuspectSince: "2026-10-04T03:58:26.561Z"
+driftSuspectReason: "code.changed touched src/ledger.rs, src/run.rs"
 createdAt: 1785915503544
 updatedAt: 1785916461329
 createdBy: "claude-code"
@@ -56,10 +56,12 @@ With `review.cmd` set (or `--review-cmd`), work that passes the gate in a fleet 
 
 1. **Checkpoint** the worker's uncommitted work, so the reviewer sees exactly `base..HEAD` and a tampering reviewer can be undone with one `reset --hard`.
 2. **Renew both leases** (`renew_checked`) — a refused amt lease aborts the iteration via the shared `lease_lost` unwind, without releasing an issue that is no longer ours.
-3. **Review** in a fresh `sh -c 'cd "$SIRIUS_REVIEW_DIR" || exit 1; <cmd>'` process with stdin closed (agents are non-interactive). The findings are the reviewer's final message (`review::findings_json_in` over its captured log) or `$SIRIUS_REVIEW_OUT` if it could write one — so a reviewer needs only read tools. With `review.against = current-base-merge` (default) the review tree is a throwaway detached worktree with the checkpoint merged onto the current tip of `base_ref`; a merge conflict skips the reviewer and becomes blocking `conflict` findings. Its `git worktree add/remove` go through a process-wide mutex (`worktree_admin`).
-4. **Enforce read-only**: `tree_fingerprint` (HEAD + porcelain status + diff) before/after; a change is reverted and the round is `tampered`. Missing/malformed JSON, a timeout, or tampering is a review error: retried once, then `on_review_error`.
+3. **Review** in a fresh `sh -c 'cd "$SIRIUS_REVIEW_DIR" || exit 1; <cmd>'` process with stdin closed (agents are non-interactive). The findings are the reviewer's final message (`review::findings_json_in` over its captured log) or `$SIRIUS_REVIEW_OUT` if it could write one — so a reviewer needs only read tools. `$SIRIUS_REVIEW_DIR` is ALWAYS a throwaway detached worktree (`add_review_tree`, `.sirius/worktrees/<tree>-review`), never the worker's tree, so the reviewer's hooks and test runs land somewhere deleted afterwards (SIRF-29). With `review.against = current-base-merge` (default) it holds the checkpoint merged onto the current tip of `base_ref`; with `launch-base` (or an unmoved base), the checkpoint itself; with `frontier` (SIRF-30), the checkpoint merged onto the integration frontier built by `frontier::prepare` — the base tip plus every sibling `sirius/*` branch awaiting integration (`frontier::siblings`), with `$SIRIUS_DIFF_RANGE = <frontier>..HEAD` and the siblings rendered into `$SIRIUS_SIBLINGS`. Conflicts are attributed by probing (`frontier::probe`): a conflict with the bare base is the base's; otherwise each sibling that conflicts with the work on its own becomes a `sibling-conflict` finding and is dropped from the retried merge. A conflict with the base skips the reviewer and becomes `conflict` findings that block regardless of `block_on`. Throwaway merges run no repo hooks and no rerere (`frontier::THROWAWAY_MERGE_CONFIG`). `review.sequences` (SIRF-31, `frontier::sequence_collisions`) adds `AUTO-` `conflict` findings for migration-style slots this branch takes out of order or shares with a sibling — including this fleet's peers under review right now (`Fleet::inflight`, `register_inflight` / `peers_before`: the peer that reached review first owns the slot; cleared by `worker_loop` after each iteration). `AUTO-` findings are recomputed every round; reviewer restatements or verdicts on them are dropped (`review::is_auto`), a vanished one counts as fixed (never an accepted rebuttal), and a round whose discovery was incomplete (`facts_complete = false`) keeps the previous round's `AUTO-` findings open. All `git worktree add/remove` go through a process-wide mutex (`worktree_admin`).
+4. **Enforce read-only**: `tree_fingerprint` (HEAD + porcelain status + diff of the worker's tree, excluding suite-owned `.suite/` `.hayven/` `.ametrite/` `.sirius/`) before/after; a change is reverted and the round is `tampered`. Missing/malformed JSON, a timeout, or tampering is a review error: retried once, then `on_review_error`.
 5. **Fix**: on confirmed blocking findings with rounds left, run the worker in fix mode, then re-gate; the next review sees each finding next to the worker's `fixed`/`rebutted` response. A fix agent failure or timeout, or a gate it cannot repair within `retry_budget`, reverts to the last reviewed checkpoint and escalates — gate-passing work is never traded for a broken fix.
 6. **Escalate** on exhaustion or error: `advance-flagged` (advance, label `review:open`, comment the open findings) or `release` (back to `todo`, ledger outcome `deadend`).
+
+**`sirius integrate`** (SIRF-32, `src/integrate.rs`) builds the same frontier with `frontier::build` (every sibling the scan finds, not the review cap) in `.sirius/worktrees/integrate` under a pidfile lock (`.sirius/integrate.lock`), points `refs/sirius/frontier` at it, and runs `integration.cmd` there (a timeout kills the command's whole process tree — `shell::kill_descendants`). Red records `integration_red` in the ledger meta first, then files one issue per red streak. Only a pass over a complete frontier clears it; a run with no command, or a pass with siblings left out or dropped, never does. With `integration.on_fail = block` (`integrate::block_reason`, fail-closed), `cmd_run` refuses to launch (exit 3), `worker_loop` pauses the fleet before each claim, and `run_iteration` HOLDS gated work: no review, no receipt, branch preserved, released to `todo` with outcome `released`.
 
 Every round writes a `review_rounds` ledger row, an NDJSON `review` event, an issue comment, and `review.*` spine events; the receipt's decision title carries the summary (`ReviewSummary::line`). A diff that is empty or touches only `skip_paths` skips the stage.
 

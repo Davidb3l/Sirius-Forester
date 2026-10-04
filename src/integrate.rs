@@ -9,7 +9,7 @@
 //! one issue and records the stop-the-line state the run loop honors.
 
 use crate::amt::Amt;
-use crate::config::Config;
+use crate::config::{Config, IntegrationOnFail};
 use crate::frontier;
 use crate::gitrange::run_git;
 use crate::ledger::Ledger;
@@ -35,7 +35,8 @@ pub struct RedState {
     pub issue: Option<String>,
 }
 
-/// The current red state, if integration is red.
+/// The current red state, if integration is red (display only — the
+/// blocking decision is [`block_reason`], which fails closed).
 pub fn red_state(ledger: &Ledger) -> Option<RedState> {
     ledger
         .meta(RED_KEY)
@@ -44,19 +45,54 @@ pub fn red_state(ledger: &Ledger) -> Option<RedState> {
         .and_then(|s| serde_json::from_str(&s).ok())
 }
 
+/// With `integration.on_fail = block`: why the line is stopped, if it is.
+/// Fails CLOSED — a red state Sirius cannot read is a reason to hold, after
+/// one retry for a transiently busy ledger. Every reason starts
+/// "integration red" (the run loop words its stop message by that).
+pub fn block_reason(cfg: &Config, ledger: &Ledger) -> Option<String> {
+    if cfg.integration.on_fail != IntegrationOnFail::Block {
+        return None;
+    }
+    let read = ledger.meta(RED_KEY).or_else(|_| {
+        std::thread::sleep(Duration::from_secs(1));
+        ledger.meta(RED_KEY)
+    });
+    match read {
+        Ok(None) => None,
+        Ok(Some(raw)) => Some(match serde_json::from_str::<RedState>(&raw) {
+            Ok(r) => format!(
+                "integration red at {}{} — fix it and run `sirius integrate` until green",
+                r.frontier,
+                r.issue.map(|i| format!(" ({i})")).unwrap_or_default()
+            ),
+            Err(_) => "integration red (state unreadable) — run `sirius integrate`".into(),
+        }),
+        Err(e) => Some(format!(
+            "integration red? the ledger cannot say ({e}) — holding until it can"
+        )),
+    }
+}
+
 /// `sirius integrate --json` (CONTRACTS §2).
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
+    /// `integration.cmd` ran and passed (true with nothing to run).
     pub ok: bool,
     pub base_ref: String,
     pub frontier: String,
     pub included: Vec<String>,
     pub left_out: Vec<Value>,
+    /// Awaiting integration but beyond the scan/merge limits.
+    pub dropped: Vec<String>,
+    /// Every sibling awaiting integration is in the frontier. Only a green
+    /// run over a COMPLETE frontier clears the red state.
+    pub complete: bool,
     pub ran: bool,
     pub exit: Option<i32>,
     pub timed_out: bool,
     pub log: Option<String>,
     pub issue: Option<String>,
+    /// The red state after this run.
     pub red: bool,
 }
 
@@ -69,6 +105,54 @@ fn tail(text: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
+/// One `sirius integrate` per repo at a time: two would remove each
+/// other's tree mid-run (a verdict over a deleted directory) and race the
+/// red state. A pidfile, like `run.pid`; a dead holder is taken over.
+struct Lock(std::path::PathBuf);
+
+impl Lock {
+    fn acquire(sirius_dir: &Path) -> Result<Lock, String> {
+        let path = sirius_dir.join("integrate.lock");
+        let _ = std::fs::create_dir_all(sirius_dir);
+        for _ in 0..2 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    let _ = write!(f, "{}", std::process::id());
+                    return Ok(Lock(path));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let holder = std::fs::read_to_string(&path).unwrap_or_default();
+                    match holder.trim().parse::<i32>() {
+                        Ok(pid) if crate::libc_kill_probe(pid) => {
+                            return Err(format!(
+                                "another `sirius integrate` is running (pid {pid}, {})",
+                                path.display()
+                            ))
+                        }
+                        // Dead (or unreadable) holder: take it over.
+                        _ => {
+                            let _ = std::fs::remove_file(&path);
+                        }
+                    }
+                }
+                Err(e) => return Err(format!("cannot create {}: {e}", path.display())),
+            }
+        }
+        Err(format!("cannot take {}", path.display()))
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Build the frontier, run `integration.cmd` on it, and keep the red state.
 /// `runner` runs git and the command from the repo root; `sirius_dir` is the
 /// absolute `.sirius/`.
@@ -79,6 +163,7 @@ pub fn integrate(
     cfg: &Config,
     sirius_dir: &Path,
 ) -> Result<Report, String> {
+    let _lock = Lock::acquire(sirius_dir)?;
     let base_ref = match cfg.review.base_ref.clone() {
         Some(r) => r,
         None => run_git(runner, &["rev-parse", "--abbrev-ref", "HEAD"])
@@ -94,12 +179,20 @@ pub fn integrate(
     .map(|o| o.stdout.trim().to_string())
     .map_err(|e| format!("base_ref `{base_ref}` does not resolve: {e}"))?;
     let status_of = |issue: &str| {
-        amt.issue_show(issue).ok().map(|v| {
+        amt.issue_show(issue).map(|v| {
             let s = |k: &str| v[k].as_str().unwrap_or_default().to_string();
             (s("status"), s("title"))
         })
     };
-    let sibs = frontier::siblings(runner, &status_of, &cur, "", &cfg.target_status);
+    // Integration takes EVERY sibling the scan finds, not the review cap.
+    let found = frontier::siblings(
+        runner,
+        &status_of,
+        &cur,
+        "",
+        &cfg.target_status,
+        frontier::SCAN_LIMIT,
+    );
 
     let t = sirius_dir.join("worktrees").join("integrate");
     let t_str = t.to_string_lossy().to_string();
@@ -107,14 +200,37 @@ pub fn integrate(
     let _ = std::fs::remove_dir_all(&t);
     run_git(runner, &["worktree", "add", "--detach", &t_str, &cur])
         .map_err(|e| format!("cannot create the integration tree: {e}"))?;
-    let result = run_in_tree(runner, cfg, sirius_dir, &t_str, &base_ref, &cur, &sibs);
+    let result = run_in_tree(runner, cfg, sirius_dir, &t_str, &base_ref, &cur, &found);
     let _ = run_git(runner, &["worktree", "remove", "--force", &t_str]);
     let _ = std::fs::remove_dir_all(&t);
     let mut report = result?;
 
     let prior = red_state(ledger);
+    report.issue = prior.as_ref().and_then(|p| p.issue.clone());
+    report.red = prior.is_some();
+    // Nothing tested is not green: the red state stays exactly as it was.
+    if !report.ran {
+        return Ok(report);
+    }
     if report.ok {
-        if let Some(issue) = prior.as_ref().and_then(|p| p.issue.as_deref()) {
+        if !report.complete {
+            // A pass over PART of the in-flight work proves nothing about
+            // the rest — it never clears a red state.
+            if let Some(issue) = &report.issue {
+                let _ = amt.comment_as(
+                    issue,
+                    &format!(
+                        "sirius integrate: passed at {} but NOT over every in-flight issue (left out: {}; dropped: {}) — still red.",
+                        report.frontier,
+                        list_or_none(&left_out_issues(&report)),
+                        list_or_none(&report.dropped)
+                    ),
+                    AUTHOR,
+                );
+            }
+            return Ok(report);
+        }
+        if let Some(issue) = &report.issue {
             let _ = amt.comment_as(
                 issue,
                 &format!(
@@ -128,16 +244,30 @@ pub fn integrate(
         ledger
             .set_meta(RED_KEY, None)
             .map_err(|e| format!("cannot clear the red state: {e}"))?;
+        report.red = false;
         return Ok(report);
     }
-    let body = red_body(cfg, &report, ledger_log_tail(&report));
-    // One issue per red streak: while the last one is open, comment on it.
-    let open = prior.and_then(|p| p.issue).filter(|i| {
+    // RED. Record it FIRST — the line stops even if filing the issue fails.
+    let record = |issue: Option<String>| {
+        let state = RedState {
+            at: crate::ledger::now_iso8601(),
+            frontier: report.frontier.clone(),
+            issue,
+        };
+        ledger
+            .set_meta(RED_KEY, Some(&json!(state).to_string()))
+            .map_err(|e| format!("cannot record the red state: {e}"))
+    };
+    record(report.issue.clone())?;
+    let body = red_body(cfg, &report, log_tail(&report));
+    // One issue per red streak: while the last one is open (or its state
+    // cannot be read), comment on it instead of filing another.
+    let open = report.issue.clone().filter(|i| {
         amt.issue_show(i)
             .map(|v| !is_closed(v["status"].as_str().unwrap_or_default()))
-            .unwrap_or(false)
+            .unwrap_or(true)
     });
-    report.issue = match open {
+    let issue = match open {
         Some(i) => {
             let _ = amt.comment_as(&i, &format!("Still red.\n\n{body}"), AUTHOR);
             Some(i)
@@ -155,15 +285,9 @@ pub fn integrate(
             }
         },
     };
+    record(issue.clone())?;
+    report.issue = issue;
     report.red = true;
-    let state = RedState {
-        at: crate::ledger::now_iso8601(),
-        frontier: report.frontier.clone(),
-        issue: report.issue.clone(),
-    };
-    ledger
-        .set_meta(RED_KEY, Some(&json!(state).to_string()))
-        .map_err(|e| format!("cannot record the red state: {e}"))?;
     Ok(report)
 }
 
@@ -175,7 +299,14 @@ fn list_or_none(v: &[String]) -> String {
     }
 }
 
-fn ledger_log_tail(report: &Report) -> String {
+fn left_out_issues(r: &Report) -> Vec<String> {
+    r.left_out
+        .iter()
+        .filter_map(|v| v["issue"].as_str().map(String::from))
+        .collect()
+}
+
+fn log_tail(report: &Report) -> String {
     report
         .log
         .as_ref()
@@ -185,29 +316,42 @@ fn ledger_log_tail(report: &Report) -> String {
 }
 
 fn red_body(cfg: &Config, r: &Report, log_tail: String) -> String {
-    let mut s = format!(
-        "`{}` failed on the integration frontier {} ({} + in-flight work).\n\nIncluded (merged in this order): {}\nExit: {}{}\nLog: {}",
-        cfg.integration.cmd.as_deref().unwrap_or_default(),
-        r.frontier,
-        r.base_ref,
-        list_or_none(&r.included),
+    let cmd = cfg.integration.cmd.as_deref().unwrap_or_default();
+    let mut s = if r.included.is_empty() {
+        format!(
+            "`{cmd}` fails on {} itself ({}) — no in-flight work was merged, so the base is red.",
+            r.base_ref, r.frontier
+        )
+    } else {
+        format!(
+            "`{cmd}` fails on the integration frontier {} = {} + {} (merged in this order). The failure is in the base or in how these changes combine.",
+            r.frontier,
+            r.base_ref,
+            r.included.join(", ")
+        )
+    };
+    s.push_str(&format!(
+        "\n\nExit: {}{}\nLog: {}",
         r.exit.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
         if r.timed_out { " (timed out)" } else { "" },
         r.log.as_deref().unwrap_or("(none)"),
-    );
+    ));
     if !r.left_out.is_empty() {
         s.push_str(&format!(
             "\nLeft out (conflict with earlier siblings): {}",
-            r.left_out
-                .iter()
-                .filter_map(|v| v["issue"].as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+            left_out_issues(r).join(", ")
         ));
     }
-    s.push_str(
-        "\n\nEvery included issue passed its own gate and review; the failure is in how they combine. Reproduce with `git checkout refs/sirius/frontier`.",
-    );
+    if !r.dropped.is_empty() {
+        s.push_str(&format!(
+            "\nNot integrated (over the scan limit): {}",
+            r.dropped.join(", ")
+        ));
+    }
+    s.push_str(&format!(
+        "\n\nReproduce: `git checkout {}` (refs/sirius/frontier moves with every run).",
+        r.frontier
+    ));
     if !log_tail.is_empty() {
         s.push_str(&format!("\n\nLast lines:\n```\n{log_tail}\n```"));
     }
@@ -221,8 +365,9 @@ fn run_in_tree(
     t: &str,
     base_ref: &str,
     cur: &str,
-    sibs: &[frontier::Sibling],
+    found: &frontier::Discovery,
 ) -> Result<Report, String> {
+    let sibs = &found.sibs;
     let built = frontier::build(runner, t, cur, sibs, &HashSet::new())?;
     run_git(runner, &["update-ref", FRONTIER_REF, &built.tip])
         .map_err(|e| format!("cannot update {FRONTIER_REF}: {e}"))?;
@@ -240,6 +385,8 @@ fn run_in_tree(
             .iter()
             .map(|(s, f)| json!({"issue": s.issue, "files": f}))
             .collect(),
+        dropped: found.dropped.clone(),
+        complete: found.complete && found.dropped.is_empty() && built.left_out.is_empty(),
         ran: false,
         exit: None,
         timed_out: false,
@@ -256,11 +403,12 @@ fn run_in_tree(
         return Ok(report);
     };
     let log = sirius_dir.join("logs").join(format!(
-        "integrate-{}.log",
+        "integrate-{}-{}.log",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+        std::process::id()
     ));
     let opts = AgentRunOpts {
         timeout: Duration::from_secs(cfg.integration.timeout_secs.max(1)),
@@ -420,6 +568,93 @@ mod tests {
         );
         let r = integrate(&m, &amt, &led, &cfg(Some("./ci.sh")), &d).unwrap();
         assert_eq!(r.issue.as_deref(), Some("AMT-91"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn red(led: &Ledger) {
+        led.set_meta(
+            RED_KEY,
+            Some(r#"{"at":"x","frontier":"f0","issue":"AMT-90"}"#),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn nothing_tested_is_not_green() {
+        // Review F3: with no integration.cmd the red state stays untouched.
+        let m = MockRunner::new();
+        let amt = Amt::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        red(&led);
+        let d = dir();
+        let t = d.join("worktrees").join("integrate").display().to_string();
+        program(&m, 0);
+        m.expect(&["git", "-C", &t, "rev-parse", "HEAD"], 0, "front1\n");
+        let r = integrate(&m, &amt, &led, &cfg(None), &d).unwrap();
+        assert!(!r.ran && r.red, "still red");
+        assert!(red_state(&led).is_some());
+        assert!(!m.recorded().iter().any(|c| c.contains("issue comment")));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_pass_over_part_of_the_in_flight_work_never_clears_red() {
+        // Review F4: a sibling whose status cannot be read is not integrated.
+        let m = MockRunner::new();
+        let amt = Amt::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        red(&led);
+        let d = dir();
+        let t = d.join("worktrees").join("integrate").display().to_string();
+        m.expect(&["git", "rev-parse", "--verify"], 0, "tip0\n");
+        m.expect(&["git", "for-each-ref"], 0, "sirius/amt-7\tsib7\n");
+        m.expect(
+            &["amt", "--json", "issue", "show", "AMT-7"],
+            1,
+            "database is locked",
+        );
+        m.expect(&["sh", "-c"], 0, "ok");
+        m.expect(&["git", "-C", &t, "rev-parse", "HEAD"], 0, "front1\n");
+        let r = integrate(&m, &amt, &led, &cfg(Some("./ci.sh")), &d).unwrap();
+        assert!(r.ok && !r.complete && r.red, "{r:?}");
+        assert!(red_state(&led).is_some());
+        assert!(m
+            .recorded()
+            .iter()
+            .any(|c| c.contains("issue comment AMT-90")
+                && c.contains("NOT over every in-flight issue")));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn red_is_recorded_even_when_filing_the_issue_fails() {
+        // Review F8: the line stops whether or not amt can take the issue.
+        let m = MockRunner::new();
+        let amt = Amt::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let d = dir();
+        let t = d.join("worktrees").join("integrate").display().to_string();
+        program(&m, 1);
+        m.expect(&["git", "-C", &t, "rev-parse", "HEAD"], 0, "front1\n");
+        m.expect(&["amt", "--json", "issue", "create"], 1, "boom");
+        let r = integrate(&m, &amt, &led, &cfg(Some("./ci.sh")), &d).unwrap();
+        assert!(r.red && r.issue.is_none());
+        assert_eq!(red_state(&led).unwrap().frontier, "front1");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn one_integrate_at_a_time() {
+        // Review F2: a second run would delete the first one's tree mid-run.
+        let d = dir();
+        let first = Lock::acquire(&d).unwrap();
+        let e = Lock::acquire(&d).err().unwrap();
+        assert!(e.contains("another `sirius integrate` is running"), "{e}");
+        drop(first);
+        assert!(Lock::acquire(&d).is_ok(), "released on drop");
+        // A dead holder is taken over.
+        std::fs::write(d.join("integrate.lock"), "999999").unwrap();
+        assert!(Lock::acquire(&d).is_ok());
         let _ = std::fs::remove_dir_all(&d);
     }
 

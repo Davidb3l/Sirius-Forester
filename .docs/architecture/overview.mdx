@@ -9,8 +9,8 @@ evidence: []
 refs: []
 verifiedCommit: "bb6391d2a1c514e1effe6c1f7bf1ed6bebb2c7bf"
 verifiedAt: "2026-10-04T01:39:09.412Z"
-driftSuspectSince: ""
-driftSuspectReason: ""
+driftSuspectSince: "2026-10-04T03:58:26.561Z"
+driftSuspectReason: "code.changed touched src/main.rs, src/cli.rs"
 createdAt: 1785915503544
 updatedAt: 1785915503544
 createdBy: "claude-code"
@@ -45,7 +45,7 @@ Sirius never opens either parent's SQLite for writing. The console (`web/`) read
 | Module | Role | Doc |
 |---|---|---|
 | `src/main.rs` | Command dispatch, `--json` envelopes, exit codes | this doc |
-| `src/cli.rs` | Clap definitions for the six subcommands | this doc |
+| `src/cli.rs` | Clap definitions for the seven subcommands | this doc |
 | `src/workspace.rs` | Walks up from cwd to find `.ametrite/` and `.hayven/` | this doc |
 | `src/ledger.rs` | The SQLite ledger — schema, receipts, iterations, policy events | [subsystems/ledger](../subsystems/ledger) |
 | `src/config.rs` | `.sirius/config.json` policy engine | [subsystems/policy-config](../subsystems/policy-config) |
@@ -59,10 +59,12 @@ Sirius never opens either parent's SQLite for writing. The console (`web/`) read
 | `src/gitrange.rs` | Changed-file resolution from a git range | — |
 | `src/models.rs` | Fleet model selection (SIRF-26): launch-time resolution + refusal, per-ticket label routing, fix floor, alias check, usage-limit detection | [subsystems/loop](../subsystems/loop) |
 | `src/review.rs` | The review stage's pure half: findings/fix JSON contracts, blocking rule, skip globs, prompt rendering, round bookkeeping | [subsystems/loop](../subsystems/loop) |
+| `src/frontier.rs` | The integration frontier (SIRF-30): sibling discovery, frontier build + sibling-conflict attribution, and the sequence-collision detector (SIRF-31) | [subsystems/loop](../subsystems/loop) |
+| `src/integrate.rs` | `sirius integrate` (SIRF-32): run `integration.cmd` on the frontier, red/green state, stop-the-line | [subsystems/loop](../subsystems/loop) |
 
 ## Subcommands
 
-`src/cli.rs` defines exactly six (`Init`, `Doctor`, `Link`, `Why`, `Gate`, `Run`). Every one takes `--json`.
+`src/cli.rs` defines exactly seven (`Init`, `Doctor`, `Link`, `Why`, `Gate`, `Integrate`, `Run`). Every one takes `--json`.
 
 ```
 sirius init            create .sirius/sirius.db beside an existing .ametrite/
@@ -70,6 +72,7 @@ sirius doctor          five contract facts live + plugin-handoff advisory
 sirius link <AMT-n>    stamp two-way provenance (--decision D-n for decisions)
 sirius why <target>    explain a symbol's issues/decisions, or an issue's symbols
 sirius gate <AMT-n>    select affected tests, run them, advance on pass
+sirius integrate       build the integration frontier, run integration.cmd on it (red → issue + optional stop-the-line)
 sirius run             the loop, --workers N --agent-cmd "<cmd>" --model <id> [--review-cmd "<cmd>"] [--review-model <id>]
 ```
 

@@ -386,7 +386,9 @@ pub fn reconcile(previous: &[Finding], report: &ReviewReport, block_on: &[String
         // A finding re-reported under its own id is OPEN, whatever the
         // verdict says (contradictory output must never count as "fixed").
         let closed = !re_reported && verdict.map_or(true, Verdict::closes);
-        let rebutted = p.response.as_ref().is_some_and(FixResponse::is_rebuttal);
+        // An AUTO fact is never closed BY a rebuttal (it is recomputed, not
+        // judged): a vanished one counts as fixed, an open one as no verdict.
+        let rebutted = !is_auto(&p.id) && p.response.as_ref().is_some_and(FixResponse::is_rebuttal);
         if closed {
             if rebutted {
                 out.rebuttals_accepted += 1;
@@ -701,6 +703,23 @@ mod tests {
         let ids: Vec<&str> = rec.blocking.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ids, vec!["R2-1", "R1-3"]);
         assert_eq!(rec.notes.len(), 1);
+    }
+
+    #[test]
+    fn a_vanished_auto_fact_counts_as_fixed_never_as_an_accepted_rebuttal() {
+        let mut prev = vec![bug("AUTO-seq-1", "conflict", "confirmed")];
+        attach_responses(
+            &mut prev,
+            &FixReport {
+                responses: vec![FixResponse {
+                    id: "AUTO-seq-1".into(),
+                    status: "rebutted".into(),
+                    note: "not a bug".into(),
+                }],
+            },
+        );
+        let rec = reconcile(&prev, &ReviewReport::default(), &block());
+        assert_eq!((rec.fixed, rec.rebuttals_accepted), (1, 0));
     }
 
     #[test]

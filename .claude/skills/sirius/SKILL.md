@@ -213,6 +213,13 @@ with `SIRIUS_PHASE=fix` (check it first — `work` means a fresh start):
   rebuttal and an unaccepted one keeps the finding open.
 - A `conflict` finding means your work clashes with work merged since launch:
   merge the named base commit into your work and resolve.
+- An `AUTO-…` finding is a FACT Sirius computed, not a reviewer's opinion —
+  e.g. a migration that takes a sequence slot the base or an in-flight sibling
+  already owns. Rebuttals cannot close it; changing the code (regenerating the
+  entry on top) does. It is recomputed every round.
+- A `sibling-conflict` note names another issue's branch awaiting integration
+  that edits the same lines. It does not block by default; check both changes
+  still agree, and leave the textual merge to whichever lands second.
 - You are re-gated afterwards. Don't trade a passing gate for a fix — if your
   fix breaks tests, Sirius reverts to the last passing state and flags the issue.
 

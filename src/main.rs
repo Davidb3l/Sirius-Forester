@@ -628,20 +628,6 @@ fn cmd_integrate(ws: &Workspace, runner: &RealRunner, json: bool) -> u8 {
     }
 }
 
-/// SIRF-32: with `integration.on_fail: block`, a red frontier stops the line.
-fn integration_block(cfg: &Config, ledger: &Ledger) -> Option<String> {
-    if cfg.integration.on_fail != config::IntegrationOnFail::Block {
-        return None;
-    }
-    integrate::red_state(ledger).map(|r| {
-        format!(
-            "integration red at {}{} — fix it and run `sirius integrate` until green",
-            r.frontier,
-            r.issue.map(|i| format!(" ({i})")).unwrap_or_default()
-        )
-    })
-}
-
 // ---- run ---------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
@@ -732,7 +718,7 @@ fn cmd_run(
     // stale entries (dead pid) are taken over, a live one refuses.
     // SIRF-32: never launch onto a red frontier when the line is blocked.
     if let Ok(l) = Ledger::open(&ws.ledger_path()) {
-        if let Some(why) = integration_block(&cfg, &l) {
+        if let Some(why) = integrate::block_reason(&cfg, &l) {
             eprint_err(&format!("refusing to launch: {why}"));
             return 3;
         }
@@ -824,6 +810,8 @@ fn cmd_run(
     let pause: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
     // SIRF-27: one fallback switch for the whole fleet, too.
     let fallback: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
+    // SIRF-31: one registry of work under review, shared by every worker.
+    let inflight: std::sync::Arc<std::sync::Mutex<run::Inflight>> = Default::default();
     let fleets: Vec<run::Fleet> = assignments
         .iter()
         .map(|(_, wt_path)| run::Fleet {
@@ -834,6 +822,7 @@ fn cmd_run(
             review_prompt: review_prompt.clone(),
             pause: pause.clone(),
             fallback: fallback.clone(),
+            inflight: inflight.clone(),
         })
         .collect();
     // Emitted once every launch check has passed — visible from the first event on (the claim events carry it per ticket).
@@ -1039,7 +1028,7 @@ fn worker_loop(
         }
         // SIRF-32: a red integration (on_fail: block) stops every worker
         // from claiming — no new work lands on a frontier that is broken.
-        if let Some(why) = integration_block(cfg, &ledger) {
+        if let Some(why) = integrate::block_reason(cfg, &ledger) {
             fleet.pause_with(&why);
             break;
         }
@@ -1060,6 +1049,8 @@ fn worker_loop(
             Some(spine),
             Some(fleet),
         );
+        // Stamped + released (or abandoned): no longer a peer under review.
+        fleet.clear_inflight(name);
         match outcome {
             run::IterationOutcome::NoWork { retry_after } => {
                 // An idle probe did no work — refund its budget slot so
@@ -1165,16 +1156,26 @@ mod tests {
         let led = Ledger::open_in_memory().unwrap();
         let mut cfg = Config::default();
         cfg.integration.on_fail = config::IntegrationOnFail::Block;
-        assert_eq!(integration_block(&cfg, &led), None, "green: no block");
+        assert_eq!(integrate::block_reason(&cfg, &led), None, "green: no block");
         led.set_meta(
             integrate::RED_KEY,
             Some(r#"{"at":"t","frontier":"f1","issue":"AMT-90"}"#),
         )
         .unwrap();
-        let why = integration_block(&cfg, &led).unwrap();
+        let why = integrate::block_reason(&cfg, &led).unwrap();
         assert!(why.starts_with("integration red at f1 (AMT-90)"), "{why}");
+        led.set_meta(integrate::RED_KEY, Some("not json")).unwrap();
+        let why = integrate::block_reason(&cfg, &led).unwrap();
+        assert!(
+            why.starts_with("integration red"),
+            "unreadable state holds: {why}"
+        );
         cfg.integration.on_fail = config::IntegrationOnFail::Warn;
-        assert_eq!(integration_block(&cfg, &led), None, "warn never blocks");
+        assert_eq!(
+            integrate::block_reason(&cfg, &led),
+            None,
+            "warn never blocks"
+        );
     }
 
     #[test]

@@ -19,11 +19,11 @@ use regex::Regex;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-/// At most this many siblings are merged into a frontier (newest first).
+/// At most this many siblings are merged into a REVIEW frontier.
 pub const MAX_SIBLINGS: usize = 12;
 /// At most this many unmerged `sirius/*` branches are looked at — completed
 /// branches are never deleted, and each one costs an `amt issue show`.
-const SCAN_LIMIT: usize = 50;
+pub const SCAN_LIMIT: usize = 50;
 
 /// Another issue's completed branch awaiting integration.
 #[derive(Debug, Clone, PartialEq)]
@@ -44,18 +44,28 @@ fn lines(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// Answers an issue's `(status, title)`.
+pub type StatusOf<'a> = dyn Fn(&str) -> Result<(String, String), String> + 'a;
+
 /// The siblings of `own_issue`: local `sirius/*` branches not merged into
 /// `cur` whose issue is in `target_status` (awaiting integration — this also
 /// drops squash-merged or abandoned work, whose branches stay "unmerged"
 /// forever), oldest completion first. `status_of(issue)` answers
-/// `(status, title)`; an issue it cannot answer for is skipped.
+/// `(status, title)`.
+///
+/// At most `max` siblings are kept — the OLDEST (next in line to merge);
+/// the rest are named in `dropped`. `complete` is `false` when a failed
+/// `for-each-ref`, an issue `status_of` could not answer, or a scan that hit
+/// its limit means siblings may be missing — facts built on an incomplete
+/// discovery must not be read as "the collision went away" (fail closed).
 pub fn siblings(
     runner: &dyn Runner,
-    status_of: &dyn Fn(&str) -> Option<(String, String)>,
+    status_of: &StatusOf,
     cur: &str,
     own_issue: &str,
     target_status: &str,
-) -> Vec<Sibling> {
+    max: usize,
+) -> Discovery {
     let own = format!("sirius/{}", own_issue.to_lowercase());
     let out = match run_git(
         runner,
@@ -71,14 +81,17 @@ pub fn siblings(
         Ok(o) => o,
         Err(e) => {
             eprintln!("sirius: cannot list sibling branches ({e}) — reviewing without them");
-            return vec![];
+            return Discovery {
+                sibs: vec![],
+                dropped: vec![],
+                complete: false,
+            };
         }
     };
+    let refs = lines(&out.stdout);
+    let mut complete = refs.len() < SCAN_LIMIT;
     let mut found = Vec::new();
-    for line in lines(&out.stdout) {
-        if found.len() >= MAX_SIBLINGS {
-            break;
-        }
+    for line in refs {
         let Some((branch, tip)) = line.split_once('\t') else {
             continue;
         };
@@ -89,8 +102,13 @@ pub fn siblings(
             continue;
         };
         let issue = key.to_uppercase();
-        let Some((status, title)) = status_of(&issue) else {
-            continue;
+        let (status, title) = match status_of(&issue) {
+            Ok(st) => st,
+            Err(e) => {
+                eprintln!("sirius: cannot read {issue}'s status ({e}) — treated as unknown");
+                complete = false;
+                continue;
+            }
         };
         if status != target_status {
             continue;
@@ -106,9 +124,27 @@ pub fn siblings(
             files,
         });
     }
-    // Newest-first was only for the cap; merge in completion order.
+    // Scanned newest first; keep the OLDEST `max`, in completion order.
     found.reverse();
-    found
+    let dropped = if found.len() > max {
+        found.split_off(max).into_iter().map(|s| s.issue).collect()
+    } else {
+        Vec::new()
+    };
+    Discovery {
+        sibs: found,
+        dropped,
+        complete,
+    }
+}
+
+/// What [`siblings`] found.
+#[derive(Debug, Clone, Default)]
+pub struct Discovery {
+    pub sibs: Vec<Sibling>,
+    /// In `target_status` but over the cap (newest first dropped).
+    pub dropped: Vec<String>,
+    pub complete: bool,
 }
 
 enum Merge {
@@ -117,26 +153,36 @@ enum Merge {
     Failed(String),
 }
 
-/// Merge `rev` into the tree at `t` (a throwaway merge commit, never on any
-/// branch — so a fixed identity is fine). A conflicted merge is aborted.
+/// The `git -c` settings for a THROWAWAY merge (never on any branch): a
+/// fixed identity, no repo hooks (a commitlint `commit-msg` hook rejecting
+/// the message would fail every review; a husky `post-merge` would run
+/// installs in the review tree), and no rerere recording.
+pub const THROWAWAY_MERGE_CONFIG: [&str; 8] = [
+    "-c",
+    "user.name=sirius",
+    "-c",
+    "user.email=sirius@localhost",
+    "-c",
+    "core.hooksPath=/nonexistent/sirius-no-hooks",
+    "-c",
+    "rerere.enabled=false",
+];
+
+/// Merge `rev` into the tree at `t` as a throwaway merge commit. A
+/// conflicted merge is aborted.
 fn merge_into(runner: &dyn Runner, t: &str, rev: &str, msg: &str) -> Merge {
-    let merged = run_git(
-        runner,
-        &[
-            "-C",
-            t,
-            "-c",
-            "user.name=sirius",
-            "-c",
-            "user.email=sirius@localhost",
-            "merge",
-            "--no-ff",
-            "--no-edit",
-            "-m",
-            msg,
-            rev,
-        ],
-    );
+    let mut args = vec!["-C", t];
+    args.extend(THROWAWAY_MERGE_CONFIG);
+    args.extend([
+        "merge",
+        "--no-ff",
+        "--no-verify",
+        "--no-edit",
+        "-m",
+        msg,
+        rev,
+    ]);
+    let merged = run_git(runner, &args);
     let Err(e) = merged else {
         return Merge::Clean;
     };
@@ -283,28 +329,87 @@ pub fn prepare(runner: &dyn Runner, t: &str, cur: &str, head: &str, sibs: &[Sibl
                 return Prepared::Failed(format!("merging onto the frontier failed: {e}"))
             }
             Merge::Conflicts(files) => {
-                let blamed: Vec<usize> = merged
+                let suspects: Vec<usize> = merged
                     .iter()
                     .copied()
                     .filter(|&i| sibs[i].files.iter().any(|f| files.contains(f)))
                     .collect();
-                if blamed.is_empty() {
+                if suspects.is_empty() {
                     return Prepared::BaseConflict {
                         files,
                         sibling_conflicts,
                     };
                 }
-                for i in blamed {
-                    let mine: Vec<String> = files
+                // Touching the same FILE is not causing the conflict: probe.
+                // If the work conflicts with the bare base, it is the base's.
+                match probe(runner, t, cur, None, head) {
+                    Ok(Some(f)) => {
+                        return Prepared::BaseConflict {
+                            files: f,
+                            sibling_conflicts,
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => return Prepared::Failed(e),
+                }
+                // Otherwise blame each suspect that conflicts with the work on
+                // its own; if only their combination does, blame them all.
+                let mut blamed = Vec::new();
+                for &i in &suspects {
+                    match probe(runner, t, cur, Some(&sibs[i].tip), head) {
+                        Ok(Some(f)) => blamed.push((i, f)),
+                        Ok(None) => {}
+                        Err(e) => return Prepared::Failed(e),
+                    }
+                }
+                if blamed.is_empty() {
+                    blamed = suspects
                         .iter()
-                        .filter(|f| sibs[i].files.contains(f))
-                        .cloned()
+                        .map(|&i| {
+                            let mine = files
+                                .iter()
+                                .filter(|f| sibs[i].files.contains(f))
+                                .cloned()
+                                .collect();
+                            (i, mine)
+                        })
                         .collect();
-                    sibling_conflicts.push(sibling_conflict(&sibs[i], &mine));
+                }
+                for (i, f) in blamed {
+                    sibling_conflicts.push(sibling_conflict(&sibs[i], &f));
                     excluded.insert(i);
                 }
             }
         }
+    }
+}
+
+/// Does `head` conflict when merged onto `cur` (+ `sibling`, if given)?
+/// `Some(files)` if so. A sibling that does not merge cleanly onto the bare
+/// base is not the culprit here (`None`). Leaves `t` in a throwaway state;
+/// `build` resets it.
+fn probe(
+    runner: &dyn Runner,
+    t: &str,
+    cur: &str,
+    sibling: Option<&str>,
+    head: &str,
+) -> Result<Option<Vec<String>>, String> {
+    for args in [&["reset", "-q", "--hard", cur][..], &["clean", "-fdq"][..]] {
+        let full: Vec<&str> = ["-C", t].iter().chain(args).copied().collect();
+        run_git(runner, &full).map_err(|e| format!("cannot reset the frontier tree: {e}"))?;
+    }
+    if let Some(sib) = sibling {
+        match merge_into(runner, t, sib, "sirius: conflict probe") {
+            Merge::Clean => {}
+            Merge::Conflicts(_) => return Ok(None),
+            Merge::Failed(e) => return Err(e),
+        }
+    }
+    match merge_into(runner, t, head, "sirius: conflict probe") {
+        Merge::Clean => Ok(None),
+        Merge::Conflicts(f) => Ok(Some(f)),
+        Merge::Failed(e) => Err(e),
     }
 }
 
@@ -357,18 +462,26 @@ pub fn render_siblings(
 
 // ---- SIRF-31: sequence collisions -----------------------------------------
 
-/// The direct children of `dir` at `rev` (names only). A missing dir is empty.
-pub fn seq_entries(runner: &dyn Runner, rev: &str, dir: &str) -> Vec<String> {
-    let dir = dir.trim_end_matches('/');
-    let prefix = format!("{dir}/");
-    run_git(runner, &["ls-tree", "--name-only", rev, "--", &prefix])
-        .map(|o| {
-            lines(&o.stdout)
-                .into_iter()
-                .filter_map(|p| p.strip_prefix(&prefix).map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
+/// `dir` as git prints paths: no leading `./`, no trailing `/`.
+fn norm_dir(dir: &str) -> &str {
+    dir.trim_start_matches("./").trim_end_matches('/')
+}
+
+/// The direct children of `dir` at `rev` (names only). A missing dir is
+/// empty; a git failure is an error (never "no entries"). `-z` keeps names
+/// with special characters unquoted.
+pub fn seq_entries(runner: &dyn Runner, rev: &str, dir: &str) -> Result<Vec<String>, String> {
+    let prefix = format!("{}/", norm_dir(dir));
+    let out = run_git(
+        runner,
+        &["ls-tree", "-z", "--name-only", rev, "--", &prefix],
+    )?;
+    Ok(out
+        .stdout
+        .split('\0')
+        .filter_map(|p| p.strip_prefix(&prefix).map(String::from))
+        .filter(|n| !n.is_empty())
+        .collect())
 }
 
 fn cmp_keys(a: &str, b: &str) -> Ordering {
@@ -406,7 +519,14 @@ pub fn sequence_findings(
 ) -> Result<Vec<Finding>, String> {
     let re =
         Regex::new(&spec.key).map_err(|e| format!("review.sequences key `{}`: {e}", spec.key))?;
-    let dir = spec.dir.trim_end_matches('/');
+    if re.captures_len() < 2 {
+        // No group 1 = no keys = a check that silently never fires.
+        return Err(format!(
+            "review.sequences key `{}` has no capture group — wrap the key part in ( )",
+            spec.key
+        ));
+    }
+    let dir = norm_dir(&spec.dir);
     let added: Vec<String> = ours
         .iter()
         .filter(|n| !launch.contains(n) && !current.contains(n))
@@ -459,8 +579,7 @@ pub fn sequence_findings(
                         "{issue} is awaiting integration with its own entry at slot {k}; once both merge, the sequence has two entries on one parent"
                     ),
                     fix: format!(
-                        "only one branch can own slot {k}: regenerate this entry after {issue} (merge `sirius/{}` first if the generator needs its state)",
-                        issue.to_lowercase()
+                        "only one branch can own slot {k}: regenerate this entry after {issue} lands (merge its work first if the generator needs its state)"
                     ),
                     response: None,
                 });
@@ -470,7 +589,9 @@ pub fn sequence_findings(
     Ok(out)
 }
 
-/// Every sequence collision for the work at `head`.
+/// Every sequence collision for the work at `head`, and whether the check
+/// was COMPLETE (a git or config error makes it `false`: the caller must not
+/// read a missing fact as "resolved").
 pub fn sequence_collisions(
     runner: &dyn Runner,
     specs: &[SequenceSpec],
@@ -478,25 +599,32 @@ pub fn sequence_collisions(
     head: &str,
     cur: &str,
     sibs: &[Sibling],
-) -> Vec<Finding> {
+) -> (Vec<Finding>, bool) {
     let mut out = Vec::new();
+    let mut complete = true;
     for spec in specs {
-        let sib_entries: Vec<SiblingEntries> = sibs
-            .iter()
-            .map(|s| (s.issue.clone(), seq_entries(runner, &s.tip, &spec.dir)))
-            .collect();
-        match sequence_findings(
-            spec,
-            &seq_entries(runner, launch, &spec.dir),
-            &seq_entries(runner, head, &spec.dir),
-            &seq_entries(runner, cur, &spec.dir),
-            &sib_entries,
-        ) {
+        let entries = || -> Result<Vec<Finding>, String> {
+            let mut sib_entries: Vec<SiblingEntries> = Vec::new();
+            for s in sibs {
+                sib_entries.push((s.issue.clone(), seq_entries(runner, &s.tip, &spec.dir)?));
+            }
+            sequence_findings(
+                spec,
+                &seq_entries(runner, launch, &spec.dir)?,
+                &seq_entries(runner, head, &spec.dir)?,
+                &seq_entries(runner, cur, &spec.dir)?,
+                &sib_entries,
+            )
+        };
+        match entries() {
             Ok(f) => out.extend(f),
-            Err(e) => eprintln!("sirius: {e} — sequence check skipped"),
+            Err(e) => {
+                eprintln!("sirius: sequence check on `{}` failed: {e}", spec.dir);
+                complete = false;
+            }
         }
     }
-    out
+    (out, complete)
 }
 
 #[cfg(test)]
@@ -564,7 +692,7 @@ mod tests {
         .unwrap();
         assert_eq!(f.len(), 1, "{f:?}");
         assert!(f[0].summary.contains("SIRF-12"), "{}", f[0].summary);
-        assert!(f[0].fix.contains("sirius/sirf-12"), "{}", f[0].fix);
+        assert!(f[0].fix.contains("after SIRF-12 lands"), "{}", f[0].fix);
     }
 
     #[test]
@@ -683,11 +811,11 @@ mod tests {
         }
     }
 
-    fn in_review(issue: &str) -> Option<(String, String)> {
+    fn in_review(issue: &str) -> Result<(String, String), String> {
         match issue {
-            "SIRF-1" | "SIRF-2" => Some(("in_review".into(), format!("{issue} title"))),
-            "SIRF-3" => Some(("done".into(), "merged by squash".into())),
-            _ => None,
+            "SIRF-1" | "SIRF-2" => Ok(("in_review".into(), format!("{issue} title"))),
+            "SIRF-3" => Ok(("done".into(), "merged by squash".into())),
+            _ => Err("no such issue".into()),
         }
     }
 
@@ -703,7 +831,16 @@ mod tests {
         let merged_in = repo.branch("sirius/sirf-4", &base, &[("four.txt", "4\n")]);
         repo.git(&["merge", "-q", "--no-ff", "--no-edit", &merged_in]); // already in main
         let cur = repo.git(&["rev-parse", "main"]);
-        let s = siblings(&repo.r, &in_review, &cur, "SIRF-9", "in_review");
+        let d = siblings(
+            &repo.r,
+            &in_review,
+            &cur,
+            "SIRF-9",
+            "in_review",
+            MAX_SIBLINGS,
+        );
+        assert!(d.complete && d.dropped.is_empty());
+        let s = d.sibs;
         let issues: Vec<&str> = s.iter().map(|s| s.issue.as_str()).collect();
         assert_eq!(issues.len(), 2, "{issues:?}");
         assert!(issues.contains(&"SIRF-1") && issues.contains(&"SIRF-2"));
@@ -820,6 +957,80 @@ mod tests {
     }
 
     #[test]
+    fn a_sibling_editing_another_part_of_the_file_is_not_blamed() {
+        // Review F2: the base moved and conflicts with line 1; the sibling
+        // only touched line 8 of the same file. Base conflict, no sibling.
+        let repo = Repo::new("blame");
+        let body = |l1: &str, l8: &str| format!("{l1}\n2\n3\n4\n5\n6\n7\n{l8}\n");
+        repo.write("f.txt", &body("1", "8"));
+        let launch = repo.commit("base");
+        let head = repo.branch("work", &launch, &[("f.txt", &body("mine", "8"))]);
+        let s1 = repo.branch("sirius/sirf-1", &launch, &[("f.txt", &body("1", "theirs"))]);
+        repo.write("f.txt", &body("base moved", "8"));
+        let cur = repo.commit("moved");
+        let sibs = vec![Sibling {
+            issue: "SIRF-1".into(),
+            title: "t".into(),
+            branch: "sirius/sirf-1".into(),
+            tip: s1,
+            files: vec!["f.txt".into()],
+        }];
+        let t = repo.tree(&cur);
+        match prepare(&repo.r, &t, &cur, &head, &sibs) {
+            Prepared::BaseConflict {
+                files,
+                sibling_conflicts,
+            } => {
+                assert_eq!(files, vec!["f.txt"]);
+                assert!(sibling_conflicts.is_empty(), "{sibling_conflicts:?}");
+            }
+            _ => panic!("expected BaseConflict"),
+        }
+    }
+
+    #[test]
+    fn repo_hooks_never_fail_a_throwaway_merge() {
+        // Review F5: a commitlint-style commit-msg hook rejecting
+        // "sirius frontier: + X" must not fail every review.
+        let repo = Repo::new("hooks");
+        repo.write("a.txt", "a\n");
+        let base = repo.commit("base");
+        let s1 = repo.branch("sirius/sirf-1", &base, &[("one.txt", "1\n")]);
+        let head = repo.branch("work", &base, &[("mine.txt", "m\n")]);
+        for hook in ["commit-msg", "pre-merge-commit"] {
+            let p = repo.dir.join(".git/hooks").join(hook);
+            std::fs::write(&p, "#!/bin/sh\nexit 1\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let sibs = vec![Sibling {
+            issue: "SIRF-1".into(),
+            title: "t".into(),
+            branch: "sirius/sirf-1".into(),
+            tip: s1,
+            files: vec!["one.txt".into()],
+        }];
+        let t = repo.tree(&base);
+        assert!(matches!(
+            prepare(&repo.r, &t, &base, &head, &sibs),
+            Prepared::Ready { .. }
+        ));
+    }
+
+    #[test]
+    fn a_key_without_a_capture_group_is_an_error_not_a_silent_no_op() {
+        let s = SequenceSpec {
+            dir: "m".into(),
+            key: r"^\d+".into(),
+        };
+        let e = sequence_findings(&s, &[], &[], &[], &[]).unwrap_err();
+        assert!(e.contains("capture group"), "{e}");
+    }
+
+    #[test]
     fn sequence_collisions_read_the_dir_from_git() {
         let repo = Repo::new("seq");
         repo.write("db/m/0001_init.sql", "-- 1\n");
@@ -838,7 +1049,9 @@ mod tests {
             tip: s1,
             files: vec![],
         }];
-        let f = sequence_collisions(&repo.r, &[spec("db/m/")], &base, &head, &base, &sibs);
+        let (f, complete) =
+            sequence_collisions(&repo.r, &[spec("./db/m/")], &base, &head, &base, &sibs);
+        assert!(complete);
         assert_eq!(f.len(), 1, "{f:?}");
         assert!(f[0].summary.contains("SIRF-1") && f[0].summary.contains("0002_theirs.sql"));
         assert_eq!(f[0].file.as_deref(), Some("db/m/0002_mine.sql"));

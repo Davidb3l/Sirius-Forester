@@ -9,8 +9,8 @@ evidence: []
 refs: []
 verifiedCommit: "c4e7486d4c51ffcb65f4b791fcbcdb0f7743c188"
 verifiedAt: "2026-10-04T01:34:50.337Z"
-driftSuspectSince: ""
-driftSuspectReason: ""
+driftSuspectSince: "2026-10-04T03:58:26.561Z"
+driftSuspectReason: "code.changed touched src/ledger.rs"
 createdAt: 1785915503544
 updatedAt: 1785915503544
 createdBy: "claude-code"
@@ -32,7 +32,7 @@ Parallel fleet workers each hold their own connection; WAL plus a 5-second `busy
 
 | Table | Holds |
 |---|---|
-| `meta` | `schema_version`, `created_at`, `sirius_version` |
+| `meta` | `schema_version`, `created_at`, `sirius_version`; plus `integration_red` (JSON `{at, frontier, issue}`) while `sirius integrate` is red (SIRF-32) |
 | `workers` | one row per worker id (`sirius/oak`), with `status` and `last_seen_at` |
 | `iterations` | one row per loop pass: issue, entities, outcome, gate result, oracle verdicts, tokens, duration, receipt |
 | `receipts` | provenance stamps — `kind` (`issue`/`decision`), `ref`, `symbols`, `forward_ok`, `reverse_ok` |
@@ -54,7 +54,7 @@ Parallel fleet workers each hold their own connection; WAL plus a 5-second `busy
 
 ## Read API for the console
 
-`schema_version()`, `meta(key)`, and `data_version()` are marked `#[allow(dead_code)]` — they are the read surface the console consumes over WAL, not called by the CLI itself. `data_version()` wraps `PRAGMA data_version`, which bumps on any external write; the console polls it to drive SSE updates without a filesystem watcher.
+`schema_version()` and `data_version()` are marked `#[allow(dead_code)]` — they are the read surface the console consumes over WAL, not called by the CLI itself. `meta(key)` / `set_meta(key, value)` are also used by the CLI: `integration_red` is the stop-the-line state `sirius run` checks before launching and before every claim. `data_version()` wraps `PRAGMA data_version`, which bumps on any external write; the console polls it to drive SSE updates without a filesystem watcher.
 
 ## No chrono
 

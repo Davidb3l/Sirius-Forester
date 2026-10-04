@@ -192,7 +192,10 @@ impl Runner for RealRunner {
                 }
                 None => {
                     if start.elapsed() >= opts.timeout {
-                        // Hung or over-budget: kill, reap, and report a timeout.
+                        // Hung or over-budget: kill the whole tree (an
+                        // integration cmd's servers, an agent's subprocesses
+                        // would otherwise outlive it), reap, report a timeout.
+                        kill_descendants(child.id());
                         let _ = child.kill();
                         let code = child.wait().ok().and_then(|s| s.code());
                         append_exit_trailer(opts.log_path.as_deref(), code);
@@ -212,6 +215,45 @@ impl Runner for RealRunner {
                 }
             }
         }
+    }
+}
+
+/// SIGKILL every descendant of `pid` (children first found, whole tree).
+/// Not a new process group: that would keep the terminal's Ctrl-C from
+/// reaching agents. Best-effort; a no-op where `ps` is unavailable (Windows),
+/// and a daemon that double-forked away is out of reach by design.
+fn kill_descendants(pid: u32) {
+    if cfg!(windows) {
+        return;
+    }
+    let Ok(out) = Command::new("ps")
+        .args(["-A", "-o", "pid=", "-o", "ppid="])
+        .output()
+    else {
+        return;
+    };
+    let pairs: Vec<(u32, u32)> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace().map(|n| n.parse::<u32>().ok());
+            Some((it.next()??, it.next()??))
+        })
+        .collect();
+    let mut tree = vec![pid];
+    let mut i = 0;
+    while i < tree.len() {
+        let parent = tree[i];
+        tree.extend(
+            pairs
+                .iter()
+                .filter(|(_, pp)| *pp == parent)
+                .map(|(p, _)| *p),
+        );
+        i += 1;
+    }
+    let victims: Vec<String> = tree[1..].iter().map(u32::to_string).collect();
+    if !victims.is_empty() {
+        let _ = Command::new("kill").arg("-KILL").args(&victims).output();
     }
 }
 
@@ -580,6 +622,37 @@ mod tests {
         assert_eq!(beats, 2);
         assert!(outcome.timed_out());
         assert!(!outcome.success());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_timeout_kills_the_childs_whole_tree() {
+        // SIRF-32 review F9: a server an integration cmd started must not
+        // outlive the timeout (it would hold its port for the next run).
+        let dir = std::env::temp_dir().join(format!("sirius-tree-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let pidfile = dir.join("bg.pid");
+        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let r = RealRunner::default();
+        let opts = AgentRunOpts {
+            timeout: Duration::from_millis(500),
+            heartbeat_interval: Duration::from_millis(100),
+            log_path: None,
+            env: vec![],
+        };
+        let out = r
+            .run_agent("sh", &["-c", &script], &opts, &mut || {})
+            .unwrap();
+        assert!(out.timed_out());
+        let bg = std::fs::read_to_string(&pidfile).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let alive = Command::new("kill")
+            .args(["-0", bg.trim()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(!alive, "the background child {bg} survived the timeout");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

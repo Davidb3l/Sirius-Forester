@@ -46,6 +46,27 @@ pub struct Fleet {
     /// SIRF-27: set (to the triggering message) once the fleet switched to
     /// `models.fallback`. Shared like `pause`.
     pub fallback: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// SIRF-31: this fleet's work currently between review and release,
+    /// shared by every worker. Completed siblings are found by their
+    /// `sirius/*` branch, but two workers reviewing AT THE SAME TIME have no
+    /// branch yet — the Lydgr case (parallel workers each generating the
+    /// next migration). The peer that reached review first owns a slot.
+    pub inflight: std::sync::Arc<std::sync::Mutex<Inflight>>,
+}
+
+/// See [`Fleet::inflight`].
+#[derive(Debug, Default)]
+pub struct Inflight {
+    next: u64,
+    peers: Vec<InflightPeer>,
+}
+
+#[derive(Debug, Clone)]
+struct InflightPeer {
+    seq: u64,
+    worker: String,
+    issue: String,
+    head: String,
 }
 
 impl Fleet {
@@ -59,6 +80,48 @@ impl Fleet {
 
     pub fn paused(&self) -> Option<String> {
         self.pause.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Record (or update) `worker`'s checkpoint under review for `issue`. A
+    /// re-registration of the same issue keeps its place in line.
+    pub fn register_inflight(&self, worker: &str, issue: &str, head: &str) {
+        let mut g = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(p) = g
+            .peers
+            .iter_mut()
+            .find(|p| p.worker == worker && p.issue == issue)
+        {
+            p.head = head.to_string();
+            return;
+        }
+        g.peers.retain(|p| p.worker != worker);
+        g.next += 1;
+        let seq = g.next;
+        g.peers.push(InflightPeer {
+            seq,
+            worker: worker.to_string(),
+            issue: issue.to_string(),
+            head: head.to_string(),
+        });
+    }
+
+    /// `(issue, head)` of every peer that reached review before `worker`.
+    pub fn peers_before(&self, worker: &str) -> Vec<(String, String)> {
+        let g = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mine) = g.peers.iter().find(|p| p.worker == worker).map(|p| p.seq) else {
+            return Vec::new();
+        };
+        g.peers
+            .iter()
+            .filter(|p| p.seq < mine)
+            .map(|p| (p.issue.clone(), p.head.clone()))
+            .collect()
+    }
+
+    /// `worker`'s iteration ended (its work is stamped + released, or gone).
+    pub fn clear_inflight(&self, worker: &str) {
+        let mut g = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        g.peers.retain(|p| p.worker != worker);
     }
 
     /// Is the fleet running on its fallback tier?
@@ -144,7 +207,7 @@ pub fn template_cmd(cmd: &str, issue: &str, worker: &str, model: Option<&str>) -
     }
 }
 
-/// An owned env pair.
+/// The last value of `k` in an env list ("" if absent).
 fn env_value<'e>(env: &'e [(String, String)], k: &str) -> &'e str {
     env.iter()
         .rev()
@@ -153,6 +216,7 @@ fn env_value<'e>(env: &'e [(String, String)], k: &str) -> &'e str {
         .unwrap_or_default()
 }
 
+/// An owned env pair.
 fn kv(k: &str, v: impl Into<String>) -> (String, String) {
     (k.to_string(), v.into())
 }
@@ -1392,7 +1456,12 @@ pub fn run_iteration(
     // 6. REVIEW⇄FIX (SIRF-23): only over work that passed the gate. Off unless
     //    `review.cmd` is set, and fleet-only (it checkpoints commits and may
     //    hard-reset, which is only safe in a private worktree).
-    let review = if work_ok && (gate_result == "pass" || gate_result == "skipped") {
+    // SIRF-32: on a red frontier (integration.on_fail = block) gated work is
+    // HELD — not reviewed, not receipted, never advanced; it is preserved on
+    // its branch and released to todo naming the red run.
+    let integration_hold = crate::integrate::block_reason(config, ledger);
+    let gated = work_ok && (gate_result == "pass" || gate_result == "skipped");
+    let review = if gated && integration_hold.is_none() {
         match fleet {
             Some(f) if config.review.cmd.is_some() => {
                 let cx = ReviewCtx {
@@ -1434,7 +1503,7 @@ pub fn run_iteration(
         ReviewStage::Release { summary, .. } => Some(summary),
         _ => None,
     };
-    if work_ok && (gate_result == "pass" || gate_result == "skipped") && !review_released {
+    if gated && !review_released && integration_hold.is_none() {
         // The decision carries the WHY (SIRF-22 #6): the review history when
         // a review ran, attributed to the worker (SIRF-22 #5).
         let (title, body) = decision_text(&issue, &review);
@@ -1481,8 +1550,7 @@ pub fn run_iteration(
     //    Otherwise the issue returns to `todo`: re-claimable, but un-promoted
     //    (matching the entity-overlap release path above). (SIRF-6)
     release_entities(hv, ledger, &issue, &claim_ids);
-    let mut advanced =
-        work_ok && (gate_result == "pass" || gate_result == "skipped") && !review_released;
+    let mut advanced = gated && !review_released && integration_hold.is_none();
     // PRESERVE the completed work before anything can reset the worktree
     // (isolated fleets hard-reset between issues and tear worktrees down at
     // exit). Non-committing agents are common — without this, a gated,
@@ -1490,7 +1558,7 @@ pub fn run_iteration(
     // worktree, completed-on-the-board but existing nowhere. Auto-commit
     // whatever is uncommitted, then stamp the per-issue branch (branch -f is
     // safe: detached worktrees never hold the branch checked out).
-    if advanced && isolate_base.is_some() {
+    if (advanced || (gated && integration_hold.is_some())) && isolate_base.is_some() {
         let _ = crate::gitrange::run_git(runner, &["add", "-A"]);
         // May legitimately fail with "nothing to commit" when the agent
         // committed its own work — that is fine, HEAD already has it. What is
@@ -1528,6 +1596,11 @@ pub fn run_iteration(
     // pass" used to be posted even when the agent itself had exited 1.
     let held_back = if advanced {
         None
+    } else if let (true, Some(why)) = (gated, &integration_hold) {
+        Some(format!(
+            "sirius: released without advancing — {why}; the gated work is preserved on sirius/{}",
+            issue.to_lowercase()
+        ))
     } else if let ReviewStage::Release { why, .. } = &review {
         Some(format!(
             "sirius: released without advancing — review: {why}"
@@ -1576,6 +1649,9 @@ pub fn run_iteration(
         "deadend"
     } else if advanced {
         "completed"
+    } else if gated && integration_hold.is_some() {
+        // Good work held back by a red frontier (SIRF-32), not a failure.
+        "released"
     } else {
         // The agent run failed (or never spawned) and nothing advanced —
         // record the honest failure rather than claiming completion.
@@ -1710,11 +1786,15 @@ enum ReviewOnce {
     Report {
         report: crate::review::ReviewReport,
         head: String,
+        /// Were the AUTO facts fully recomputed? If not, the previous
+        /// round's facts stay open (fail closed — SIRF-31).
+        facts_complete: bool,
     },
-    /// `current-base-merge` conflicted: these are the blocking findings.
+    /// The work does not merge onto the base: these findings, no review.
     Conflicts {
         findings: Vec<Finding>,
         head: String,
+        facts_complete: bool,
     },
     Failed {
         result: RoundResult,
@@ -1930,31 +2010,49 @@ fn review_once(
     // SIRF-30/31: the in-flight siblings, and the facts no reviewer decides.
     let tip = cur.clone().unwrap_or_else(|| fleet.base.clone());
     let frontier_mode = rc.against == crate::config::ReviewAgainst::Frontier;
-    let sibs = if frontier_mode || !rc.sequences.is_empty() {
+    fleet.register_inflight(cx.worker, cx.issue, &head);
+    let (sibs, sibs_complete) = if frontier_mode || !rc.sequences.is_empty() {
         let status_of = |issue: &str| {
-            cx.amt.issue_show(issue).ok().map(|v| {
+            cx.amt.issue_show(issue).map(|v| {
                 let s = |k: &str| v[k].as_str().unwrap_or_default().to_string();
                 (s("status"), s("title"))
             })
         };
-        crate::frontier::siblings(
+        let d = crate::frontier::siblings(
             cx.runner,
             &status_of,
             &tip,
             cx.issue,
             &cx.config.target_status,
-        )
+            crate::frontier::MAX_SIBLINGS,
+        );
+        (d.sibs, d.complete)
     } else {
-        Vec::new()
+        (Vec::new(), true)
     };
-    let mut auto = crate::frontier::sequence_collisions(
+    // Sequence slots are also contested by this fleet's peers under review
+    // right now (no branch yet): the one that got here first owns the slot.
+    let mut seq_sibs = sibs.clone();
+    for (issue, peer_head) in fleet.peers_before(cx.worker) {
+        if issue != cx.issue && !seq_sibs.iter().any(|s| s.issue == issue) {
+            seq_sibs.push(crate::frontier::Sibling {
+                branch: format!("in review in this fleet ({issue})"),
+                issue,
+                title: String::new(),
+                tip: peer_head,
+                files: Vec::new(),
+            });
+        }
+    }
+    let (mut auto, seq_complete) = crate::frontier::sequence_collisions(
         cx.runner,
         &rc.sequences,
         &fleet.base,
         &head,
         &tip,
-        &sibs,
+        &seq_sibs,
     );
+    let facts_complete = sibs_complete && seq_complete;
     let mut frontier_env = vec![
         kv("SIRIUS_FRONTIER", ""),
         kv("SIRIUS_SIBLING_BRANCHES", ""),
@@ -2010,7 +2108,11 @@ fn review_once(
                 let mut findings = base_conflict_findings(round, label, &tip, &files);
                 findings.extend(sibling_conflicts);
                 findings.append(&mut auto);
-                return ReviewOnce::Conflicts { findings, head };
+                return ReviewOnce::Conflicts {
+                    findings,
+                    head,
+                    facts_complete,
+                };
             }
             crate::frontier::Prepared::Failed(detail) => {
                 remove_review_tree(cx, &t);
@@ -2035,13 +2137,10 @@ fn review_once(
                 let t_str = t.to_string_lossy().to_string();
                 // A throwaway merge commit, never on any branch — so a fixed
                 // identity is fine and the user's git config is not needed.
-                let merged = crate::gitrange::run_git(
-                    cx.runner,
-                    &[
-                        "-C", &t_str, "-c", "user.name=sirius", "-c",
-                        "user.email=sirius@localhost", "merge", "--no-ff", "--no-edit", &head,
-                    ],
-                );
+                let mut args = vec!["-C", t_str.as_str()];
+                args.extend(crate::frontier::THROWAWAY_MERGE_CONFIG);
+                args.extend(["merge", "--no-ff", "--no-verify", "--no-edit", &head]);
+                let merged = crate::gitrange::run_git(cx.runner, &args);
                 if let Err(e) = merged {
                     let conflicts: Vec<String> = crate::gitrange::run_git(
                         cx.runner,
@@ -2065,7 +2164,11 @@ fn review_once(
                     }
                     let mut findings = base_conflict_findings(round, &r, &cur, &conflicts);
                     findings.append(&mut auto);
-                    return ReviewOnce::Conflicts { findings, head };
+                    return ReviewOnce::Conflicts {
+                        findings,
+                        head,
+                        facts_complete,
+                    };
                 }
                 diff_range = format!("{cur}..HEAD");
                 tmp = Some(t);
@@ -2118,9 +2221,11 @@ fn review_once(
     );
     // A custom template predating SIRF-30 still learns what is in flight.
     let siblings_text = env_value(&vars, "SIRIUS_SIBLINGS");
-    if siblings_text != "(none)" && !fleet.review_prompt.contains("$SIRIUS_SIBLINGS") {
+    let has_placeholder = fleet.review_prompt.contains("$SIRIUS_SIBLINGS")
+        || fleet.review_prompt.contains("${SIRIUS_SIBLINGS}");
+    if siblings_text != "(none)" && !has_placeholder {
         rendered.push_str(&format!(
-            "\n\nOther in-flight changes (already merged into the review tree):\n{siblings_text}\n"
+            "\n\nOther in-flight changes (other issues' branches awaiting integration):\n{siblings_text}\n"
         ));
     }
     let prompt_path = reviews_dir.join(format!("{stem}-prompt.md"));
@@ -2257,7 +2362,11 @@ fn review_once(
             report.findings.retain(|f| !crate::review::is_auto(&f.id));
             report.previous.retain(|v| !crate::review::is_auto(&v.id));
             report.findings.append(&mut auto);
-            ReviewOnce::Report { report, head }
+            ReviewOnce::Report {
+                report,
+                head,
+                facts_complete,
+            }
         }
         Err(detail) => ReviewOnce::Failed {
             result: RoundResult::Error,
@@ -2471,22 +2580,50 @@ pub fn run_review_stage(cx: &ReviewCtx, out: &mut dyn Write, fix_round: &FixRoun
             }
         }
         let (rec, head) = match got {
-            Some(ReviewOnce::Report { report, head }) => (
-                crate::review::reconcile(&previous, &report, &rc.block_on),
+            Some(ReviewOnce::Report {
+                mut report,
                 head,
-            ),
-            Some(ReviewOnce::Conflicts { findings, head }) => {
+                facts_complete,
+            }) => {
+                if !facts_complete {
+                    // A fact we could not recompute is not a fact that went
+                    // away: keep the previous round's AUTO findings open.
+                    for p in strip_responses(&previous) {
+                        if crate::review::is_auto(&p.id)
+                            && !report.findings.iter().any(|f| f.id == p.id)
+                        {
+                            report.findings.push(p);
+                        }
+                    }
+                }
+                (
+                    crate::review::reconcile(&previous, &report, &rc.block_on),
+                    head,
+                )
+            }
+            Some(ReviewOnce::Conflicts {
+                findings,
+                head,
+                facts_complete,
+            }) => {
                 // No review ran this round: the previous findings are still
                 // unverified, so they stay open alongside the conflicts —
-                // except AUTO- facts, which this round recomputed.
-                let (mut blocking, notes): (Vec<Finding>, Vec<Finding>) = findings
-                    .into_iter()
-                    .partition(|f| crate::review::is_blocking(f, &rc.block_on));
-                blocking.extend(
-                    strip_responses(&previous)
-                        .into_iter()
-                        .filter(|p| !crate::review::is_auto(&p.id)),
-                );
+                // except AUTO- facts this round recomputed. A base conflict
+                // ALWAYS blocks (whatever block_on says); only the AUTO facts
+                // go through the blocking rule.
+                let (mut blocking, notes): (Vec<Finding>, Vec<Finding>) =
+                    findings.into_iter().partition(|f| {
+                        !crate::review::is_auto(&f.id)
+                            || crate::review::is_blocking(f, &rc.block_on)
+                    });
+                let fresh: Vec<String> = blocking
+                    .iter()
+                    .chain(notes.iter())
+                    .map(|f| f.id.clone())
+                    .collect();
+                blocking.extend(strip_responses(&previous).into_iter().filter(|p| {
+                    !fresh.contains(&p.id) && (!crate::review::is_auto(&p.id) || !facts_complete)
+                }));
                 (
                     crate::review::Reconciled {
                         blocking,
@@ -2692,6 +2829,7 @@ mod tests {
             review_prompt: crate::review::DEFAULT_PROMPT.into(),
             pause: Default::default(),
             fallback: Default::default(),
+            inflight: Default::default(),
         }
     }
 
@@ -4961,20 +5099,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_braced_siblings_placeholder_is_not_appended_twice() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-89");
+        checkpoint_heads(&m, &["ck1"]);
+        program_sibling(&m);
+        let mut fleet = test_fleet("base999");
+        fleet.review_prompt = "In flight:\n${SIRIUS_SIBLINGS}".into();
+        let t = fleet.sirius_dir.join("worktrees").join("sirius_oak-review");
+        m.expect(
+            &["git", "-C", &t.to_string_lossy(), "rev-parse", "HEAD"],
+            0,
+            "front1\n",
+        );
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+        let mut c = review_cfg(3);
+        c.review.against = crate::config::ReviewAgainst::Frontier;
+        run_fleet_at(&m, &c, &fleet);
+        let env = &m.agent_envs()[1];
+        let prompt = std::fs::read_to_string(env_of(env, "SIRIUS_REVIEW_PROMPT").unwrap()).unwrap();
+        assert_eq!(
+            prompt.matches("AMT-7 \"Other work\"").count(),
+            1,
+            "{prompt}"
+        );
+    }
+
     /// `dir` m/ at the launch base (also the current tip — no base_ref).
     fn program_sequence_round(m: &MockRunner, head: &str, head_entries: &str) {
+        let z = |names: &str| names.replace('\n', "\0");
         program_sibling(m);
         m.expect(
-            &["git", "ls-tree", "--name-only", "sib7"],
+            &["git", "ls-tree", "-z", "--name-only", "sib7"],
             0,
-            "m/0001_a\nm/0002_theirs\n",
+            &z("m/0001_a\nm/0002_theirs\n"),
         );
-        m.expect(&["git", "ls-tree", "--name-only", head], 0, head_entries);
+        m.expect(
+            &["git", "ls-tree", "-z", "--name-only", head],
+            0,
+            &z(head_entries),
+        );
         for _ in 0..2 {
             m.expect(
-                &["git", "ls-tree", "--name-only", "base999"],
+                &["git", "ls-tree", "-z", "--name-only", "base999"],
                 0,
-                "m/0001_a\n",
+                &z("m/0001_a\n"),
             );
         }
     }
@@ -5224,6 +5394,164 @@ mod tests {
         assert_eq!(o, IterationOutcome::Completed);
         assert_eq!(phases(&m), vec!["work"], "no reviewer over an empty diff");
         assert!(nd.contains("\"result\":\"skipped\""), "{nd}");
+    }
+
+    #[test]
+    fn a_base_conflict_blocks_even_when_block_on_omits_conflict() {
+        // Review F1: no reviewer ran — the conflict must never read as clean.
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-85");
+        checkpoint_heads(&m, &["ck1"]);
+        m.expect(&["git", "rev-parse", "--verify"], 0, "cur777\n");
+        m.push(MockResponse::new(
+            &["git", "-C"],
+            1,
+            "",
+            "CONFLICT (content)",
+        ));
+        m.expect(&["git", "-C"], 0, "src/x.rs\n");
+        let mut c = review_cfg(1);
+        c.review.against = crate::config::ReviewAgainst::CurrentBaseMerge;
+        c.review.base_ref = Some("main".into());
+        c.review.block_on = vec!["bug".into()];
+        let (_o, led, _nd) = run_fleet(&m, &c);
+        let rounds = led.review_rounds_for_issue("AMT-85").unwrap();
+        assert_eq!(rounds[0].result, "blocking");
+        assert!(m
+            .recorded()
+            .iter()
+            .any(|c| c == "amt --json issue update AMT-85 --add-label review:open"));
+    }
+
+    #[test]
+    fn a_fleet_peer_under_review_first_owns_the_sequence_slot() {
+        // Review F3: rowan reached review first with its own 0002; it has no
+        // branch yet, so only the fleet's in-flight registry can tell oak.
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-86");
+        checkpoint_heads(&m, &["ck1"]);
+        let z = |n: &str| n.replace('\n', "\0");
+        m.expect(
+            &["git", "ls-tree", "-z", "--name-only", "peer1"],
+            0,
+            &z("m/0001_a\nm/0002_rowan\n"),
+        );
+        m.expect(
+            &["git", "ls-tree", "-z", "--name-only", "ck1"],
+            0,
+            &z("m/0001_a\nm/0002_oak\n"),
+        );
+        for _ in 0..2 {
+            m.expect(
+                &["git", "ls-tree", "-z", "--name-only", "base999"],
+                0,
+                &z("m/0001_a\n"),
+            );
+        }
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+        let fleet = test_fleet("base999");
+        fleet.register_inflight("sirius/rowan", "AMT-70", "peer1");
+        let mut c = review_cfg(1);
+        c.review.sequences = vec![crate::config::SequenceSpec {
+            dir: "m".into(),
+            key: r"^(\d+)".into(),
+        }];
+        let (_o, led, _nd) = run_fleet_at(&m, &c, &fleet);
+        let rounds = led.review_rounds_for_issue("AMT-86").unwrap();
+        assert_eq!(rounds[0].result, "blocking", "{rounds:?}");
+        assert!(
+            rounds[0].findings.contains("in-flight AMT-70"),
+            "{}",
+            rounds[0].findings
+        );
+        // rowan, registered FIRST, does not see oak (first come owns the slot).
+        assert!(fleet.peers_before("sirius/rowan").is_empty());
+        assert_eq!(fleet.peers_before("sirius/oak").len(), 1);
+    }
+
+    #[test]
+    fn an_incomplete_recheck_keeps_the_previous_fact_open() {
+        // Review F4: round 2 cannot read the sibling (amt fails) — the
+        // collision must not count as "fixed".
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-87");
+        m.expect(&["git", "diff", "--name-only", "base999"], 0, "src/x.rs\n");
+        checkpoint_heads(&m, &["ck1", "ck2"]);
+        program_sequence_round(&m, "ck1", "m/0001_a\nm/0002_mine\n");
+        // Round 2: the sibling's status cannot be read.
+        m.expect(&["git", "for-each-ref"], 0, "sirius/amt-7\tsib7\n");
+        m.expect(
+            &["amt", "--json", "issue", "show", "AMT-7"],
+            1,
+            "database is locked",
+        );
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+        m.on_phase_write("fix", "SIRIUS_FIX_OUT", r#"{"responses":[]}"#);
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+        let mut c = review_cfg(2);
+        c.review.sequences = vec![crate::config::SequenceSpec {
+            dir: "m".into(),
+            key: r"^(\d+)".into(),
+        }];
+        let (_o, led, _nd) = run_fleet(&m, &c);
+        let results: Vec<String> = led
+            .review_rounds_for_issue("AMT-87")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.result)
+            .collect();
+        assert_eq!(results, vec!["blocking", "blocking"]);
+    }
+
+    #[test]
+    fn a_red_integration_holds_gated_work_without_review() {
+        // SIRF-32 review F1: no review, no receipt, no advance — preserved on
+        // its branch and released to todo naming the red run.
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-88");
+        let mut c = review_cfg(3);
+        c.integration.on_fail = crate::config::IntegrationOnFail::Block;
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        led.set_meta(
+            crate::integrate::RED_KEY,
+            Some(r#"{"at":"t","frontier":"f1","issue":"AMT-90"}"#),
+        )
+        .unwrap();
+        let fleet = test_fleet("base999");
+        let mut out = Vec::new();
+        run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &c,
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
+            None,
+            Some(&fleet),
+        );
+        assert_eq!(phases(&m), vec!["work"], "no reviewer while red");
+        let rec = m.recorded();
+        assert!(
+            !rec.iter().any(|c| c.starts_with("amt --json decide")),
+            "no receipt"
+        );
+        assert!(
+            rec.iter().any(|c| c == "git branch -f sirius/amt-88 HEAD"),
+            "work preserved: {rec:?}"
+        );
+        let release = rec
+            .iter()
+            .find(|c| c.starts_with("amt --json release"))
+            .unwrap();
+        assert!(
+            release.contains("--status todo") && release.contains("integration red at f1 (AMT-90)"),
+            "{release}"
+        );
     }
 
     #[test]

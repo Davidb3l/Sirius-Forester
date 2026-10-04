@@ -139,16 +139,23 @@ sirius gate AMT-7 [--tier safe] [--target-status in_review] [--range <git-range>
 
 sirius integrate [--json]   # SIRF-32 — build the frontier, run integration.cmd on it
    -> {"ok":bool,"base_ref":str,"frontier":str,"included":["AMT-7"],
-       "left_out":[{"issue":"AMT-9","files":[str]}],"ran":bool,"exit":int|null,
-       "timed_out":bool,"log":str|null,"issue":"AMT-12"|null,"red":bool}
+       "left_out":[{"issue":"AMT-9","files":[str]}],"dropped":[str],"complete":bool,
+       "ran":bool,"exit":int|null,"timed_out":bool,"log":str|null,
+       "issue":"AMT-12"|null,"red":bool}
    # frontier = base_ref tip + every sibling (§3.1) merged in order, in a throwaway
    # worktree; refs/sirius/frontier points at it. integration.cmd runs there via
    # `sh -c` with SIRIUS_INTEGRATION_DIR, SIRIUS_FRONTIER, SIRIUS_BASE_REF. A failure
-   # files ONE issue (label integration; later failures comment on it while it is
-   # open) and records the red state in the ledger (meta `integration_red`); a pass
-   # clears it and comments on that issue. No integration.cmd = build + report only.
-   # Exit 0 green (or nothing to run), 3 red, 1 operational failure.
+   # records the red state in the ledger (meta `integration_red`) FIRST, then files
+   # ONE issue (label integration; later failures comment on it while it is open or
+   # unreadable). Only a pass over a COMPLETE frontier (every sibling awaiting
+   # integration merged: none left_out, none dropped, discovery complete) clears it
+   # and comments on that issue; a partial pass says so and stays red. No
+   # integration.cmd = build + report only — never green, red state untouched.
+   # One integrate per repo (.sirius/integrate.lock, pid; a dead holder is taken over).
+   # A timed-out command's whole process tree is killed.
+   # Exit 0 passed (or nothing to run), 3 red, 1 operational failure (incl. lock held).
    # Spine: integration.passed / integration.failed.
+   # Not (yet) implemented from SIRF-32's sketch: `integration.after_each`.
 
 sirius run --workers N --agent-cmd "<cmd>" [--from todo] [--review-cmd "<cmd>"]
            [--model <id>|inherit] [--review-model <id>|inherit] [--allow-default-model] --json
@@ -159,6 +166,7 @@ sirius run --workers N --agent-cmd "<cmd>" [--from todo] [--review-cmd "<cmd>"]
    # work/fix events carry "model" and "tier":"primary|fallback"
    # claim events carry "model" (this ticket's worker model) and "review_model"
    # exit 2 when no worker model resolves (unless --allow-default-model / models.allow_default);
+   # exit 3 = refused to launch: integration red with integration.on_fail "block" (SIRF-32)
    # exit 4 = PAUSED: a fleet stop with nowhere to fall back — a usage/plan limit or an
    # unsupported model on the fallback tier (or with no fallback), or a logged-out CLI
    # ("Please run /login", never a fallback); judged on the failed run's LAST lines; every
@@ -233,8 +241,10 @@ other stdout formats.
   },
   "integration": {                         // SIRF-32 — `sirius integrate`
     "cmd": null,                           // e.g. "./scripts/ci.sh --e2e-required"; null = build + report only
-    "on_fail": "warn",                     // | "block": while red, `sirius run` refuses to start and a
-                                           //   running fleet stops claiming (paused, exit 4)
+    "on_fail": "warn",                     // | "block": while red, `sirius run` refuses to start (exit 3),
+                                           //   a running fleet stops claiming (paused, exit 4), and gated
+                                           //   work is HELD: no review, no receipt, preserved on its
+                                           //   sirius/<issue> branch, released to todo (outcome released)
     "timeout_secs": 1800
   }
 }
@@ -298,10 +308,13 @@ still covers the worker's tree, minus suite-owned paths (`.suite/`, `.hayven/`,
 completion first, at most 12. With `against: "frontier"` the review tree is the
 current base tip, then each sibling merged in order (a sibling that conflicts with
 the ones before it is left out), then the checkpoint; the reviewer reviews
-`$SIRIUS_DIFF_RANGE` = `<frontier>..HEAD`. A conflict on a file a sibling touched is a
-`sibling-conflict` finding (confirmed; blocking only if listed in `block_on`) naming
-the sibling, and the merge is retried without it; a conflict with the base alone is a
-blocking `conflict`, as with `current-base-merge`. Extra reviewer env:
+`$SIRIUS_DIFF_RANGE` = `<frontier>..HEAD`. A conflict is attributed by probing: if the
+work conflicts with the bare base it is a blocking `conflict` (as with
+`current-base-merge` — a base conflict blocks whatever `block_on` says); otherwise each
+sibling that conflicts with the work on its own is a `sibling-conflict` finding
+(confirmed; blocking only if listed in `block_on`) and is dropped from the retried
+merge. Throwaway merges run no repo hooks (`--no-verify`, a null `core.hooksPath`) and
+no rerere. Extra reviewer env:
 `SIRIUS_FRONTIER` (the frontier commit), `SIRIUS_SIBLING_BRANCHES` (comma list of
 merged siblings), `SIRIUS_SIBLINGS` (rendered summary: issue, title, branch, files,
 overlap with this diff — also a prompt placeholder, appended to the prompt when a
@@ -311,9 +324,14 @@ custom template lacks it).
 children of `dir` whose name matches `key` (capture group 1; numeric when both parse)
 form a sequence. Every entry this branch ADDS (vs the launch base) must have a key
 greater than every key on the current base tip and must not share a key with an entry
-a sibling adds. A violation is a `conflict`/`confirmed` finding with a stable
-`AUTO-…` id, recomputed every round — a fact, not an opinion: a rebuttal cannot close
-it, regenerating the entry does. Computed for every `against` mode.
+a sibling adds — siblings here also include this fleet's peers under review right
+now (no branch yet), in arrival order: the peer that reached review FIRST owns a
+contested slot. A violation is a `conflict`/`confirmed` finding with a stable `AUTO-…`
+id, recomputed every round — a fact, not an opinion: a rebuttal cannot close it (a
+vanished one counts as fixed, never as an accepted rebuttal), regenerating the entry
+does. If a round cannot recompute the facts completely (git or amt errors), the
+previous round's `AUTO-` findings stay open. `key` must have a capture group; `dir`
+may start with `./`. Computed for every `against` mode.
 
 One issue comment per round and per fix (as `sirius/<tree>`), a `review_rounds`
 ledger row per attempt, spine events `review.started` / `review.finding` /

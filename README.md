@@ -291,6 +291,27 @@ reviews, and when the Fable allotment runs out Sonnet implements and Opus
 reviews. With no fallback left, it **pauses** (exit `4`) instead of bouncing the
 board; a logged-out CLI always pauses.
 
+**Review what will actually land** (SIRF-29–32). Every defect that escaped the
+first large fleet run lived *between* branches — two migrations on the same
+parent, two features each correct and inconsistent together. So Sirius keeps an
+**integration frontier**: the current base tip plus every in-flight `sirius/*`
+branch awaiting integration, merged in order (a speculative merge queue).
+
+- `review.against: "frontier"` reviews each change merged onto that frontier;
+  the reviewer is told what else is in flight (`$SIRIUS_SIBLINGS`), and a
+  conflict with a sibling is named (`sibling-conflict`) instead of discovered
+  at merge time.
+- `review.sequences: [{"dir": "drizzle"}]` checks migration-style directories
+  mechanically: a new entry must come after the base's last one and must not
+  share a slot with a sibling's. These `AUTO-` findings are facts — no
+  reviewer verdict or rebuttal can close them.
+- `sirius integrate` builds the frontier (`refs/sirius/frontier`) and runs
+  `integration.cmd` (e.g. your e2e suite) on it **before** anything merges.
+  Red files one issue naming the combined branches; with
+  `integration.on_fail: "block"` the fleet stops claiming until it is green.
+- The reviewer always runs in a throwaway worktree, so its hooks and test runs
+  never touch the worker's tree.
+
 The reviewer needs only **read** tools: it delivers its findings as JSON in its
 final message (headless `claude -p` is not allowed to write files by default —
 and a reviewer that cannot write cannot tamper). The built-in adversarial
