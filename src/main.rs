@@ -9,6 +9,7 @@ mod bridge;
 mod cli;
 mod config;
 mod doctor;
+mod frontier;
 mod gate;
 mod gitrange;
 mod hayven;

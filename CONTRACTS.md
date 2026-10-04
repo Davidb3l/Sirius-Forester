@@ -170,6 +170,7 @@ every agent/reviewer process gets this environment (SIRF-22 #4/#5, SIRF-23):
 | `ANTHROPIC_MODEL`, `SIRIUS_MODEL` | (work, fix) this ticket's resolved worker model — Claude Code honors `ANTHROPIC_MODEL` over settings.json |
 | `ANTHROPIC_MODEL`, `SIRIUS_REVIEW_MODEL` | (review) the reviewer's model |
 | `SIRIUS_REVIEW_DIR`, `SIRIUS_DIFF_RANGE` | (review, fix) the tree to review, and `git diff $SIRIUS_DIFF_RANGE` |
+| `SIRIUS_FRONTIER`, `SIRIUS_SIBLING_BRANCHES`, `SIRIUS_SIBLINGS` | (review) the frontier commit, the siblings merged into it, and their rendered summary (SIRF-30; empty / "(none)" outside `frontier`) |
 | `SIRIUS_ROUND` | (review, fix) 1-based round |
 | `SIRIUS_REVIEW_OUT`, `SIRIUS_REVIEW_PROMPT` | (review) where to write findings; the rendered prompt |
 | `SIRIUS_REVIEW_FINDINGS` | (fix) this round's findings; (review, round > 1) the previous findings WITH the worker's responses |
@@ -209,12 +210,13 @@ other stdout formats.
     "prompt_file": ".sirius/review-prompt.md", // an OVERRIDE; absent = the built-in default
     "max_rounds": 3,
     "block_on": ["bug", "conflict"],
-    "against": "current-base-merge",       // | "launch-base"
+    "against": "current-base-merge",       // | "launch-base" | "frontier" (SIRF-30)
     "base_ref": null,                      // default: the branch HEAD pointed to at launch
     "timeout_secs": 1500,
     "on_exhausted": "advance-flagged",     // | "release"
     "on_review_error": "advance-flagged",  // | "release"
-    "skip_paths": ["**/*.md", "docs/**"]
+    "skip_paths": ["**/*.md", "docs/**"],
+    "sequences": []                        // SIRF-31: [{"dir": "drizzle", "key": "^(\\d+)"}] — off when empty
   }
 }
 ```
@@ -264,6 +266,35 @@ After WORK⇄GATE passes, and only in an isolated fleet worktree, Sirius runs:
    completed reads "review: did not complete after N round(s)" in the receipt —
    never like a clean review. An empty diff, or one touching only `skip_paths`,
    skips the stage.
+
+**Throwaway tree, always (SIRF-29).** The reviewer never runs in the worker's tree:
+without a merge tree it gets a throwaway detached worktree at the checkpoint
+(`.sirius/worktrees/<tree>-review`), removed every round. The read-only fingerprint
+still covers the worker's tree, minus suite-owned paths (`.suite/`, `.hayven/`,
+`.ametrite/`, `.sirius/`) whose writers are hooks and daemons, not the reviewer.
+
+**Siblings and the integration frontier (SIRF-30).** A *sibling* is a local
+`sirius/*` branch not merged into the current `base_ref` tip whose issue is in
+`target_status` (awaiting integration), other than this issue's own branch — oldest
+completion first, at most 12. With `against: "frontier"` the review tree is the
+current base tip, then each sibling merged in order (a sibling that conflicts with
+the ones before it is left out), then the checkpoint; the reviewer reviews
+`$SIRIUS_DIFF_RANGE` = `<frontier>..HEAD`. A conflict on a file a sibling touched is a
+`sibling-conflict` finding (confirmed; blocking only if listed in `block_on`) naming
+the sibling, and the merge is retried without it; a conflict with the base alone is a
+blocking `conflict`, as with `current-base-merge`. Extra reviewer env:
+`SIRIUS_FRONTIER` (the frontier commit), `SIRIUS_SIBLING_BRANCHES` (comma list of
+merged siblings), `SIRIUS_SIBLINGS` (rendered summary: issue, title, branch, files,
+overlap with this diff — also a prompt placeholder, appended to the prompt when a
+custom template lacks it).
+
+**Sequence collisions (SIRF-31).** For each `review.sequences` entry, the direct
+children of `dir` whose name matches `key` (capture group 1; numeric when both parse)
+form a sequence. Every entry this branch ADDS (vs the launch base) must have a key
+greater than every key on the current base tip and must not share a key with an entry
+a sibling adds. A violation is a `conflict`/`confirmed` finding with a stable
+`AUTO-…` id, recomputed every round — a fact, not an opinion: a rebuttal cannot close
+it, regenerating the entry does. Computed for every `against` mode.
 
 One issue comment per round and per fix (as `sirius/<tree>`), a `review_rounds`
 ledger row per attempt, spine events `review.started` / `review.finding` /

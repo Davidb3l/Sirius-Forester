@@ -145,6 +145,14 @@ pub fn template_cmd(cmd: &str, issue: &str, worker: &str, model: Option<&str>) -
 }
 
 /// An owned env pair.
+fn env_value<'e>(env: &'e [(String, String)], k: &str) -> &'e str {
+    env.iter()
+        .rev()
+        .find(|(key, _)| key == k)
+        .map(|(_, v)| v.as_str())
+        .unwrap_or_default()
+}
+
 fn kv(k: &str, v: impl Into<String>) -> (String, String) {
     (k.to_string(), v.into())
 }
@@ -1721,14 +1729,30 @@ enum ReviewOnce {
     },
 }
 
+/// Suite-owned paths whose writers are daemons and hooks, never the reviewer:
+/// a reviewer's Claude Code hooks append to `.suite/events/` (tracked in some
+/// repos), and reading one as tampering discarded a clean review (SIRF-29).
+const FINGERPRINT_EXCLUDES: [&str; 4] = [
+    ":(exclude).suite",
+    ":(exclude).hayven",
+    ":(exclude).ametrite",
+    ":(exclude).sirius",
+];
+
 /// What the reviewer must leave alone, as text: the HEAD commit, the porcelain
 /// status (untracked included), and the full diff against HEAD. Any change
 /// between before and after = the reviewer edited, staged, or committed.
 fn tree_fingerprint(runner: &dyn Runner) -> String {
+    let scoped = |args: &[&'static str]| -> Vec<&'static str> {
+        let mut v = args.to_vec();
+        v.extend(["--", "."]);
+        v.extend(FINGERPRINT_EXCLUDES);
+        v
+    };
     [
-        &["log", "-1", "--format=%H"][..],
-        &["status", "--porcelain=v1", "--untracked-files=all"][..],
-        &["diff", "--no-ext-diff", "--binary", "HEAD"][..],
+        vec!["log", "-1", "--format=%H"],
+        scoped(&["status", "--porcelain=v1", "--untracked-files=all"]),
+        scoped(&["diff", "--no-ext-diff", "--binary", "HEAD"]),
     ]
     .iter()
     .map(|args| match crate::gitrange::run_git(runner, args) {
@@ -1802,6 +1826,47 @@ fn worktree_admin<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Blocking `conflict` findings: the work does not merge onto `r` at `cur`.
+fn base_conflict_findings(round: u32, r: &str, cur: &str, files: &[String]) -> Vec<Finding> {
+    let short = &cur[..cur.len().min(10)];
+    files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| Finding {
+            id: format!("R{round}-c{}", i + 1),
+            kind: "conflict".into(),
+            confidence: "confirmed".into(),
+            file: Some(f.clone()),
+            line: None,
+            summary: format!("conflicts with the current {r} ({short})"),
+            scenario: format!("merging this issue's work onto {r} at {short} conflicts in {f}"),
+            fix: format!(
+                "merge the current base into the issue work (`git merge {cur}`) and resolve the conflict"
+            ),
+            response: None,
+        })
+        .collect()
+}
+
+/// Create the throwaway review tree for this worker, detached at `at`. The
+/// reviewer ALWAYS runs in one (SIRF-29): its cwd-relative side effects —
+/// hooks, caches, test runs — land in a tree that is deleted afterwards, and
+/// only a deliberate edit of the worker's tree still reads as tampering.
+fn add_review_tree(cx: &ReviewCtx, at: &str) -> Result<std::path::PathBuf, String> {
+    let t = cx
+        .fleet
+        .sirius_dir
+        .join("worktrees")
+        .join(format!("{}-review", safe_name(cx.worker)));
+    let t_str = t.to_string_lossy().to_string();
+    remove_review_tree(cx, &t);
+    worktree_admin(|| {
+        crate::gitrange::run_git(cx.runner, &["worktree", "add", "--detach", &t_str, at])
+    })
+    .map_err(|e| format!("cannot create the review tree: {e}"))?;
+    Ok(t)
+}
+
 /// Remove a throwaway review tree (always — even on error paths).
 fn remove_review_tree(cx: &ReviewCtx, t: &std::path::Path) {
     let t_str = t.to_string_lossy().to_string();
@@ -1849,37 +1914,125 @@ fn review_once(
     // Which tree to review: the worker's own, or a throwaway merge of the
     // work onto the CURRENT base tip (catches clashes with work merged since
     // launch). Falls back to the launch base when there is nothing newer.
-    let mut review_dir = fleet.worktree.clone();
     let mut diff_range = format!("{}..HEAD", fleet.base);
+    // The merge tree, when the review is against a moved base.
     let mut tmp: Option<std::path::PathBuf> = None;
-    if rc.against == crate::config::ReviewAgainst::CurrentBaseMerge {
-        let base_ref = rc.base_ref.clone().or_else(|| fleet.base_ref.clone());
-        let cur = base_ref.as_deref().and_then(|r| {
-            crate::gitrange::run_git(
-                cx.runner,
-                &["rev-parse", "--verify", &format!("{r}^{{commit}}")],
-            )
-            .map(|o| o.stdout.trim().to_string())
-            .ok()
-            .filter(|c| !c.is_empty())
-        });
+    let base_ref = rc.base_ref.clone().or_else(|| fleet.base_ref.clone());
+    let cur = base_ref.as_deref().and_then(|r| {
+        crate::gitrange::run_git(
+            cx.runner,
+            &["rev-parse", "--verify", &format!("{r}^{{commit}}")],
+        )
+        .map(|o| o.stdout.trim().to_string())
+        .ok()
+        .filter(|c| !c.is_empty())
+    });
+    // SIRF-30/31: the in-flight siblings, and the facts no reviewer decides.
+    let tip = cur.clone().unwrap_or_else(|| fleet.base.clone());
+    let frontier_mode = rc.against == crate::config::ReviewAgainst::Frontier;
+    let sibs = if frontier_mode || !rc.sequences.is_empty() {
+        let status_of = |issue: &str| {
+            cx.amt.issue_show(issue).ok().map(|v| {
+                let s = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+                (s("status"), s("title"))
+            })
+        };
+        crate::frontier::siblings(
+            cx.runner,
+            &status_of,
+            &tip,
+            cx.issue,
+            &cx.config.target_status,
+        )
+    } else {
+        Vec::new()
+    };
+    let mut auto = crate::frontier::sequence_collisions(
+        cx.runner,
+        &rc.sequences,
+        &fleet.base,
+        &head,
+        &tip,
+        &sibs,
+    );
+    let mut frontier_env = vec![
+        kv("SIRIUS_FRONTIER", ""),
+        kv("SIRIUS_SIBLING_BRANCHES", ""),
+        kv("SIRIUS_SIBLINGS", "(none)"),
+    ];
+    if frontier_mode {
+        let t = match add_review_tree(cx, &tip) {
+            Ok(t) => t,
+            Err(detail) => {
+                return ReviewOnce::Failed {
+                    result: RoundResult::Error,
+                    detail,
+                }
+            }
+        };
+        let t_str = t.to_string_lossy().to_string();
+        match crate::frontier::prepare(cx.runner, &t_str, &tip, &head, &sibs) {
+            crate::frontier::Prepared::Ready {
+                frontier,
+                merged,
+                left_out,
+                sibling_conflicts,
+            } => {
+                let ours = crate::gitrange::changed_files(
+                    cx.runner,
+                    Some(&format!("{}..{head}", fleet.base)),
+                )
+                .unwrap_or_default();
+                let branches: Vec<&str> = merged.iter().map(|s| s.branch.as_str()).collect();
+                frontier_env = vec![
+                    kv("SIRIUS_FRONTIER", frontier.as_str()),
+                    kv("SIRIUS_SIBLING_BRANCHES", branches.join(",")),
+                    kv(
+                        "SIRIUS_SIBLINGS",
+                        crate::frontier::render_siblings(
+                            &merged,
+                            &left_out,
+                            &sibling_conflicts,
+                            &ours,
+                        ),
+                    ),
+                ];
+                diff_range = format!("{frontier}..HEAD");
+                auto.extend(sibling_conflicts);
+                tmp = Some(t);
+            }
+            crate::frontier::Prepared::BaseConflict {
+                files,
+                sibling_conflicts,
+            } => {
+                remove_review_tree(cx, &t);
+                let label = base_ref.as_deref().unwrap_or("the launch base");
+                let mut findings = base_conflict_findings(round, label, &tip, &files);
+                findings.extend(sibling_conflicts);
+                findings.append(&mut auto);
+                return ReviewOnce::Conflicts { findings, head };
+            }
+            crate::frontier::Prepared::Failed(detail) => {
+                remove_review_tree(cx, &t);
+                return ReviewOnce::Failed {
+                    result: RoundResult::Error,
+                    detail,
+                };
+            }
+        }
+    } else if rc.against == crate::config::ReviewAgainst::CurrentBaseMerge {
         match (base_ref, cur) {
             (Some(r), Some(cur)) if cur != fleet.base => {
-                let t = fleet
-                    .sirius_dir
-                    .join("worktrees")
-                    .join(format!("{}-review", safe_name(cx.worker)));
+                let t = match add_review_tree(cx, &cur) {
+                    Ok(t) => t,
+                    Err(detail) => {
+                        return ReviewOnce::Failed {
+                            result: RoundResult::Error,
+                            detail,
+                        }
+                    }
+                };
                 let t_str = t.to_string_lossy().to_string();
-                remove_review_tree(cx, &t);
-                let added = worktree_admin(|| {
-                    crate::gitrange::run_git(cx.runner, &["worktree", "add", "--detach", &t_str, &cur])
-                });
-                if let Err(e) = added {
-                    return ReviewOnce::Failed {
-                        result: RoundResult::Error,
-                        detail: format!("cannot create the review merge tree: {e}"),
-                    };
-                }
                 // A throwaway merge commit, never on any branch — so a fixed
                 // identity is fine and the user's git config is not needed.
                 let merged = crate::gitrange::run_git(
@@ -1910,29 +2063,10 @@ fn review_once(
                             detail: format!("merging onto {r} failed: {e}"),
                         };
                     }
-                    let short = &cur[..cur.len().min(10)];
-                    let findings = conflicts
-                        .iter()
-                        .enumerate()
-                        .map(|(i, f)| Finding {
-                            id: format!("R{round}-c{}", i + 1),
-                            kind: "conflict".into(),
-                            confidence: "confirmed".into(),
-                            file: Some(f.clone()),
-                            line: None,
-                            summary: format!("conflicts with the current {r} ({short})"),
-                            scenario: format!(
-                                "merging this issue's work onto {r} at {short} conflicts in {f}"
-                            ),
-                            fix: format!(
-                                "merge the current base into the issue work (`git merge {cur}`) and resolve the conflict"
-                            ),
-                            response: None,
-                        })
-                        .collect();
+                    let mut findings = base_conflict_findings(round, &r, &cur, &conflicts);
+                    findings.append(&mut auto);
                     return ReviewOnce::Conflicts { findings, head };
                 }
-                review_dir = t.clone();
                 diff_range = format!("{cur}..HEAD");
                 tmp = Some(t);
             }
@@ -1945,6 +2079,20 @@ fn review_once(
             _ => {} // the base has not moved: the plain diff IS the merge
         }
     }
+    // No merge tree: review the checkpoint itself — still in a throwaway
+    // tree, never in the worker's (SIRF-29).
+    let review_dir = match tmp {
+        Some(t) => t,
+        None => match add_review_tree(cx, &head) {
+            Ok(t) => t,
+            Err(detail) => {
+                return ReviewOnce::Failed {
+                    result: RoundResult::Error,
+                    detail,
+                }
+            }
+        },
+    };
 
     let out_path = reviews_dir.join(format!("{stem}.json"));
     let _ = std::fs::remove_file(&out_path);
@@ -1959,7 +2107,8 @@ fn review_once(
         kv("SIRIUS_ROUND", round.to_string()),
         kv("SIRIUS_REVIEW_OUT", out_path.display().to_string()),
     ]);
-    let rendered = crate::review::render_prompt(
+    vars.extend(frontier_env);
+    let mut rendered = crate::review::render_prompt(
         &fleet.review_prompt,
         &[
             vars.clone(),
@@ -1967,6 +2116,13 @@ fn review_once(
         ]
         .concat(),
     );
+    // A custom template predating SIRF-30 still learns what is in flight.
+    let siblings_text = env_value(&vars, "SIRIUS_SIBLINGS");
+    if siblings_text != "(none)" && !fleet.review_prompt.contains("$SIRIUS_SIBLINGS") {
+        rendered.push_str(&format!(
+            "\n\nOther in-flight changes (already merged into the review tree):\n{siblings_text}\n"
+        ));
+    }
     let prompt_path = reviews_dir.join(format!("{stem}-prompt.md"));
     let _ = std::fs::write(&prompt_path, rendered);
     let mut env = vars;
@@ -1987,9 +2143,7 @@ fn review_once(
     }
 
     if let Err(reason) = (cx.renew_checked)() {
-        if let Some(t) = &tmp {
-            remove_review_tree(cx, t);
-        }
+        remove_review_tree(cx, &review_dir);
         return ReviewOnce::LeaseLost(reason);
     }
     let fp_before = tree_fingerprint(cx.runner);
@@ -2011,9 +2165,7 @@ fn review_once(
         .runner
         .run_agent("sh", &["-c", &cmd], &opts, &mut || (cx.renew)());
 
-    if let Some(t) = &tmp {
-        remove_review_tree(cx, t);
-    }
+    remove_review_tree(cx, &review_dir);
     // READ-ONLY enforcement: any change to the worker's tree is discarded.
     if tree_fingerprint(cx.runner) != fp_before {
         revert_to(cx, &head);
@@ -2099,7 +2251,14 @@ fn review_once(
         }
     };
     match crate::review::parse_review(&raw, round) {
-        Ok(report) => ReviewOnce::Report { report, head },
+        Ok(mut report) => {
+            // AUTO- findings are recomputed facts (SIRF-30/31): Sirius states
+            // them, and a reviewer can neither restate nor resolve them.
+            report.findings.retain(|f| !crate::review::is_auto(&f.id));
+            report.previous.retain(|v| !crate::review::is_auto(&v.id));
+            report.findings.append(&mut auto);
+            ReviewOnce::Report { report, head }
+        }
         Err(detail) => ReviewOnce::Failed {
             result: RoundResult::Error,
             detail,
@@ -2318,12 +2477,20 @@ pub fn run_review_stage(cx: &ReviewCtx, out: &mut dyn Write, fix_round: &FixRoun
             ),
             Some(ReviewOnce::Conflicts { findings, head }) => {
                 // No review ran this round: the previous findings are still
-                // unverified, so they stay open alongside the conflicts.
-                let mut blocking = findings;
-                blocking.extend(strip_responses(&previous));
+                // unverified, so they stay open alongside the conflicts —
+                // except AUTO- facts, which this round recomputed.
+                let (mut blocking, notes): (Vec<Finding>, Vec<Finding>) = findings
+                    .into_iter()
+                    .partition(|f| crate::review::is_blocking(f, &rc.block_on));
+                blocking.extend(
+                    strip_responses(&previous)
+                        .into_iter()
+                        .filter(|p| !crate::review::is_auto(&p.id)),
+                );
                 (
                     crate::review::Reconciled {
                         blocking,
+                        notes,
                         ..Default::default()
                     },
                     head,
@@ -4592,6 +4759,294 @@ mod tests {
             "retried once, then clean"
         );
         assert_eq!(o, IterationOutcome::Completed);
+    }
+
+    #[test]
+    fn reviewer_never_runs_in_the_workers_tree() {
+        // SIRF-29: even reviewing against the launch base (no merge tree),
+        // the reviewer gets a throwaway tree at the checkpoint — its hooks'
+        // cwd-relative writes must never land in the worker's tree.
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-80");
+        checkpoint_heads(&m, &["ck1"]);
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+        let (o, _led, _nd) = run_fleet(&m, &review_cfg(3));
+        assert_eq!(o, IterationOutcome::Completed);
+        let env = &m.agent_envs()[1];
+        let dir = env_of(env, "SIRIUS_REVIEW_DIR").unwrap();
+        let worktree = env_of(env, "SIRIUS_WORKTREE").unwrap();
+        assert_ne!(dir, worktree, "the reviewer's cwd is not the worker tree");
+        assert!(dir.ends_with("sirius_oak-review"), "{dir}");
+        let rec = m.recorded();
+        assert!(
+            rec.iter()
+                .any(|c| c == &format!("git worktree add --detach {dir} ck1")),
+            "{rec:?}"
+        );
+        assert!(
+            rec.iter()
+                .any(|c| c == &format!("git worktree remove --force {dir}")),
+            "the throwaway tree is removed"
+        );
+    }
+
+    #[test]
+    fn fingerprint_ignores_suite_telemetry_but_not_source() {
+        // SIRF-29, against real git: a hook appending to a TRACKED
+        // `.suite/` file (Lydgr commits it) is not tampering; an edit to
+        // source, or a new stray file, still is.
+        let dir = std::env::temp_dir().join(format!("sirius-fp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join(".suite/events")).unwrap();
+        std::fs::write(dir.join("src/x.rs"), "fn x() {}\n").unwrap();
+        std::fs::write(dir.join(".suite/events/a.jsonl"), "{}\n").unwrap();
+        let r = crate::shell::RealRunner {
+            cwd: Some(dir.clone()),
+        };
+        for args in [
+            &["init", "-q"][..],
+            &["-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"][..],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "init",
+            ][..],
+        ] {
+            crate::gitrange::run_git(&r, args).unwrap();
+        }
+        let before = tree_fingerprint(&r);
+        std::fs::write(dir.join(".suite/events/a.jsonl"), "{}\n{\"hook\":1}\n").unwrap();
+        std::fs::create_dir_all(dir.join(".hayven")).unwrap();
+        std::fs::write(dir.join(".hayven/cache"), "x").unwrap();
+        assert_eq!(
+            tree_fingerprint(&r),
+            before,
+            "suite telemetry is not tampering"
+        );
+        std::fs::write(dir.join("stray.txt"), "x").unwrap();
+        assert_ne!(tree_fingerprint(&r), before, "a new file is");
+        std::fs::remove_file(dir.join("stray.txt")).unwrap();
+        std::fs::write(dir.join("src/x.rs"), "fn y() {}\n").unwrap();
+        assert_ne!(tree_fingerprint(&r), before, "a source edit is");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- SIRF-30/31: the frontier and sequence collisions -----------------
+
+    fn run_fleet_at(
+        m: &MockRunner,
+        c: &Config,
+        fleet: &Fleet,
+    ) -> (IterationOutcome, Ledger, String) {
+        let amt = Amt::new(m);
+        let hv = Hayven::new(m);
+        let led = Ledger::open_in_memory().unwrap();
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            c,
+            m,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
+            None,
+            Some(fleet),
+        );
+        (o, led, String::from_utf8(out).unwrap())
+    }
+
+    /// One in-flight sibling, AMT-7, awaiting integration and touching src/x.rs.
+    fn program_sibling(m: &MockRunner) {
+        m.expect(&["git", "for-each-ref"], 0, "sirius/amt-7\tsib7\n");
+        m.expect(
+            &["amt", "--json", "issue", "show", "AMT-7"],
+            0,
+            r#"{"id":"AMT-7","status":"in_review","title":"Other work"}"#,
+        );
+        m.expect(
+            &["git", "diff", "--name-only", "base999...sib7"],
+            0,
+            "src/x.rs\n",
+        );
+    }
+
+    #[test]
+    fn frontier_review_merges_siblings_and_names_them_in_the_prompt() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-81");
+        checkpoint_heads(&m, &["ck1"]);
+        program_sibling(&m);
+        let fleet = test_fleet("base999");
+        let t = fleet.sirius_dir.join("worktrees").join("sirius_oak-review");
+        let t = t.to_string_lossy().to_string();
+        m.expect(&["git", "-C", &t, "rev-parse", "HEAD"], 0, "front1\n");
+        m.expect(
+            &["git", "diff", "--name-only", "base999..ck1"],
+            0,
+            "src/x.rs\n",
+        );
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+        let mut c = review_cfg(3);
+        c.review.against = crate::config::ReviewAgainst::Frontier;
+        let (o, _led, _nd) = run_fleet_at(&m, &c, &fleet);
+        assert_eq!(o, IterationOutcome::Completed);
+        let env = &m.agent_envs()[1];
+        assert_eq!(env_of(env, "SIRIUS_FRONTIER").as_deref(), Some("front1"));
+        assert_eq!(
+            env_of(env, "SIRIUS_DIFF_RANGE").as_deref(),
+            Some("front1..HEAD")
+        );
+        assert_eq!(
+            env_of(env, "SIRIUS_SIBLING_BRANCHES").as_deref(),
+            Some("sirius/amt-7")
+        );
+        assert_eq!(
+            env_of(env, "SIRIUS_REVIEW_DIR").as_deref(),
+            Some(t.as_str())
+        );
+        let prompt = std::fs::read_to_string(env_of(env, "SIRIUS_REVIEW_PROMPT").unwrap()).unwrap();
+        assert!(
+            prompt.contains("AMT-7 \"Other work\" (sirius/amt-7)"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("OVERLAPS this diff: src/x.rs"), "{prompt}");
+        let rec = m.recorded();
+        let merged = |rev: &str| {
+            rec.iter().any(|c| {
+                c.starts_with(&format!("git -C {t} ")) && c.contains(" merge ") && c.ends_with(rev)
+            })
+        };
+        assert!(
+            merged("sib7"),
+            "the sibling is merged into the frontier: {rec:?}"
+        );
+        assert!(merged("ck1"), "then the work");
+        assert!(rec
+            .iter()
+            .any(|c| c == &format!("git worktree remove --force {t}")));
+    }
+
+    #[test]
+    fn a_custom_prompt_without_the_placeholder_still_learns_the_siblings() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-82");
+        checkpoint_heads(&m, &["ck1"]);
+        program_sibling(&m);
+        let mut fleet = test_fleet("base999");
+        fleet.review_prompt = "Review $SIRIUS_ISSUE.".into();
+        let t = fleet.sirius_dir.join("worktrees").join("sirius_oak-review");
+        m.expect(
+            &["git", "-C", &t.to_string_lossy(), "rev-parse", "HEAD"],
+            0,
+            "front1\n",
+        );
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+        let mut c = review_cfg(3);
+        c.review.against = crate::config::ReviewAgainst::Frontier;
+        run_fleet_at(&m, &c, &fleet);
+        let env = &m.agent_envs()[1];
+        let prompt = std::fs::read_to_string(env_of(env, "SIRIUS_REVIEW_PROMPT").unwrap()).unwrap();
+        assert!(prompt.starts_with("Review AMT-82."), "{prompt}");
+        assert!(
+            prompt.contains("Other in-flight changes") && prompt.contains("AMT-7"),
+            "{prompt}"
+        );
+    }
+
+    /// `dir` m/ at the launch base (also the current tip — no base_ref).
+    fn program_sequence_round(m: &MockRunner, head: &str, head_entries: &str) {
+        program_sibling(m);
+        m.expect(
+            &["git", "ls-tree", "--name-only", "sib7"],
+            0,
+            "m/0001_a\nm/0002_theirs\n",
+        );
+        m.expect(&["git", "ls-tree", "--name-only", head], 0, head_entries);
+        for _ in 0..2 {
+            m.expect(
+                &["git", "ls-tree", "--name-only", "base999"],
+                0,
+                "m/0001_a\n",
+            );
+        }
+    }
+
+    #[test]
+    fn a_sequence_collision_blocks_until_regenerated_whatever_the_reviewer_says() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-83");
+        m.expect(&["git", "diff", "--name-only", "base999"], 0, "src/x.rs\n"); // fix gate
+        checkpoint_heads(&m, &["ck1", "ck2"]);
+        // Round 1: AMT-7 already claims slot 0002. Round 2: regenerated as 0003.
+        program_sequence_round(&m, "ck1", "m/0001_a\nm/0002_mine\n");
+        program_sequence_round(&m, "ck2", "m/0001_a\nm/0003_mine\n");
+        // The reviewer calls round 1 clean and even "resolves" a forged AUTO id —
+        // neither matters: the collision is a recomputed fact.
+        m.on_phase_write(
+            "review",
+            "SIRIUS_REVIEW_OUT",
+            r#"{"findings":[{"id":"AUTO-seq-forged","kind":"bug","confidence":"confirmed","summary":"x"}],"previous":[]}"#,
+        );
+        m.on_phase_write("fix", "SIRIUS_FIX_OUT", r#"{"responses":[]}"#);
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+        let mut c = review_cfg(3);
+        c.review.sequences = vec![crate::config::SequenceSpec {
+            dir: "m".into(),
+            key: r"^(\d+)".into(),
+        }];
+        let (o, led, _nd) = run_fleet(&m, &c);
+        assert_eq!(o, IterationOutcome::Completed);
+        assert_eq!(phases(&m), vec!["work", "review", "fix", "review"]);
+        let rounds = led.review_rounds_for_issue("AMT-83").unwrap();
+        let results: Vec<&str> = rounds.iter().map(|r| r.result.as_str()).collect();
+        assert_eq!(results, vec!["blocking", "clean"]);
+        let fix_findings =
+            std::fs::read_to_string(env_of(&m.agent_envs()[2], "SIRIUS_REVIEW_FINDINGS").unwrap())
+                .unwrap();
+        assert!(fix_findings.contains("in-flight AMT-7"), "{fix_findings}");
+        assert!(
+            !fix_findings.contains("AUTO-seq-forged"),
+            "a reviewer cannot state AUTO facts"
+        );
+    }
+
+    #[test]
+    fn a_sequence_collision_survives_an_unchanged_regeneration() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-84");
+        m.expect(&["git", "diff", "--name-only", "base999"], 0, "src/x.rs\n");
+        checkpoint_heads(&m, &["ck1", "ck2"]);
+        program_sequence_round(&m, "ck1", "m/0001_a\nm/0002_mine\n");
+        program_sequence_round(&m, "ck2", "m/0001_a\nm/0002_mine\n");
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+        // The worker rebuts; the reviewer "accepts" — the fact still stands.
+        m.on_phase_write("fix", "SIRIUS_FIX_OUT", r#"{"responses":[]}"#);
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+        let mut c = review_cfg(2);
+        c.review.sequences = vec![crate::config::SequenceSpec {
+            dir: "m".into(),
+            key: r"^(\d+)".into(),
+        }];
+        let (_o, led, _nd) = run_fleet(&m, &c);
+        let results: Vec<String> = led
+            .review_rounds_for_issue("AMT-84")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.result)
+            .collect();
+        assert_eq!(results, vec!["blocking", "blocking"]);
+        assert!(m
+            .recorded()
+            .iter()
+            .any(|c| c == "amt --json issue update AMT-84 --add-label review:open"));
     }
 
     #[test]

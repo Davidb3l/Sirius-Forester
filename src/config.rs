@@ -117,6 +117,28 @@ pub enum ReviewAgainst {
     /// blocking `conflict` finding.
     #[default]
     CurrentBaseMerge,
+    /// SIRF-30: the work merged onto the integration frontier — the current
+    /// base tip plus every in-flight sibling branch awaiting integration — so
+    /// a change is reviewed as it will actually land. A conflict with a
+    /// sibling is a `sibling-conflict` finding; one with the base, `conflict`.
+    Frontier,
+}
+
+/// SIRF-31: a directory whose entries form an ordered sequence (migrations).
+/// Two branches claiming the same slot fork the chain — a fact no per-branch
+/// reviewer can see, so Sirius checks it mechanically.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SequenceSpec {
+    /// Repo-relative directory whose DIRECT children are the sequence.
+    pub dir: String,
+    /// Regex whose capture group 1 is an entry's key; non-matching entries
+    /// (e.g. a `meta/` folder) are not part of the sequence.
+    #[serde(default = "default_sequence_key")]
+    pub key: String,
+}
+
+fn default_sequence_key() -> String {
+    r"^(\d+)".into()
 }
 
 /// The review stage (SIRF-23): an unbiased fresh-eyes review after the gate,
@@ -157,6 +179,9 @@ pub struct ReviewConfig {
     /// A diff touching ONLY files matching these globs skips review.
     #[serde(default = "default_review_skip_paths")]
     pub skip_paths: Vec<String>,
+    /// SIRF-31: sequence directories checked for collisions. Empty = off.
+    #[serde(default)]
+    pub sequences: Vec<SequenceSpec>,
 }
 
 fn default_review_prompt_file() -> String {
@@ -188,6 +213,7 @@ impl Default for ReviewConfig {
             on_exhausted: ReviewEscalation::default(),
             on_review_error: ReviewEscalation::default(),
             skip_paths: default_review_skip_paths(),
+            sequences: Vec::new(),
         }
     }
 }
@@ -354,6 +380,21 @@ mod tests {
         assert_eq!(c.review.on_exhausted, ReviewEscalation::AdvanceFlagged);
         assert_eq!(c.review.on_review_error, ReviewEscalation::AdvanceFlagged);
         assert_eq!(c.review.timeout_secs, 1500);
+    }
+
+    #[test]
+    fn frontier_and_sequences_parse() {
+        let c: Config = serde_json::from_str(
+            r#"{"review":{"against":"frontier","sequences":[{"dir":"drizzle"},{"dir":"db/m","key":"^V(\\d+)__"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.review.against, ReviewAgainst::Frontier);
+        assert_eq!(c.review.sequences[0].key, r"^(\d+)");
+        assert_eq!(c.review.sequences[1].key, r"^V(\d+)__");
+        assert!(
+            Config::default().review.sequences.is_empty(),
+            "off by default"
+        );
     }
 
     #[test]
