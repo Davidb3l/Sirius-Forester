@@ -21,10 +21,15 @@ bun run seed                                   # -> fixtures/.sirius/sirius.db
 SIRIUS_LEDGER="$PWD/fixtures/.sirius/sirius.db" bun run src/server.ts
 ```
 
-Against a real workspace (once `sirius init` has created `.sirius/sirius.db`):
+Against real workspaces — **one console sees every fleet** (the Ametrite
+switcher pattern). It lists every repo in the Ametrite registry
+(`~/.ametrite/registry.json`, or `AMT_REGISTRY`) that has a `.sirius/sirius.db`,
+plus the repo it is launched in; the header switcher shows running fleets
+(a live `.sirius/run.pid`) first. The choice is remembered per browser and
+carried as `?ws=<alias>`:
 
 ```sh
-cd /path/to/repo && bun run /path/to/web/src/server.ts   # walks up for .sirius/
+cd /path/to/any/repo && bun run /path/to/web/src/server.ts   # → http://localhost:1777
 ```
 
 Quality gates:
@@ -55,6 +60,7 @@ bun run typecheck   # tsc --noEmit, clean
 
 ```
 src/db.ts       workspace discovery + read-only WAL SQLite opens; PRAGMA data_version
+src/workspaces.ts  every fleet: registry discovery, run.pid liveness, per-fleet readers (lazy)
 src/schema.ts   CONTRACTS §1 ledger DDL (used only by the fixture seeder + tests)
 src/ledger.ts   typed read queries over the ledger (fleet, history, receipts)
 src/stores.ts   best-effort read-only enrichment from the parent Ametrite store
@@ -68,7 +74,9 @@ fixtures/seed.ts  writes a sample ledger matching CONTRACTS §1
 ```
 
 **Write discipline (PRD §2.2):** the console opens all three stores **read-only**
-and never writes any SQLite. The *only* mutation path is shelling to
+and never writes any SQLite. (An idle WAL ledger whose `-shm`/`-wal` were
+cleaned up is opened read-write-without-create with `PRAGMA query_only` —
+SQLite still refuses every write.) The *only* mutation path is shelling to
 `sirius <cmd> --json` via `src/sirius.ts`.
 
 ## HTTP endpoints
@@ -76,6 +84,7 @@ and never writes any SQLite. The *only* mutation path is shelling to
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/` , `/app.css`, `/app.js` | static console |
+| GET | `/api/workspaces` | every fleet: `{default, workspaces:[{alias,name,root,running,working,ledgerAvailable}]}`, running first |
 | GET | `/events` | SSE — `version` events on `data_version` change |
 | GET | `/api/fleet` | fleet board JSON |
 | GET | `/api/history` | history stats + recent iterations + policy events |
@@ -86,6 +95,10 @@ and never writes any SQLite. The *only* mutation path is shelling to
 | GET | `/api/health` | liveness + ledger availability |
 | POST | `/api/gate` | shells `sirius gate <issue> --json` |
 | POST | `/api/link` | shells `sirius link … --json` |
+
+Every route except `/api/workspaces` and static files takes `?ws=<alias>`
+(default: the launch repo). An unknown alias is a 404 — never another repo's
+data.
 
 ## Integration once the real `sirius` binary lands
 

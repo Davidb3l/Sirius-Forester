@@ -350,7 +350,8 @@ timeouts) live in `.sirius/config.json`; `sirius init` writes the defaults.
 ## Console and benchmarks
 
 A local web console (Bun, zero npm runtime deps, port `:1777`) shows the
-fleet board, receipts, and history. Try it with fixture data, no binary needed:
+fleet board, receipts, and history — for **every** fleet on the machine, with
+a switcher (running fleets first), like the Ametrite board. Try it with fixture data, no binary needed:
 
 ```bash
 cd web && bun run demo    # → http://localhost:1777

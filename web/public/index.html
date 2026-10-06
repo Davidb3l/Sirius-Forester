@@ -47,6 +47,12 @@
         <span class="brand-sub" id="brand-sub">fleet console · α&nbsp;CMa</span>
       </div>
       <div class="topbar-right">
+        <div class="ws-switch" id="ws-switch">
+          <button id="ws-button" class="ws-button" type="button" aria-haspopup="listbox" aria-expanded="false" title="Switch fleet">
+            <span class="ws-dot" id="ws-dot"></span><span id="ws-current">fleet</span><span class="ws-caret" aria-hidden="true">▾</span>
+          </button>
+          <div id="ws-menu" class="ws-menu" role="listbox" aria-label="Fleets" hidden></div>
+        </div>
         <span id="conn" class="conn conn-init" title="live connection">
           <span class="dot"></span><span class="conn-label">connecting</span>
         </span>

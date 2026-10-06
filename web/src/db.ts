@@ -86,10 +86,20 @@ function firstExistingDir(paths: string[]): string | null {
 export function openReadOnly(path: string): Database | null {
   if (!existsSync(path)) return null;
   let db: Database;
+  let first: Database | null = null;
   try {
-    db = new Database(path, { readonly: true });
-    db.query("SELECT 1 FROM sqlite_master LIMIT 1").get();
+    first = new Database(path, { readonly: true });
+    // prepare + finalize (not the cached `query`): a cached statement would
+    // defer this handle's close until GC if the probe fails below.
+    const probe = first.prepare("SELECT 1 FROM sqlite_master LIMIT 1");
+    try {
+      probe.get();
+    } finally {
+      probe.finalize();
+    }
+    db = first;
   } catch (e) {
+    first?.close(); // never leak the failed read-only handle
     if (!/unable to open database file/i.test(String(e))) throw e;
     db = new Database(path, { readwrite: true, create: false });
     db.exec("PRAGMA query_only = ON;");

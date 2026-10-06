@@ -5,7 +5,39 @@
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
-const state = { view: "fleet", dataVersion: null };
+const state = {
+  view: "fleet",
+  dataVersion: null,
+  // Which fleet this tab watches (?ws=<alias>); resolved in init().
+  ws: new URL(location.href).searchParams.get("ws"),
+  fleets: [],
+  es: null,
+  // Bumped on every fleet switch: a response for the fleet you just left
+  // must never render under the new one's name.
+  gen: 0,
+};
+
+// The chosen fleet persists per browser, like Ametrite's workspace switcher.
+const WS_KEY = "sirius-ws";
+const storedWs = () => {
+  try {
+    return localStorage.getItem(WS_KEY);
+  } catch {
+    return null;
+  }
+};
+const storeWs = (alias) => {
+  try {
+    localStorage.setItem(WS_KEY, alias);
+  } catch {
+    // private window / blocked storage: the URL still carries the choice
+  }
+};
+/** Scope an API/SSE URL to the current fleet. */
+const withWs = (url) =>
+  state.ws
+    ? `${url}${url.includes("?") ? "&" : "?"}ws=${encodeURIComponent(state.ws)}`
+    : url;
 
 // ---- small html helpers ----
 const esc = (s) =>
@@ -34,7 +66,11 @@ const dur = (ms) => {
 };
 
 async function getJSON(url) {
-  const r = await fetch(url, { headers: { accept: "application/json" } });
+  const gen = state.gen;
+  const r = await fetch(withWs(url), { headers: { accept: "application/json" } });
+  // Switched fleets while this was in flight: drop it (never resolves, so the
+  // stale render simply stops; the new fleet's render is already underway).
+  if (gen !== state.gen) return new Promise(() => {});
   if (!r.ok) throw new Error(`${url} → ${r.status}`);
   return r.json();
 }
@@ -395,7 +431,9 @@ function connectSSE() {
     conn.className = `conn ${cls}`;
     $(".conn-label", conn).textContent = label;
   };
-  const es = new EventSource("/events");
+  if (state.es) state.es.close();
+  const es = new EventSource(withWs("/events"));
+  state.es = es;
   es.addEventListener("open", () => setConn("conn-live", "live"));
   es.addEventListener("version", (e) => {
     const v = Number(e.data);
@@ -416,23 +454,135 @@ function connectSSE() {
 
 // ---- wiring -----------------------------------------------------------------
 
-/** Say WHICH repo this console watches, and on which port — one console runs
- *  per repo, and several open tabs must be told apart at a glance. */
-async function labelWorkspace() {
+// ---- fleet switcher -----------------------------------------------------------
+
+const currentFleet = () => state.fleets.find((f) => f.alias === state.ws);
+
+/** Header label + tab title name the fleet being watched and the real port. */
+function labelWorkspace() {
   const port = location.port || (location.protocol === "https:" ? "443" : "80");
-  let repo = "";
-  try {
-    const h = await (await fetch("/api/health")).json();
-    repo = String(h.workspace || "").split(/[\\/]/).filter(Boolean).pop() || "";
-  } catch {
-    // the header stays generic; the views report their own errors
-  }
-  $("#brand-sub").textContent = `fleet console · α CMa${repo ? ` · ${repo}` : ""} · :${port}`;
-  if (repo) document.title = `${repo} — Sirius Fleet Console`;
+  const f = currentFleet();
+  $("#brand-sub").textContent = `fleet console · α CMa · :${port}`;
+  $("#ws-current").textContent = f ? f.name : state.ws || "fleet";
+  $("#ws-dot").classList.toggle("running", Boolean(f && f.running));
+  $("#ws-button").title = f ? `${f.root} — switch fleet` : "Switch fleet";
+  if (f) document.title = `${f.name} — Sirius Fleet Console`;
 }
 
-function init() {
+function fleetState(f) {
+  if (f.running) return `running · ${f.working} working`;
+  if (!f.ledgerAvailable) return "no ledger";
+  return "idle";
+}
+
+function renderSwitcher({ menu: rebuildMenu = true } = {}) {
+  if (!rebuildMenu) {
+    labelWorkspace();
+    return;
+  }
+  const menu = $("#ws-menu");
+  const running = state.fleets.filter((f) => f.running);
+  const idle = state.fleets.filter((f) => !f.running);
+  const item = (f) => `
+    <button class="ws-item" role="option" type="button" data-ws="${esc(f.alias)}"
+      aria-selected="${f.alias === state.ws}" title="${esc(f.root)}">
+      <span class="ws-dot${f.running ? " running" : ""}"></span>
+      <span class="ws-name">${esc(f.name)}</span>
+      <span class="ws-state${f.running ? " running" : ""}">${esc(fleetState(f))}</span>
+    </button>`;
+  menu.innerHTML =
+    (running.length
+      ? `<div class="ws-menu-heading">Running · ${running.length}</div>${running.map(item).join("")}`
+      : "") +
+    (idle.length
+      ? `<div class="ws-menu-heading">Other fleets · ${idle.length}</div>${idle.map(item).join("")}`
+      : "");
   labelWorkspace();
+}
+
+/** Refresh the fleet list; on first load, settle which fleet to show. */
+async function loadFleets(first = false, { menu = true } = {}) {
+  let d;
+  try {
+    const r = await fetch("/api/workspaces", { headers: { accept: "application/json" } });
+    if (!r.ok) throw new Error(String(r.status));
+    d = await r.json();
+  } catch {
+    if (first) labelWorkspace(); // an older server: single-workspace mode
+    return;
+  }
+  state.fleets = d.workspaces || [];
+  if (first) {
+    const known = (a) => a && state.fleets.some((f) => f.alias === a);
+    // URL choice, else the remembered one, else a RUNNING fleet, else the
+    // repo the console was launched in.
+    const firstRunning = state.fleets.find((f) => f.running);
+    const home = state.fleets.find((f) => f.alias === d.default);
+    const firstWithLedger = state.fleets.find((f) => f.ledgerAvailable);
+    state.ws = known(state.ws)
+      ? state.ws
+      : known(storedWs())
+        ? storedWs()
+        : firstRunning
+          ? firstRunning.alias
+          : home && !home.ledgerAvailable && firstWithLedger
+            ? firstWithLedger.alias
+            : d.default;
+    syncUrl();
+  }
+  // Never rebuild an OPEN menu from a timed refresh: it would steal focus
+  // and drop a click that straddles the re-render.
+  renderSwitcher({ menu: menu && $("#ws-menu").hidden });
+}
+
+function syncUrl() {
+  const url = new URL(location.href);
+  if (state.ws) url.searchParams.set("ws", state.ws);
+  history.replaceState(null, "", url);
+}
+
+function selectFleet(alias) {
+  closeMenu(true);
+  if (alias === state.ws) return;
+  state.gen++;
+  closeDrawer(); // a receipt from the fleet you left is not this fleet's
+  state.ws = alias;
+  storeWs(alias);
+  syncUrl();
+  state.dataVersion = null;
+  renderSwitcher();
+  connectSSE();
+  renderActive();
+}
+
+function openMenu() {
+  renderSwitcher(); // build from what we know, then show it
+  $("#ws-menu").hidden = false;
+  $("#ws-button").setAttribute("aria-expanded", "true");
+}
+function closeMenu(refocus = false) {
+  const wasOpen = !$("#ws-menu").hidden;
+  $("#ws-menu").hidden = true;
+  $("#ws-button").setAttribute("aria-expanded", "false");
+  if (wasOpen && refocus) $("#ws-button").focus();
+}
+
+async function init() {
+  $("#ws-button").addEventListener("click", (e) => {
+    e.stopPropagation();
+    if ($("#ws-menu").hidden) openMenu();
+    else closeMenu();
+  });
+  $("#ws-menu").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-ws]");
+    if (b) selectFleet(b.dataset.ws);
+  });
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest("#ws-switch")) closeMenu();
+  });
+  await loadFleets(true);
+  // Running dots stay current (an open menu is left alone until it closes).
+  setInterval(() => loadFleets(false, { menu: true }), 15_000);
   $$(".tab").forEach((t) =>
     t.addEventListener("click", () => switchView(t.dataset.view)),
   );
@@ -446,7 +596,10 @@ function init() {
     if (e.target.closest("[data-close]")) closeDrawer();
   });
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") closeDrawer();
+    if (e.key === "Escape") {
+      closeDrawer();
+      closeMenu(true);
+    }
   });
   switchView("fleet");
   connectSSE();

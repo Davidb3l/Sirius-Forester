@@ -5,6 +5,7 @@ import { file } from "bun";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { discoverWorkspace, type Workspace } from "./db.ts";
+import { WorkspaceSet } from "./workspaces.ts";
 import { Ledger } from "./ledger.ts";
 import { ParentStores } from "./stores.ts";
 import { loadConfig } from "./config.ts";
@@ -61,6 +62,39 @@ export async function handle(
       500,
     );
   }
+}
+
+/** One console, every fleet: `/api/workspaces` lists them; every other route
+ *  serves the workspace named by `?ws=<alias>` (default: the launch repo). An
+ *  alias the console does not know is a 404 — never another repo's data. */
+export async function handleFleets(
+  req: Request,
+  set: WorkspaceSet<ServerDeps>,
+): Promise<Response> {
+  const url = new URL(req.url);
+  const scoped = url.pathname.startsWith("/api/") || url.pathname === "/events";
+  // DNS-rebinding defense for READS too: every fleet's boards and the paths
+  // of every registered repo are behind this one port.
+  if (scoped && !LOOPBACK.has(url.hostname)) {
+    return json({ error: "non-loopback Host refused" }, 403);
+  }
+  if (url.pathname === "/api/workspaces") {
+    try {
+      set.refresh();
+      return json({ default: set.defaultAlias, workspaces: set.status() });
+    } catch (e) {
+      return json({ error: e instanceof Error ? e.message : String(e) }, 500);
+    }
+  }
+  const alias = url.searchParams.get("ws");
+  if (alias && scoped && !set.has(alias)) {
+    return json({ error: `unknown workspace "${alias}"` }, 404);
+  }
+  // Static assets ignore ws: the page must always load — a stale bookmark
+  // to a fleet that is gone must still let you switch to another.
+  const deps = set.get(scoped ? alias : null);
+  if (!deps) return json({ error: "no workspace" }, 500);
+  return handle(req, deps);
 }
 
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
@@ -256,23 +290,32 @@ async function serveStatic(path: string, publicDir: string): Promise<Response> {
 export function startServer(
   port = Number(process.env.SIRIUS_CONSOLE_PORT ?? 1777),
 ) {
-  const deps = buildDeps();
+  const fleets = new WorkspaceSet<ServerDeps>(
+    (ws) => buildDeps(ws),
+    undefined,
+    undefined,
+    (d) => {
+      d.ledger.close();
+      d.stores.close();
+    },
+  );
+  const deps = fleets.get(null)!;
   const server = Bun.serve({
     port,
     // Bind loopback only: the mutation endpoints are unauthenticated, so they
     // must never be reachable from the LAN (0.0.0.0). (SIRF-11)
     hostname: "127.0.0.1",
     idleTimeout: 0, // keep SSE connections open
-    fetch: (req) => handle(req, deps),
+    fetch: (req) => handleFleets(req, fleets),
   });
   const ledgerState = deps.ledger.available
     ? `ledger ${deps.workspace.ledgerPath}`
     : `no ledger at ${deps.workspace.ledgerPath} (run 'sirius init')`;
   // eslint-disable-next-line no-console
   console.log(
-    `Sirius Console → http://localhost:${server.port}  ·  ${ledgerState}`,
+    `Sirius Console → http://localhost:${server.port}  ·  ${ledgerState}  ·  ${fleets.list().length} fleet workspace(s) (switch with ?ws=<alias>)`,
   );
-  return { server, deps };
+  return { server, deps, fleets };
 }
 
 // Run when invoked directly (not when imported by tests).
