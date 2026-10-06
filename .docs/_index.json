@@ -195,6 +195,7 @@
       ],
       "relatedFiles": [
         "web/src/server.ts",
+        "web/src/workspaces.ts",
         "web/src/hub.ts",
         "web/src/discovery.ts",
         "web/src/api.ts",
@@ -209,8 +210,8 @@
       "anchors": [],
       "evidence": [],
       "refs": [],
-      "verifiedCommit": "a7f3a16d384efc451e8c6e25f4823453a64ccf8d",
-      "verifiedAt": "2026-08-05T07:54:35.428Z",
+      "verifiedCommit": "6dde259198b233165fd6da10d2e05046454e9fe4",
+      "verifiedAt": "2026-10-06T22:53:54.752Z",
       "driftSuspectSince": "",
       "driftSuspectReason": "",
       "createdAt": 1785916441493,
@@ -218,5 +219,5 @@
       "createdBy": "claude-code"
     }
   ],
-  "lastUpdated": 1791138401319
+  "lastUpdated": 1791327234756
 }
