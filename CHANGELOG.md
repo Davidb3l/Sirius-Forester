@@ -5,6 +5,9 @@ release moves them under its version (see AGENTS.md → "Releases are batched").
 
 ## Unreleased
 
+### Fixed
+- Console: the Fleet/History views no longer fail with "unable to open database file" when no fleet is running (an idle WAL ledger has no `-shm`/`-wal` side files, which a read-only SQLite connection cannot create). The console now falls back to a `query_only` connection — still never writes.
+
 ## 0.1.6 — 2026-10-04
 
 ### Plugin 0.2.5 (terminal and the Claude app alike)

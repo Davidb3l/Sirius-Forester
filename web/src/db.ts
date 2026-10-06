@@ -74,10 +74,26 @@ function firstExistingDir(paths: string[]): string | null {
  * Open a SQLite file read-only. Uses bun:sqlite readonly mode; sets a busy
  * timeout so concurrent WAL writers (the real sirius/amt) never error us out.
  * Returns null if the file does not exist yet.
+ *
+ * A WAL-mode database whose `-shm`/`-wal` side files were cleaned up (no
+ * writer has it open — the normal state between fleet runs) cannot be opened
+ * by a SQLITE_OPEN_READONLY connection: it may not create them, and SQLite
+ * reports "unable to open database file". Then we open it read-write WITHOUT
+ * create and set `PRAGMA query_only` — SQLite itself refuses every write on
+ * the connection, so the console stays a reader; it only creates the side
+ * files any WAL reader needs.
  */
 export function openReadOnly(path: string): Database | null {
   if (!existsSync(path)) return null;
-  const db = new Database(path, { readonly: true });
+  let db: Database;
+  try {
+    db = new Database(path, { readonly: true });
+    db.query("SELECT 1 FROM sqlite_master LIMIT 1").get();
+  } catch (e) {
+    if (!/unable to open database file/i.test(String(e))) throw e;
+    db = new Database(path, { readwrite: true, create: false });
+    db.exec("PRAGMA query_only = ON;");
+  }
   // WAL readers coexist with writers; a small busy timeout guards checkpoints.
   db.exec("PRAGMA busy_timeout=2000;");
   return db;
