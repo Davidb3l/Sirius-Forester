@@ -7,6 +7,7 @@ release moves them under its version (see AGENTS.md → "Releases are batched").
 
 ### Fixed
 - Console: the Fleet/History views no longer fail with "unable to open database file" when no fleet is running (an idle WAL ledger has no `-shm`/`-wal` side files, which a read-only SQLite connection cannot create). The console now falls back to a `query_only` connection — still never writes.
+- Console: the header and tab title name the repo being watched and the real port (it always said `:1777`) — one console runs per repo, so several can be open at once (`SIRIUS_LEDGER=<repo>/.sirius/sirius.db SIRIUS_CONSOLE_PORT=<port>`).
 
 ## 0.1.6 — 2026-10-04
 

@@ -416,7 +416,23 @@ function connectSSE() {
 
 // ---- wiring -----------------------------------------------------------------
 
+/** Say WHICH repo this console watches, and on which port — one console runs
+ *  per repo, and several open tabs must be told apart at a glance. */
+async function labelWorkspace() {
+  const port = location.port || (location.protocol === "https:" ? "443" : "80");
+  let repo = "";
+  try {
+    const h = await (await fetch("/api/health")).json();
+    repo = String(h.workspace || "").split(/[\\/]/).filter(Boolean).pop() || "";
+  } catch {
+    // the header stays generic; the views report their own errors
+  }
+  $("#brand-sub").textContent = `fleet console · α CMa${repo ? ` · ${repo}` : ""} · :${port}`;
+  if (repo) document.title = `${repo} — Sirius Fleet Console`;
+}
+
 function init() {
+  labelWorkspace();
   $$(".tab").forEach((t) =>
     t.addEventListener("click", () => switchView(t.dataset.view)),
   );
