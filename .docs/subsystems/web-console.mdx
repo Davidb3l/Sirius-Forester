@@ -3,14 +3,14 @@ id: 96301a4d-3f3f-4a18-b40e-f5f3366b9596
 title: "The Console & Suite Hub — web/"
 path: "subsystems/web-console"
 tags: ["console", "hub", "web", "bun", "suite"]
-relatedFiles: ["web/src/server.ts", "web/src/hub.ts", "web/src/discovery.ts", "web/src/api.ts", "web/src/sse.ts", "web/src/stores.ts", "web/src/ledger.ts", "web/src/sirius.ts", "web/src/db.ts", "web/src/schema.ts", "web/src/config.ts"]
+relatedFiles: ["web/src/server.ts", "web/src/workspaces.ts", "web/src/hub.ts", "web/src/discovery.ts", "web/src/api.ts", "web/src/sse.ts", "web/src/stores.ts", "web/src/ledger.ts", "web/src/sirius.ts", "web/src/db.ts", "web/src/schema.ts", "web/src/config.ts"]
 anchors: []
 evidence: []
 refs: []
 verifiedCommit: "a7f3a16d384efc451e8c6e25f4823453a64ccf8d"
 verifiedAt: "2026-08-05T07:54:35.428Z"
-driftSuspectSince: ""
-driftSuspectReason: ""
+driftSuspectSince: "2026-10-06T22:22:52.526Z"
+driftSuspectReason: "code.changed touched web/src/db.ts"
 createdAt: 1785916441493
 updatedAt: 1785916441493
 createdBy: "claude-code"
@@ -22,13 +22,16 @@ createdBy: "claude-code"
 
 ## The one invariant
 
-**The Console never writes any SQLite.** It reads the three stores read-only (`web/src/db.ts` opens everything read-only), and its ONLY mutation path is shelling `sirius <cmd> --json` through `web/src/sirius.ts`. That keeps the write-path story identical everywhere: one write path per store, and the console owns none of them — see [architecture/overview](../architecture/overview).
+**The Console never writes any SQLite.** It reads the three stores read-only (`web/src/db.ts` opens everything read-only — an idle WAL ledger whose `-shm`/`-wal` side files were cleaned up, which a SQLITE_OPEN_READONLY connection cannot recreate, is opened read-write-without-create with `PRAGMA query_only = ON`, so SQLite itself still refuses every write), and its ONLY mutation path is shelling `sirius <cmd> --json` through `web/src/sirius.ts`. That keeps the write-path story identical everywhere: one write path per store, and the console owns none of them — see [architecture/overview](../architecture/overview).
 
 ## The Console
 
+**One console, every fleet** (the Ametrite board's pattern). `:1777` serves every Sirius fleet on the machine: `web/src/workspaces.ts` (`WorkspaceSet`) lists the repos in the Ametrite registry (`~/.ametrite/registry.json` / `AMT_REGISTRY`) that have a `.sirius/sirius.db`, plus the launch repo (the default, under its registry alias) — no state of its own, one entry per real path. `/api/workspaces` reports each fleet's `running` (a live `.sirius/run.pid`, `fleetRunning`) and `working` count from a short-lived read, running first; it builds nothing it keeps. Every other route takes `?ws=<alias>` (`handleFleets` in `server.ts`); an unknown alias is a 404, never another repo's data, and every `/api/*` and `/events` read refuses a non-loopback `Host` (DNS rebinding). A fleet's full readers (ledger, parent store, poller, `sirius` runner with that repo as cwd) are built only when it is viewed, and closed when its repo leaves the registry or loses its ledger. The header switcher (`public/app.js`) remembers the choice (localStorage + URL), opens on a running fleet by default, reconnects SSE on switch, and drops any in-flight response for the fleet just left (a generation counter).
+
 | File | Role |
 |---|---|
-| `web/src/server.ts` | `Bun.serve` HTTP server — routes, static assets |
+| `web/src/server.ts` | `Bun.serve` HTTP server — routes, static assets, `handleFleets` (`?ws=` routing) |
+| `web/src/workspaces.ts` | Every fleet: registry discovery, run.pid liveness, lazy per-fleet readers |
 | `web/src/api.ts` | Pure JSON payload assembly over Ledger + ParentStores; unit-testable against fixtures |
 | `web/src/ledger.ts` | Typed read queries over the ledger (CONTRACTS.md §1) |
 | `web/src/stores.ts` | Best-effort enrichment from parent stores — probes defensively, degrades to bare refs |
