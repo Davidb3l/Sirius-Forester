@@ -3,12 +3,12 @@ id: sf-arch-overview
 title: "Architecture Overview"
 path: "architecture/overview"
 tags: ["architecture", "rust", "suite"]
-relatedFiles: ["src/main.rs", "src/cli.rs", "src/workspace.rs"]
+relatedFiles: ["src/main.rs", "src/cli.rs", "src/workspace.rs", "src/doctor.rs", "src/shell.rs"]
 anchors: []
 evidence: []
 refs: []
-verifiedCommit: "174510b28ba1e88de7fd5e4b411317da8d6d26e6"
-verifiedAt: "2026-10-04T18:26:30.118Z"
+verifiedCommit: "c38e8f247abfea0e0869ef1ce1722628990274f2"
+verifiedAt: "2026-10-08T23:09:30.128Z"
 driftSuspectSince: ""
 driftSuspectReason: ""
 createdAt: 1785915503544
@@ -54,8 +54,8 @@ Sirius never opens either parent's SQLite for writing. The console (`web/`) read
 | `src/bridge.rs` | `sirius link` / `sirius why` two-way provenance | [subsystems/provenance-bridge](../subsystems/provenance-bridge) |
 | `src/spine.rs` | The `.suite/` append-only event log | [subsystems/suite-spine](../subsystems/suite-spine) |
 | `src/amt.rs`, `src/hayven.rs` | Thin adapters over the two parent CLIs | — |
-| `src/shell.rs` | `Runner` trait + `MockRunner`, the seam every test uses | — |
-| `src/doctor.rs` | `sirius doctor` — the five contract facts live, plus an advisory `plugin_handoff` check (WARN, never gates `ok`) | — |
+| `src/shell.rs` | `Runner` trait + `MockRunner`, the seam every test uses; shell resolution for `gate.test_cmd` / `--agent-cmd` (`resolve_shell`, `$SIRIUS_SHELL`); the `--agent-cmd` PATH preflight (`agent_program` / `find_program`) | [subsystems/policy-config](../subsystems/policy-config) |
+| `src/doctor.rs` | `sirius doctor` — the five contract facts live, plus the gating `gate_configured` fact (SF-11: a null/blank `gate.test_cmd` flips `ok`), plus advisories `plugin_handoff`, `fleet_models`, `integration`, `plugin_version` (WARN, never gate `ok`) | — |
 | `src/gitrange.rs` | Changed-file resolution from a git range | — |
 | `src/models.rs` | Fleet model selection (SIRF-26): launch-time resolution + refusal, per-ticket label routing, fix floor, alias check, usage-limit detection | [subsystems/loop](../subsystems/loop) |
 | `src/review.rs` | The review stage's pure half: findings/fix JSON contracts, blocking rule, skip globs, prompt rendering, round bookkeeping | [subsystems/loop](../subsystems/loop) |
@@ -69,8 +69,8 @@ Sirius never opens either parent's SQLite for writing. The console (`web/`) read
 `src/cli.rs` defines exactly nine (`Init`, `Doctor`, `Link`, `Why`, `Gate`, `Escape`, `ReviewCanary`, `Integrate`, `Run`). Every one takes `--json`.
 
 ```
-sirius init            create .sirius/sirius.db beside an existing .ametrite/
-sirius doctor          five contract facts live + advisories: plugin handoff, fleet models, integration red
+sirius init            create .sirius/sirius.db beside an existing .ametrite/ (+ config.json with a detected gate.test_cmd, if absent)
+sirius doctor          five contract facts live + gate_configured; advisories: plugin handoff, fleet models, integration red, plugin version
 sirius link <AMT-n>    stamp two-way provenance (--decision D-n for decisions)
 sirius why <target>    explain a symbol's issues/decisions, or an issue's symbols
 sirius gate <AMT-n>    select affected tests, run them, advance on pass
@@ -80,7 +80,7 @@ sirius integrate       build the integration frontier, run integration.cmd on it
 sirius run             the loop, --workers N --agent-cmd "<cmd>" --model <id> [--review-cmd "<cmd>"] [--review-model <id>]
 ```
 
-Exit codes follow the suite convention: `0` ok, `1` operational failure, `2` usage error, `3` soft-block. `sirius doctor --json` is the discovery handshake and deliberately **exits 0 even when unhealthy** — a peer that exits non-zero is read as ABSENT, so an unhealthy-but-present tool must report its health in the envelope body, not the exit code (`doctor_exit_code` in `src/main.rs`).
+Exit codes follow the suite convention: `0` ok, `1` operational failure, `2` usage error, `3` soft-block; `sirius run` adds `4` = the fleet paused (usage limit, or integration red under `on_fail: block`). `sirius run` also exits `2` up front when `--agent-cmd`'s program is not on `PATH` (a command too dynamic to read statically skips this preflight). An unconfigured gate is still exit `3`; `sirius gate --json` carries `reason_code` / `structural` to tell it apart from a real failure. `sirius doctor --json` is the discovery handshake and deliberately **exits 0 even when unhealthy** — a peer that exits non-zero is read as ABSENT, so an unhealthy-but-present tool must report its health in the envelope body, not the exit code (`doctor_exit_code` in `src/main.rs`).
 
 ## Workspace discovery
 

@@ -4,11 +4,11 @@ title: "The Gate — select, doubt, run, verdict"
 path: "subsystems/gate"
 tags: ["gate", "tests", "rust", "safety"]
 relatedFiles: ["src/gate.rs"]
-anchors: [{"file":"src/config.rs","symbol":"GateConfig"}]
+anchors: [{"file":"src/config.rs","symbol":"GateConfig"},{"file":"src/config.rs","symbol":"detect_test_cmd"},{"file":"src/shell.rs","symbol":"resolve_shell_from"},{"file":"src/main.rs","symbol":"cmd_gate"}]
 evidence: []
 refs: []
-verifiedCommit: "f0cc2edeb9b9fa7b6fdc2ee6c39fb66297a618df"
-verifiedAt: "2026-10-04T18:26:41.318Z"
+verifiedCommit: "c38e8f247abfea0e0869ef1ce1722628990274f2"
+verifiedAt: "2026-10-08T23:09:30.142Z"
 driftSuspectSince: ""
 driftSuspectReason: ""
 createdAt: 1785915503544
@@ -29,7 +29,7 @@ A gate keyed on that exit code passes with **zero tests executed** — and both 
 1. Resolve changed files from a git range (`src/gitrange.rs`; default working tree vs HEAD).
 2. Ask `hayven affected-tests --changed <files> --json` which tests those files can affect.
 3. Decide whether that selection can be **trusted to be complete**.
-4. Run the chosen tests via `gate.test_cmd`.
+4. Run the chosen tests via `gate.test_cmd`, through an explicitly resolved shell (see [The shell](#the-shell)).
 5. Take the verdict from the **test runner's** exit code.
 
 The governing rule is *"ran too much, never missed a test."*
@@ -46,7 +46,7 @@ The governing rule is *"ran too much, never missed a test."*
 - the selector's own `note` raises no under-reporting flag
 - **no global-impact file changed**
 
-Anything short of all of that is *doubt*, and doubt defers to `gate.fallback`. Fleet iterations in isolated worktrees are ALWAYS doubt (the daemon's graph reflects the main checkout, not the worktree), and a `fail` verdict whose plan is `unconfigured` is marked `structural` — the retry budget skips it, since no fresh agent attempt can change it.
+Anything short of all of that is *doubt*, and doubt defers to `gate.fallback`. Fleet iterations in isolated worktrees are ALWAYS doubt (the daemon's graph reflects the main checkout, not the worktree), and the `unconfigured` verdict is the one marked `structural` — the retry budget skips it, since no fresh agent attempt can change it.
 
 `note_is_suspect` matches the selector's self-reported caveats: `stale`, `cold`, `under-report`, `under report`, `under_report`, `no traces`, `may under`. This matters in practice — an untraced index emits `"no traces yet — static only, may UNDER-report"`, and that alone forces the full suite even when the selection looks narrow and healthy.
 
@@ -66,11 +66,41 @@ Anything short of all of that is *doubt*, and doubt defers to `gate.fallback`. F
 
 ## Fail-closed
 
-With no `gate.test_cmd` configured, a plan that requires running tests yields `plan: "unconfigured"` and does **not** pass. The gate refuses to bless code it could not test — asserted by `execute_without_test_cmd_fails_closed`, which also checks that no command was run at all.
+With no `gate.test_cmd` configured (or a blank one), a plan that requires running tests yields `plan: "unconfigured"` (`reason_code: unconfigured_test_cmd`, `structural: true`) and does **not** pass. The gate refuses to bless code it could not test — asserted by `execute_without_test_cmd_fails_closed`, which also checks that no command was run at all. Its `reason` says outright that no test failure occurred and points at `sirius doctor`, whose `gate_configured` check prints the command detected for the repo.
+
+To keep that state rare, `sirius init` writes a starter config with `gate.test_cmd` pre-filled (`Config::default_json_for_root` → `detect_test_cmd`, reading only workspace-root markers, first match wins): `Cargo.toml` → `cargo test --workspace`; a `package.json` that declares a non-empty `scripts.test` → `bun test` with a `bun.lock`/`bun.lockb`, else `npm test`; `pyproject.toml` or `pytest.ini` → `pytest`; `go.mod` → `go test ./...`. Nothing detectable leaves it `null`. A legacy `"test_cmd": null` still parses.
+
+## The shell
+
+`test_cmd` — with any subset ids appended — is handed to a shell as **one script string** (`shell::run_in_shell`), so `&&` and `|` act as operators. Which shell is resolved explicitly by `shell::resolve_shell`, never inherited from whatever launched Sirius:
+
+1. `SIRIUS_SHELL`, if set, wins verbatim (`cmd`-named programs get `/C`, anything else `-c`).
+2. On unix: `/bin/sh -c` — absolute, so an empty `PATH` cannot break it.
+3. On Windows: the first `sh.exe` / `sh` on `PATH`, resolved to an absolute path, with `-c`. `bash` is never probed by name — `System32\bash.exe` is the WSL launcher.
+4. Otherwise on Windows: `%ComSpec%` (default `cmd.exe`) with `/C`. On Windows the script goes on cmd's command line raw, as `/S /C "<script>"`, so its own quotes survive.
+
+Subset ids are quoted for the resolved shell (`shell_quote`): ids made only of `[A-Za-z0-9_\-./:=]` pass bare; otherwise POSIX single quotes, or for `cmd.exe` MSVC-quoting with every cmd metacharacter (quotes and `%` included) caret-escaped (`cmd_quote`). `execute_plan` takes the shell as a parameter, so gate tests pin `ShellCmd::posix_sh()` instead of depending on the developer's box. A shell that cannot be spawned yields `reason_code: shell_spawn_failed` with `ran_tests: false` and a detail that names the shell and says it is not the test binary.
+
+Only `gate.test_cmd` and `--agent-cmd` (see [subsystems/loop](./loop)) go through this resolution; the review, integration, and review-canary spawns still run literal `sh -c`, since each wraps its command in a Sirius-built POSIX `cd "$…" || exit 1; …` script.
 
 ## Outcome
 
-On pass: `amt issue update --status <target>` advances the issue. On fail: the failure is filed as an issue comment (last 20 non-empty lines of combined stdout/stderr) and the status is left untouched. Either way a `gate_tier` policy event lands in the ledger.
+On pass: `amt issue update --status <target>` advances the issue (a `pass-with-warning` also files its warning comment). On fail: an issue comment `sirius gate FAILED (tier …, plan …, reason <reason_code>): <reason>. <line>` is filed, where `<line>` is only the **first** of the last 20 non-empty lines of combined stdout/stderr the verdict kept as `detail`; the status is left untouched. Either way a `gate_tier` policy event lands in the ledger carrying `plan`, `reason`, `reason_code`, and `tests_run` (plus `structural` on a fail, `advanced_to` on a pass).
+
+## Reason codes and exit 3
+
+`plan` is human copy and gets reworded; `reason_code` (`gate::reason_code`) is the stable machine contract:
+
+| `reason_code` | Meaning |
+|---|---|
+| `pass` | tests ran, runner exited 0 |
+| `tests_failed` | tests ran, runner failed — retryable |
+| `blocked_by_policy` | `fallback = fail` refused to run the suite under doubt |
+| `passed_without_tests` | `fallback = pass-with-warning` advanced without running anything |
+| `unconfigured_test_cmd` | no `gate.test_cmd`; the only `structural: true` verdict |
+| `shell_spawn_failed` | the shell itself could not start |
+
+`sirius gate` exits **3** for every failing verdict, unconfigured included — exit 3 is the published "gate blocked" code (CONTRACTS §2) and the sirius worker Skill keys its release-without-advancing path on it, so no fourth code was minted. The `--json` envelope (`cmd_gate`) carries `reason_code` and `structural` alongside `plan`, `ran_tests`, `advanced_to`, `tests_selected`, and `comment_filed`; in human mode an unconfigured verdict also prints its `reason` to stderr.
 
 <Callout type="warning">
 **Naming wart worth knowing.** `GateOutcome.tests_selected` is populated from `GateVerdict.tests_run`, not from the size of the selection — its own doc comment says "Count of tests actually run (0 for a full-suite run — the runner decides)". A full-suite run therefore reports `tests_selected: 0` while having run the entire suite. `CONTRACTS.md` §2 documents the field by its name. Read `plan` and `ran_tests` for the truth.

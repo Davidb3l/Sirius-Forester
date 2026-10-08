@@ -3,12 +3,12 @@ id: sf-sub-config
 title: "Policy config — .sirius/config.json"
 path: "subsystems/policy-config"
 tags: ["config", "policy", "rust"]
-relatedFiles: ["src/config.rs"]
+relatedFiles: ["src/config.rs", "src/shell.rs", "src/doctor.rs"]
 anchors: []
 evidence: []
 refs: []
-verifiedCommit: "174510b28ba1e88de7fd5e4b411317da8d6d26e6"
-verifiedAt: "2026-10-04T18:26:30.154Z"
+verifiedCommit: "c38e8f247abfea0e0869ef1ce1722628990274f2"
+verifiedAt: "2026-10-08T23:09:30.166Z"
 driftSuspectSince: ""
 driftSuspectReason: ""
 createdAt: 1785915503544
@@ -20,7 +20,16 @@ createdBy: "claude-code"
 
 `.sirius/config.json` is the policy engine. An **absent file means committed defaults**; a malformed one is a hard error rather than a silent fallback. A partial file fills the rest from defaults, so you only write the knobs you are changing. `sirius` reads it; the console displays it read-only.
 
-`Config::default_json()` pretty-prints the defaults and is what `sirius init` writes.
+`Config::default_json_for_root(root)` is what `sirius init` writes (only when no config exists): the committed defaults, pretty-printed, with **`gate.test_cmd` pre-filled** from `detect_test_cmd(root)` so a fresh workspace is gateable rather than inert. Detection reads only files at the workspace root, first match wins:
+
+| Root marker | Detected `test_cmd` |
+|---|---|
+| `Cargo.toml` | `cargo test --workspace` |
+| `package.json` with a non-blank `scripts.test` | `bun test` if `bun.lock`/`bun.lockb` is present, else `npm test` |
+| `pyproject.toml`, then `pytest.ini` | `pytest` |
+| `go.mod` | `go test ./...` |
+
+Nothing detectable ⇒ `test_cmd` stays `null` (still a valid shape — every pre-SF-11 config has it on disk). Whenever `test_cmd` is null, `sirius doctor`'s **gating** `gate_configured` check fails (so `ok` is false) with `test_cmd_suggestion(root)`: the detected command plus the file it came from, or, with no marker, a placeholder listing the markers it looked for.
 
 ## The knobs, as the struct actually defines them
 
@@ -35,7 +44,7 @@ createdBy: "claude-code"
 | `retry_budget` | `3` | before an iteration is a deadend |
 | `worker_concurrency` | `3` | |
 | `claim_mode` | `adaptive` | `always` / `never` / `adaptive` |
-| `gate.test_cmd` | *unset* | full-suite command, run via `sh -c`. Unset ⇒ fail-closed |
+| `gate.test_cmd` | *unset* (`sirius init` pre-fills a detected one) | full-suite command, run through the resolved shell (below). Unset or blank ⇒ fail-closed (structural `unconfigured_test_cmd`; `sirius run` refuses to start), and `sirius doctor` fails it |
 | `gate.fallback` | `full-suite` | `fail` / `pass-with-warning` also available |
 | `agent_timeout_secs` | `1800` | hard wall-clock cap on one agent run |
 | `models.default` | *unset* | the workers' model (`--model`; `inherit` = `$SIRIUS_PARENT_MODEL`). Unset ⇒ `sirius run` refuses unless `models.allow_default` / `--allow-default-model` |
@@ -58,6 +67,8 @@ createdBy: "claude-code"
 | `integration.on_fail` | `warn` | or `block`: while red, `sirius run` refuses to launch, the fleet stops claiming, and gated work is held |
 | `integration.timeout_secs` | `1800` | hard cap on one integration run (the whole process tree is killed) |
 | `lease_ttl_secs` | `900` | amt/hayven lease TTL |
+
+**Which shell runs `gate.test_cmd`** (`shell::resolve_shell`, SF-15 — the same rule runs `sirius run --agent-cmd`): `$SIRIUS_SHELL` if set, verbatim (a `cmd`/`command` program stem gets `/C`, anything else `-c`); otherwise `/bin/sh -c` on unix; on Windows the first `sh.exe`/`sh` on `PATH` (absolute path, `-c`), else `%ComSpec%` (`cmd.exe`) with `/C`. `bash` is never auto-probed on Windows (`System32\bash.exe` is the WSL launcher). `review.cmd` and `integration.cmd` still spawn literal `sh -c`. `sirius doctor`'s `gate_configured` line names the shell it resolved.
 
 `backoff_delay_ms(attempt)` is `base << attempt`, clamped to `max_ms`: 500, 1000, 2000, 4000, 8000, then flat.
 

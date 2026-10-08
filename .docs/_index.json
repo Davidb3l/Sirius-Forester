@@ -13,13 +13,15 @@
       "relatedFiles": [
         "src/main.rs",
         "src/cli.rs",
-        "src/workspace.rs"
+        "src/workspace.rs",
+        "src/doctor.rs",
+        "src/shell.rs"
       ],
       "anchors": [],
       "evidence": [],
       "refs": [],
-      "verifiedCommit": "174510b28ba1e88de7fd5e4b411317da8d6d26e6",
-      "verifiedAt": "2026-10-04T18:26:30.118Z",
+      "verifiedCommit": "c38e8f247abfea0e0869ef1ce1722628990274f2",
+      "verifiedAt": "2026-10-08T23:09:30.128Z",
       "driftSuspectSince": "",
       "driftSuspectReason": "",
       "createdAt": 1785915503544,
@@ -43,12 +45,24 @@
         {
           "file": "src/config.rs",
           "symbol": "GateConfig"
+        },
+        {
+          "file": "src/config.rs",
+          "symbol": "detect_test_cmd"
+        },
+        {
+          "file": "src/shell.rs",
+          "symbol": "resolve_shell_from"
+        },
+        {
+          "file": "src/main.rs",
+          "symbol": "cmd_gate"
         }
       ],
       "evidence": [],
       "refs": [],
-      "verifiedCommit": "f0cc2edeb9b9fa7b6fdc2ee6c39fb66297a618df",
-      "verifiedAt": "2026-10-04T18:26:41.318Z",
+      "verifiedCommit": "c38e8f247abfea0e0869ef1ce1722628990274f2",
+      "verifiedAt": "2026-10-08T23:09:30.142Z",
       "driftSuspectSince": "",
       "driftSuspectReason": "",
       "createdAt": 1785915503544,
@@ -100,12 +114,24 @@
         {
           "file": "src/ledger.rs",
           "symbol": "count_policy_events"
+        },
+        {
+          "file": "src/main.rs",
+          "symbol": "cmd_run"
+        },
+        {
+          "file": "src/shell.rs",
+          "symbol": "agent_program"
+        },
+        {
+          "file": "src/gitrange.rs",
+          "symbol": "git_path"
         }
       ],
       "evidence": [],
       "refs": [],
-      "verifiedCommit": "174510b28ba1e88de7fd5e4b411317da8d6d26e6",
-      "verifiedAt": "2026-10-04T18:26:30.143Z",
+      "verifiedCommit": "c38e8f247abfea0e0869ef1ce1722628990274f2",
+      "verifiedAt": "2026-10-08T23:09:30.154Z",
       "driftSuspectSince": "",
       "driftSuspectReason": "",
       "createdAt": 1785915503544,
@@ -122,13 +148,15 @@
         "rust"
       ],
       "relatedFiles": [
-        "src/config.rs"
+        "src/config.rs",
+        "src/shell.rs",
+        "src/doctor.rs"
       ],
       "anchors": [],
       "evidence": [],
       "refs": [],
-      "verifiedCommit": "174510b28ba1e88de7fd5e4b411317da8d6d26e6",
-      "verifiedAt": "2026-10-04T18:26:30.154Z",
+      "verifiedCommit": "c38e8f247abfea0e0869ef1ce1722628990274f2",
+      "verifiedAt": "2026-10-08T23:09:30.166Z",
       "driftSuspectSince": "",
       "driftSuspectReason": "",
       "createdAt": 1785915503544,
@@ -219,5 +247,5 @@
       "createdBy": "claude-code"
     }
   ],
-  "lastUpdated": 1791327234756
+  "lastUpdated": 1791500970167
 }
