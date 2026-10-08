@@ -151,50 +151,15 @@ pub fn changed_symbols(
     let files = match (range, fleet) {
         (Some(r), _) => changed_files(runner, Some(r))?,
         // Inside a fleet iteration the base the worker started from is known
-        // ($SIRIUS_BASE): the change is everything the worker did since — its
-        // own commits plus anything still uncommitted. `--first-parent`: the
-        // worker's line is always first-parent (detached at base; a fix round
-        // merges the CURRENT base into its HEAD), so other workers' commits
-        // that a fix round merged in stay out — a plain `base..HEAD` (tree
-        // diff or log) would stamp them on this issue. Work resumed from an
-        // earlier run arrives as a second parent, so it is added explicitly.
-        // A worker that did nothing (HEAD == base, clean tree) links nothing —
-        // never the base branch's last commit.
+        // ($SIRIUS_BASE): the change is this issue's line of work since then
+        // ([`fleet_line_files`]) plus anything still uncommitted. A worker
+        // that did nothing (HEAD == base, clean tree) links nothing — never
+        // the base branch's last commit.
         (None, Some(f)) => {
-            let own = run_git(
-                runner,
-                &[
-                    "log",
-                    "--first-parent",
-                    "--no-merges",
-                    "--name-only",
-                    "--format=",
-                    &format!("{}..HEAD", f.base),
-                ],
-            )?;
-            let resumed = match f.resumed_from.map(str::trim).filter(|r| !r.is_empty()) {
-                Some(r) => run_git(
-                    runner,
-                    &[
-                        "log",
-                        "--no-merges",
-                        "--name-only",
-                        "--format=",
-                        &format!("{}..{r}", f.base),
-                    ],
-                )
-                .map(|o| stdout_lines(&o))
-                .unwrap_or_default(),
-                None => Vec::new(),
-            };
-            let mut files: Vec<String> = Vec::new();
-            for f in stdout_lines(&own)
-                .into_iter()
-                .chain(resumed)
-                .chain(changed_files(runner, None)?)
-            {
-                if !files.contains(&f) {
-                    files.push(f);
+            let mut files = fleet_line_files(runner, f)?;
+            for x in changed_files(runner, None)? {
+                if !files.contains(&x) {
+                    files.push(x);
                 }
             }
             if files.is_empty() {
@@ -245,6 +210,81 @@ pub fn changed_symbols(
 pub struct FleetBase<'a> {
     pub base: &'a str,
     pub resumed_from: Option<&'a str>,
+}
+
+/// How many resume merges [`fleet_line_files`] follows back. Each is one
+/// earlier hold of the same issue; a chain longer than this is pathological.
+const MAX_RESUME_DEPTH: usize = 8;
+
+/// The files this issue's own commits touched since the fleet base.
+///
+/// The worker's line is the FIRST-PARENT walk from HEAD: it starts detached at
+/// the base, and a fix round merges the CURRENT base into it — so a plain
+/// `base..HEAD` (tree diff or log) would also stamp every other worker's
+/// commit that merge brought in. `--no-merges` alone does not help: it drops
+/// the merge commits, not the commits they reach.
+///
+/// Held work resumed from an earlier hold is the one second parent that IS
+/// this issue's: `resume_held` merges it before the agent runs, so that merge
+/// sits at the BOTTOM of the line. Follow it — but only a real resume merge:
+/// at the first level the one `$SIRIUS_RESUMED_FROM` names; deeper (a resume
+/// of a resume) one carrying resume_held's `Merge commit '<sha>'` subject
+/// (git's default for `merge --no-edit <sha>`). A
+/// worker that opens with its own `git merge main` also leaves a merge at the
+/// bottom, and following that would stamp the whole base onto the issue.
+fn fleet_line_files(runner: &dyn Runner, f: FleetBase<'_>) -> Result<Vec<String>, String> {
+    let mut files: Vec<String> = Vec::new();
+    let mut tip = "HEAD".to_string();
+    let mut expect_parent = f.resumed_from.map(str::trim).filter(|r| !r.is_empty());
+    for depth in 0..=MAX_RESUME_DEPTH {
+        let range = format!("{}..{tip}", f.base);
+        let log = run_git(
+            runner,
+            &[
+                "log",
+                "--first-parent",
+                "--no-merges",
+                "--name-only",
+                "--format=",
+                &range,
+            ],
+        )?;
+        for x in stdout_lines(&log) {
+            if !files.contains(&x) {
+                files.push(x);
+            }
+        }
+        let line = run_git(runner, &["rev-list", "--first-parent", &range])?;
+        let Some(bottom) = stdout_lines(&line).pop() else {
+            break;
+        };
+        let parents = run_git(runner, &["rev-list", "--parents", "-n", "1", &bottom])?;
+        let parents: Vec<String> = parents
+            .stdout
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+        let Some(second) = parents.get(2) else {
+            break; // the bottom is an ordinary commit: the line ends here
+        };
+        let is_resume = if depth == 0 {
+            expect_parent.is_some_and(|r| second.starts_with(r) || r.starts_with(second.as_str()))
+        } else {
+            let subject = run_git(runner, &["log", "-1", "--format=%s", &bottom])?;
+            // `Merge commit '<sha>'`, plus ` into HEAD` on a detached
+            // worktree (or ` into <branch>`).
+            subject
+                .stdout
+                .trim()
+                .starts_with(&format!("Merge commit '{second}'"))
+        };
+        if !is_resume {
+            break;
+        }
+        expect_parent = None;
+        tip = second.clone();
+    }
+    Ok(files)
 }
 
 /// Whether `base` names a commit HEAD descends from. Anything else — a stale
@@ -534,29 +574,6 @@ mod tests {
         assert!(!calls.iter().any(|c| c.contains("HEAD~1")), "{calls:?}");
     }
 
-    /// Work resumed from an earlier run sits on a second parent, outside the
-    /// first-parent walk — it is this issue's work, so it is listed too.
-    #[test]
-    fn changed_symbols_includes_resumed_work() {
-        let m = MockRunner::new();
-        m.expect(&["git", "merge-base", "--is-ancestor"], 0, "");
-        m.expect(&["git", "log", "--first-parent"], 0, "src/new.rs\n");
-        m.expect(&["git", "log", "--no-merges"], 0, "src/held.rs\n");
-        m.expect(&["git", "diff", "--name-only", "HEAD"], 0, "");
-        m.expect(&["hayven", "affected-tests"], 0, r#"{"roots":["a","b"]}"#);
-        let hv = Hayven::new(&m);
-        let fleet = FleetBase {
-            base: "base1",
-            resumed_from: Some("held1"),
-        };
-        let got = changed_symbols(&m, &hv, None, Some(fleet)).unwrap();
-        assert_eq!(got.files, vec!["src/new.rs", "src/held.rs"]);
-        assert!(m
-            .recorded()
-            .iter()
-            .any(|c| c == "git log --no-merges --name-only --format= base1..held1"));
-    }
-
     /// Fleet worker with only new, uncommitted files: refuse loudly instead of
     /// silently linking nothing.
     #[test]
@@ -747,5 +764,127 @@ mod tests {
             ChangedSymbols::default()
         );
         assert!(!m2.recorded().iter().any(|c| c.starts_with("hayven")));
+    }
+
+    // ---- fleet line walk, against real git --------------------------------
+
+    struct Repo(crate::shell::RealRunner);
+
+    impl Repo {
+        fn new(tag: &str) -> Repo {
+            let dir =
+                std::env::temp_dir().join(format!("sirius-line-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let r = Repo(crate::shell::RealRunner { cwd: Some(dir) });
+            r.git(&["init", "-q", "-b", "main"]);
+            r
+        }
+        fn git(&self, args: &[&str]) -> String {
+            let mut full = vec!["-c", "user.name=t", "-c", "user.email=t@t"];
+            full.extend(args);
+            run_git(&self.0, &full)
+                .unwrap_or_else(|e| panic!("git {args:?}: {e}"))
+                .stdout
+                .trim()
+                .to_string()
+        }
+        /// Commit one new file; returns the new HEAD.
+        fn file(&self, name: &str) -> String {
+            std::fs::write(self.0.cwd.as_ref().unwrap().join(name), name).unwrap();
+            self.git(&["add", "-A"]);
+            self.git(&["commit", "-q", "-m", name]);
+            self.git(&["rev-parse", "HEAD"])
+        }
+        /// Another worker's issue landing on main as a --no-ff merge.
+        fn land_on_main(&self, name: &str) -> String {
+            let back = self.git(&["rev-parse", "HEAD"]);
+            self.git(&["switch", "-q", "main"]);
+            self.git(&["switch", "-q", "-c", name]);
+            self.file(name);
+            self.git(&["switch", "-q", "main"]);
+            self.git(&["merge", "-q", "--no-ff", "--no-edit", name]);
+            let tip = self.git(&["rev-parse", "HEAD"]);
+            self.git(&["switch", "-q", "--detach", &back]);
+            tip
+        }
+        fn line(&self, base: &str, resumed: Option<&str>) -> Vec<String> {
+            let mut got = fleet_line_files(
+                &self.0,
+                FleetBase {
+                    base,
+                    resumed_from: resumed,
+                },
+            )
+            .unwrap();
+            got.sort();
+            got
+        }
+        fn drop(self) {
+            let _ = std::fs::remove_dir_all(self.0.cwd.unwrap());
+        }
+    }
+
+    /// A fix round merges the moved base in; same-run resume fast-forwards a
+    /// held line that contains that merge. Neither may stamp other.txt.
+    #[test]
+    fn fleet_line_excludes_base_merged_in_by_a_fix_round_and_same_run_resume() {
+        let r = Repo::new("samerun");
+        let base = r.file("base.txt");
+        r.git(&["switch", "-q", "--detach", &base]);
+        r.file("mine.txt");
+        let cur = r.land_on_main("other.txt");
+        r.git(&["merge", "-q", "--no-edit", &cur]); // fix round
+        r.file("mine2.txt");
+        assert_eq!(r.line(&base, None), vec!["mine.txt", "mine2.txt"]);
+        // Held, then resumed in the same run: worktree reset to base, merge
+        // of the held sha fast-forwards.
+        let held = r.git(&["rev-parse", "HEAD"]);
+        r.git(&["switch", "-q", "--detach", &base]);
+        r.git(&["merge", "-q", "--no-edit", &held]);
+        r.file("mine3.txt");
+        assert_eq!(
+            r.line(&base, Some(&held)),
+            vec!["mine.txt", "mine2.txt", "mine3.txt"]
+        );
+        r.drop();
+    }
+
+    /// Cross-run resume chain: each run's base already holds the earlier
+    /// landed work, and the held line comes back as a non-ff resume merge.
+    #[test]
+    fn fleet_line_follows_a_resume_chain_across_runs() {
+        let r = Repo::new("chain");
+        let b1 = r.file("base.txt");
+        r.git(&["switch", "-q", "--detach", &b1]);
+        let h0 = r.file("h0.txt");
+        r.git(&["switch", "-q", "main"]);
+        r.file("landed1.txt");
+        let b2 = r.git(&["rev-parse", "HEAD"]);
+        r.git(&["switch", "-q", "--detach", &b2]);
+        r.git(&["merge", "-q", "--no-edit", &h0]); // run 2 resumes h0
+        let h1 = r.file("w.txt");
+        r.git(&["switch", "-q", "main"]);
+        r.file("landed2.txt");
+        let b3 = r.git(&["rev-parse", "HEAD"]);
+        r.git(&["switch", "-q", "--detach", &b3]);
+        r.git(&["merge", "-q", "--no-edit", &h1]); // run 3 resumes h1
+        r.file("w2.txt");
+        assert_eq!(r.line(&b3, Some(&h1)), vec!["h0.txt", "w.txt", "w2.txt"]);
+        r.drop();
+    }
+
+    /// A worker that OPENS with its own `git merge main` leaves a merge at the
+    /// bottom of its line too — that is not a resume and must not be walked.
+    #[test]
+    fn fleet_line_does_not_follow_a_workers_own_opening_merge() {
+        let r = Repo::new("opening");
+        let base = r.file("base.txt");
+        r.git(&["switch", "-q", "--detach", &base]);
+        let main_tip = r.land_on_main("other.txt");
+        r.git(&["merge", "-q", "--no-ff", "--no-edit", &main_tip]);
+        r.file("mine.txt");
+        assert_eq!(r.line(&base, None), vec!["mine.txt"]);
+        r.drop();
     }
 }
