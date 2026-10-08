@@ -1,5 +1,6 @@
-//! `sirius doctor` — checks the five PRD §6 contract facts live (M0), plus one
-//! ADVISORY check on the Claude Code plugin half of the install.
+//! `sirius doctor` — checks the five PRD §6 contract facts live (M0), plus a
+//! sixth workspace fact and two ADVISORY checks on the Claude Code plugin half
+//! of the install.
 //!
 //! 1. amt present + schema (read the ametrite `meta.schema_version` read-only;
 //!    pragmatic ≥ 3, NOT a version-string compare — `amt 0.1.0` ships schema 3).
@@ -11,14 +12,23 @@
 //!    surface present).
 //! 4. gate exit codes (hayven affected-tests present).
 //! 5. fleet-memory write path (hayven remember/recall present).
-//! 6. plugin handoff (ADVISORY, never gates `ok`): is the Sothis bundle
+//! 6. gate configuration (SF-11/SF-15): can THIS workspace run tests at all?
+//!    Fact 4 is about the affected-tests BINARY; it says nothing about whether
+//!    `gate.test_cmd` is set here, so a workspace whose gate is inert used to
+//!    get "all contract facts hold" — and a fleet started against it burned
+//!    workers doing real edits while every gate refused to advance.
+//! 7. plugin handoff (ADVISORY, never gates `ok`): is the Sothis bundle
 //!    marketplace added and are the sirius/hayvenhurst/catryna plugins
 //!    installed in Claude Code? This exists because the CLI half and the
 //!    plugin half install separately, and a real audit found machines with
 //!    every BINARY present but the `sirius` plugin never installed — the
 //!    printed `/plugin` handoff is a silent drop-off unless something checks.
+//! 8. plugin/CLI version skew (ADVISORY, SF-10): report the plugin manifest
+//!    version beside the CLI's, so a plugin fix that shipped without a version
+//!    bump is visible instead of silently cached forever.
 
 use crate::amt::Amt;
+use crate::config::{test_cmd_suggestion, Config};
 use crate::hayven::Hayven;
 use crate::shell::Runner;
 use crate::workspace::Workspace;
@@ -135,6 +145,149 @@ fn daemon_http_ok(runner: &dyn Runner) -> bool {
     ) {
         Ok(o) => o.stdout.trim() == "200",
         Err(_) => false,
+    }
+}
+
+/// Ask the RUNNING daemon what it is, via its own `/api/health` (verified live
+/// against hayven 0.0.7: `{"ok":true,"version":"0.0.7","pid":…,
+/// "native_version":"present","root":…,"projects":[…]}`).
+///
+/// SF-13: `hayven --version` reports the CLI on disk; `hayven daemon status`
+/// reports that *a* process is alive. Neither asks the daemon what BUILD it is,
+/// and a daemon left running across an upgrade answers /health perfectly while
+/// failing the one operation the whole loop depends on ("hayven-native
+/// serialize encode failed (undefined)" on every entity claim, 2026-08-26).
+/// This is the field that closes that hole.
+fn daemon_health(runner: &dyn Runner) -> Option<serde_json::Value> {
+    // Same `curl` seam as `daemon_http_ok` — if curl could fetch `/` for the
+    // liveness probe it can fetch this. 127.0.0.1, not `localhost`: a machine
+    // whose `localhost` resolves to ::1 first would otherwise probe a
+    // different socket than the daemon bound.
+    let out = runner
+        .run(
+            "curl",
+            &["-s", "-m", "3", "http://127.0.0.1:7777/api/health"],
+        )
+        .ok()?;
+    serde_json::from_str(&out.stdout).ok()
+}
+
+/// Compare two hayven version strings tolerantly: `hayven 0.0.7`, `v0.0.7`, and
+/// `0.0.7` are the same build. Only the CLI's spelling has ever varied, but a
+/// cosmetic reword upstream must not manufacture a false skew alarm.
+fn same_build(a: &str, b: &str) -> bool {
+    normalize_version(a) == normalize_version(b)
+}
+
+fn normalize_version(v: &str) -> String {
+    v.trim()
+        .trim_start_matches("hayven")
+        .trim()
+        .trim_start_matches('v')
+        .trim()
+        .to_string()
+}
+
+/// Check #6 — can THIS workspace actually run tests? (SF-11)
+///
+/// Pure over the workspace root and the loaded gate config, so it is testable
+/// against a temp fixture. GATING on purpose: an unset `test_cmd` means every
+/// gate in this repo fails closed forever, which is precisely the "doctor says
+/// healthy while nothing can advance" state the ticket is about. The fix
+/// direction is to report the truth — never to relax the gate.
+/// `shell` is passed in rather than resolved here so the fact stays pure — and
+/// so doctor can TELL the operator which interpreter their `test_cmd` will
+/// actually reach. That line is not decoration: SF-15 was a gate that passed
+/// from Git Bash and failed from PowerShell on the same commit, and nothing in
+/// the tool ever said which shell it had picked.
+pub fn gate_configured_check(
+    root: &Path,
+    cfg: &Result<Config, String>,
+    shell: &crate::shell::ShellCmd,
+) -> Check {
+    const NAME: &str = "gate_configured";
+    let cfg = match cfg {
+        Ok(c) => c,
+        // A config we cannot read is not a configured gate. Fail-closed and say
+        // exactly which file is the problem.
+        Err(e) => return Check::fail(NAME, format!("cannot read gate config: {e}")),
+    };
+    match cfg.gate.test_cmd.as_deref().map(str::trim) {
+        Some(cmd) if !cmd.is_empty() => Check::ok(
+            NAME,
+            format!(
+                "gate.test_cmd = `{cmd}` (fallback: {:?}; runs via `{}`)",
+                cfg.gate.fallback,
+                shell.describe()
+            ),
+        ),
+        // A whitespace-only command is worse than none: it reaches the shell,
+        // runs nothing, and exits 0 — a gate that passes everything.
+        Some(_) => Check::fail(
+            NAME,
+            format!(
+                "gate.test_cmd is set to an empty/whitespace string — it would run nothing \
+                 and pass everything; {}",
+                test_cmd_suggestion(root)
+            ),
+        ),
+        None => Check::fail(
+            NAME,
+            format!(
+                "gate.test_cmd is not set — EVERY gate in this workspace fails closed \
+                 (exit 3, plan `unconfigured`, 0 tests), so no issue can advance and a \
+                 fleet started here would burn a full agent run per issue for nothing; {}",
+                test_cmd_suggestion(root)
+            ),
+        ),
+    }
+}
+
+/// Check #8 — plugin/CLI version skew (ADVISORY, SF-10). Pure over the plugin
+/// root so tests drive it with a fixture instead of mutating the environment.
+///
+/// ADVISORY and always a PASS: `sirius` is a CLI first, and most invocations
+/// (CI, a plain terminal, a service) have no plugin around them at all. Failing
+/// doctor because a plugin manifest is not present would break exactly the
+/// environments that never wanted one. The job here is visibility: a plugin fix
+/// that shipped WITHOUT a version bump leaves installed users on a stale cached
+/// copy forever, and nothing in the system says so out loud.
+pub fn plugin_version_check(plugin_root: Option<&Path>, cli_version: &str) -> Check {
+    const NAME: &str = "plugin_version";
+    let Some(root) = plugin_root else {
+        return Check::advisory(
+            NAME,
+            true,
+            format!(
+                "sirius CLI {cli_version}; not running inside a plugin (CLAUDE_PLUGIN_ROOT unset)"
+            ),
+        );
+    };
+    let manifest = root.join(".claude-plugin").join("plugin.json");
+    match read_json(&manifest).and_then(|v| {
+        v.get("version")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string())
+    }) {
+        Some(pv) => Check::advisory(
+            NAME,
+            true,
+            format!(
+                "sirius CLI {cli_version}, plugin {pv} (from {}) — these versions move \
+                 independently; if a plugin fix is missing here, its manifest version was \
+                 not bumped and Claude Code is serving a cached copy",
+                manifest.display()
+            ),
+        ),
+        None => Check::advisory(
+            NAME,
+            true,
+            format!(
+                "sirius CLI {cli_version}; CLAUDE_PLUGIN_ROOT is set to {} but no readable \
+                 version in .claude-plugin/plugin.json — plugin skew cannot be seen from here",
+                root.display()
+            ),
+        ),
     }
 }
 
@@ -313,10 +466,57 @@ pub fn run_with_plugins_dir(
                 ),
             ));
         } else if running {
-            checks.push(Check::ok(
-                "hayven_daemon_7777",
-                format!("hayven {hv_ver}, daemon healthy on :7777 (status: {status_line});{hv_ws}"),
-            ));
+            // SF-13: LIVENESS IS NOT HEALTH. Everything above this point proves
+            // a process is up and answering; none of it proves the process is
+            // running the build the CLI just installed. On 2026-08-26 doctor
+            // printed "daemon healthy on :7777 (status: running (pid 25808))"
+            // and every single entity claim immediately failed with
+            // "hayven-native serialize encode failed (undefined)" — the daemon
+            // predated the hayven 0.0.7 CLI beside it, and a stop/start fixed
+            // it instantly. So: ASK THE DAEMON what it is, and refuse to bless
+            // a build we cannot read. Fail-closed, because the failure mode is
+            // silent and total (nothing in the loop works, everything looks OK).
+            const REMEDY: &str = "run `hayven daemon stop && hayven daemon start`";
+            let health = daemon_health(runner);
+            let daemon_ver = health
+                .as_ref()
+                .and_then(|v| v.get("version"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            // Reported verbatim: today hayven answers `"present"` here, not a
+            // version (see the module-level gap note in this check's ticket) —
+            // showing it keeps the limitation in front of whoever reads doctor.
+            let native = health
+                .as_ref()
+                .and_then(|v| v.get("native_version"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unreported");
+            match daemon_ver {
+                _ if hv_ver == "unknown" => checks.push(Check::fail(
+                    "hayven_daemon_7777",
+                    format!(
+                        "a daemon is running on :7777 but `hayven --version` is unreadable, so its build cannot be verified against the CLI (status: {status_line});{hv_ws} — reinstall the hayven CLI, then {REMEDY}"
+                    ),
+                )),
+                Some(dv) if same_build(&dv, &hv_ver) => checks.push(Check::ok(
+                    "hayven_daemon_7777",
+                    format!(
+                        "hayven {hv_ver}, daemon healthy on :7777 running the SAME build {dv} (native: {native}, status: {status_line});{hv_ws}"
+                    ),
+                )),
+                Some(dv) => checks.push(Check::fail(
+                    "hayven_daemon_7777",
+                    format!(
+                        "STALE DAEMON: the hayven CLI is {hv_ver} but the daemon on :7777 is build {dv}. It is live and answers /health, and it will fail the ONE operation the loop depends on — every entity claim returns 500 'hayven-native serialize encode failed'. Fix: {REMEDY} (status: {status_line});{hv_ws}"
+                    ),
+                )),
+                None => checks.push(Check::fail(
+                    "hayven_daemon_7777",
+                    format!(
+                        "hayven {hv_ver}: a daemon answers :7777 but would not report its build at http://127.0.0.1:7777/api/health, so it cannot be shown to match the installed CLI — an upgrade-straddling daemon looks exactly like this. Fix: {REMEDY} (status: {status_line});{hv_ws}"
+                    ),
+                )),
+            }
         } else {
             // Workspace is set up, port answers, THIS repo's pidfile disagrees.
             // Two states look identical from here: an orphan daemon nothing
@@ -405,17 +605,40 @@ pub fn run_with_plugins_dir(
         )),
     }
 
-    // 6. plugin handoff — advisory; reports and recommends, never gates.
+    // 6. gate configuration — GATING (SF-11). Check 4 above proves the
+    //     affected-tests SELECTOR exists; it says nothing about whether this
+    //     workspace can RUN anything. Loaded here rather than passed in so the
+    //     fact needs no new plumbing through the caller.
+    checks.push(gate_configured_check(
+        &ws.root,
+        &Config::load(&ws.config_path()),
+        &crate::shell::resolve_shell(),
+    ));
+
+    // 7. plugin handoff — advisory; reports and recommends, never gates.
     checks.push(plugin_handoff_check(plugins_dir.as_deref()));
 
-    // 7. fleet models (SIRF-26) — advisory: what the fleet would run on.
+    // 8. fleet models (SIRF-26) — advisory: what the fleet would run on.
     checks.push(models_check(ws));
 
-    // 8. integration (SIRF-32) — advisory: is the line stopped, and is any
+    // 9. integration (SIRF-32) — advisory: is the line stopped, and is any
     //    held work parked where a human must look?
     checks.push(integration_check(ws));
 
+    // 10. plugin/CLI version skew — advisory (SF-10). A CLI run outside a plugin
+    //    context must never fail doctor, so this is informational either way.
+    checks.push(plugin_version_check(
+        std::env::var_os("CLAUDE_PLUGIN_ROOT")
+            .map(PathBuf::from)
+            .as_deref(),
+        env!("CARGO_PKG_VERSION"),
+    ));
+
     // Only GATING checks decide overall health; an advisory failure is a WARN.
+    // `gate_configured` is gating, so an inert gate now flips `ok` — which is
+    // what stops main.rs printing "all contract facts hold" and what makes the
+    // human-mode exit code non-zero. No new aggregation mechanism: the fact
+    // simply joins the existing all-gating-checks-pass fold.
     let ok = checks.iter().all(|c| !c.gating || c.pass);
     DoctorReport { ok, checks }
 }
@@ -541,6 +764,26 @@ mod tests {
         }
     }
 
+    /// Queue BOTH daemon probes: the `/` liveness GET (`curl -s -o /dev/null …`)
+    /// and the SF-13 build probe (`curl -s -m 3 …/api/health`). They are keyed
+    /// on their distinct third argv element, so the mock's longest-prefix rule
+    /// hands each call the right canned answer.
+    fn expect_daemon(m: &MockRunner, http_code: &str, health_json: &str) {
+        m.push(MockResponse::new(&["curl", "-s", "-o"], 0, http_code, ""));
+        m.push(MockResponse::new(&["curl", "-s", "-m"], 0, health_json, ""));
+    }
+
+    /// Give a fixture workspace a CONFIGURED gate, so `gate_configured` is not
+    /// the thing under test in checks that are about something else.
+    fn write_gate_cfg(root: &Path, test_cmd: &str) {
+        std::fs::create_dir_all(root.join(".sirius")).unwrap();
+        std::fs::write(
+            root.join(".sirius/config.json"),
+            format!(r#"{{"gate":{{"test_cmd":"{test_cmd}","fallback":"full-suite"}}}}"#),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn a_red_integration_shows_in_doctor() {
         // Branch review X11: doctor said all green while `run` refused.
@@ -611,9 +854,16 @@ mod tests {
             hayven_dir: Some(dir.join(".hayven")),
         };
 
+        write_gate_cfg(&dir, "cargo test");
+
         let m = MockRunner::new();
         m.expect(&["amt", "--version"], 0, "amt 0.1.0");
-        m.expect(&["curl"], 0, "200");
+        // SF-13: the daemon reports the SAME build as the CLI beside it.
+        expect_daemon(
+            &m,
+            "200",
+            r#"{"ok":true,"version":"0.0.5","native_version":"present"}"#,
+        );
         m.expect(&["hayven", "--version"], 0, "0.0.5");
         m.expect(&["hayven", "daemon", "status"], 0, "running");
         m.push(MockResponse::new(
@@ -665,9 +915,10 @@ mod tests {
             ametrite_db: Some(dbp),
             hayven_dir: Some(dir.join(".hayven")),
         };
+        write_gate_cfg(&dir, "cargo test");
         let m = MockRunner::new();
         m.expect(&["amt", "--version"], 0, "amt 0.1.0");
-        m.expect(&["curl"], 0, "200");
+        expect_daemon(&m, "200", r#"{"ok":true,"version":"0.0.5"}"#);
         m.expect(&["hayven", "--version"], 0, "0.0.5");
         m.expect(&["hayven", "daemon", "status"], 0, "running");
         m.push(MockResponse::new(
@@ -1033,5 +1284,328 @@ mod tests {
             "expected fix-it hint, detail: {}",
             c.detail
         );
+    }
+
+    // ---- gate configuration (check #6, SF-11) ------------------------------
+
+    /// A workspace fixture rooted in a fresh temp dir, with a healthy ametrite
+    /// db and a real `.hayven/`. Everything else is per-test.
+    fn healthy_ws(tag: &str) -> (PathBuf, Workspace) {
+        let dir = std::env::temp_dir().join(format!("sirius-doc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".ametrite")).unwrap();
+        std::fs::create_dir_all(dir.join(".hayven")).unwrap();
+        let dbp = dir.join(".ametrite/ametrite.db");
+        {
+            let c = Connection::open(&dbp).unwrap();
+            c.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)", [])
+                .unwrap();
+            c.execute("INSERT INTO meta VALUES ('schema_version','3')", [])
+                .unwrap();
+        }
+        let ws = Workspace {
+            root: dir.clone(),
+            ametrite_db: Some(dbp),
+            hayven_dir: Some(dir.join(".hayven")),
+        };
+        (dir, ws)
+    }
+
+    /// Every non-gate call a healthy run needs, so a test can be about ONE fact.
+    fn healthy_mock(cli_ver: &str, daemon_health_json: &str) -> MockRunner {
+        let m = MockRunner::new();
+        m.expect(&["amt", "--version"], 0, "amt 0.1.0");
+        expect_daemon(&m, "200", daemon_health_json);
+        m.expect(&["hayven", "--version"], 0, cli_ver);
+        m.expect(&["hayven", "daemon", "status"], 0, "running (pid 4242)");
+        m.push(MockResponse::new(
+            &["amt", "--json", "claim", "--peek"],
+            0,
+            r#"{"claimed":false}"#,
+            "",
+        ));
+        m.push(MockResponse::new(
+            &["hayven", "--help"],
+            0,
+            "affected-tests remember recall",
+            "",
+        ));
+        m
+    }
+
+    fn cfg_of(json: &str) -> Result<Config, String> {
+        serde_json::from_str(json).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn gate_configured_passes_with_a_test_cmd() {
+        let c = gate_configured_check(
+            Path::new("/nowhere"),
+            &cfg_of(r#"{"gate":{"test_cmd":"cargo test --workspace"}}"#),
+            &crate::shell::ShellCmd::posix_sh(),
+        );
+        assert!(c.pass && c.gating, "detail: {}", c.detail);
+        assert!(c.detail.contains("cargo test --workspace"), "{}", c.detail);
+    }
+
+    // The SF-11 state: `sirius init` wrote `"test_cmd": null`, so the FIRST gate
+    // on this workspace fails closed and the issue strands in in_progress. The
+    // message must name a repo-appropriate command AND the file it came from.
+    #[test]
+    fn gate_configured_fails_on_null_test_cmd_and_suggests_per_ecosystem() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "Cargo.toml",
+                "[package]\nname=\"x\"\n",
+                "cargo test --workspace",
+            ),
+            ("go.mod", "module x\n", "go test ./..."),
+            ("pyproject.toml", "[project]\nname=\"x\"\n", "pytest"),
+        ];
+        for (marker, body, want) in cases {
+            let dir = std::env::temp_dir().join(format!(
+                "sirius-gc-{}-{}",
+                marker.replace('.', "_"),
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(marker), body).unwrap();
+
+            let c = gate_configured_check(
+                &dir,
+                &cfg_of(r#"{"gate":{"test_cmd":null}}"#),
+                &crate::shell::ShellCmd::posix_sh(),
+            );
+            assert!(!c.pass, "must fail for {marker}");
+            assert!(
+                c.gating,
+                "an inert gate is a CONTRACT failure, not a warning"
+            );
+            assert!(c.detail.contains(want), "{marker}: {}", c.detail);
+            assert!(
+                c.detail.contains(marker),
+                "must name the file: {}",
+                c.detail
+            );
+            // It must explain the consequence, not just the fact.
+            assert!(c.detail.contains("fails closed"), "{}", c.detail);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    // A whitespace test_cmd is worse than none: it reaches the shell, runs
+    // nothing, and exits 0 — a gate that passes literally everything.
+    #[test]
+    fn gate_configured_rejects_a_blank_test_cmd() {
+        let c = gate_configured_check(
+            Path::new("/nowhere"),
+            &cfg_of(r#"{"gate":{"test_cmd":"   "}}"#),
+            &crate::shell::ShellCmd::posix_sh(),
+        );
+        assert!(!c.pass);
+        assert!(c.detail.contains("pass everything"), "{}", c.detail);
+    }
+
+    #[test]
+    fn gate_configured_fails_when_the_config_cannot_be_read() {
+        let c = gate_configured_check(
+            Path::new("/nowhere"),
+            &Err("invalid config.json".into()),
+            &crate::shell::ShellCmd::posix_sh(),
+        );
+        assert!(!c.pass && c.gating);
+        assert!(c.detail.contains("invalid config.json"), "{}", c.detail);
+    }
+
+    // The headline of SF-11/SF-15: an inert gate must flip `report.ok`, because
+    // that bit is what stops main.rs printing "all contract facts hold" and
+    // what makes doctor's human-mode exit code non-zero. Pinned END-TO-END,
+    // with every OTHER fact healthy, so nothing else can be crediting the flip.
+    #[test]
+    fn unconfigured_gate_flips_overall_ok_even_when_all_else_is_healthy() {
+        let (dir, ws) = healthy_ws("gate-inert");
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        // Exactly what `sirius init` used to write.
+        std::fs::create_dir_all(dir.join(".sirius")).unwrap();
+        std::fs::write(
+            dir.join(".sirius/config.json"),
+            r#"{"gate":{"test_cmd":null,"fallback":"full-suite"}}"#,
+        )
+        .unwrap();
+
+        let m = healthy_mock("0.0.7", r#"{"ok":true,"version":"0.0.7"}"#);
+        let report = run_with_plugins_dir(&ws, &m, None);
+
+        let gc = report
+            .checks
+            .iter()
+            .find(|c| c.name == "gate_configured")
+            .expect("gate_configured is a fact");
+        assert!(!gc.pass, "an unset test_cmd must FAIL: {}", gc.detail);
+        assert!(!report.ok, "an inert gate must flip overall ok");
+        // ...and it is the ONLY gating failure, i.e. nothing else was disturbed.
+        let failing: Vec<&str> = report
+            .checks
+            .iter()
+            .filter(|c| c.gating && !c.pass)
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(
+            failing,
+            vec!["gate_configured"],
+            "checks: {:?}",
+            report.checks
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- daemon build skew (check #2, SF-13) --------------------------------
+
+    // The 2026-08-26 incident: doctor said "daemon healthy on :7777 (status:
+    // running (pid 25808))" while the daemon was a build predating the 0.0.7
+    // CLI, and every entity claim failed with "hayven-native serialize encode
+    // failed". Liveness is not health -- a build mismatch must FAIL and carry
+    // the exact remedy.
+    #[test]
+    fn stale_daemon_build_fails_with_the_stop_start_remedy() {
+        let (dir, ws) = healthy_ws("stale-daemon");
+        write_gate_cfg(&dir, "cargo test");
+        let m = healthy_mock(
+            "0.0.7",
+            r#"{"ok":true,"version":"0.0.5","native_version":"present"}"#,
+        );
+        let report = run_with_plugins_dir(&ws, &m, None);
+
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "hayven_daemon_7777")
+            .unwrap();
+        assert!(
+            !c.pass,
+            "a stale daemon must not read as healthy: {}",
+            c.detail
+        );
+        assert!(!report.ok);
+        assert!(c.detail.contains("STALE DAEMON"), "{}", c.detail);
+        assert!(
+            c.detail.contains("0.0.7") && c.detail.contains("0.0.5"),
+            "{}",
+            c.detail
+        );
+        assert!(
+            c.detail
+                .contains("hayven daemon stop && hayven daemon start"),
+            "the exact remedy must be in the message: {}",
+            c.detail
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn matching_daemon_build_passes_and_names_both_versions() {
+        let (dir, ws) = healthy_ws("fresh-daemon");
+        write_gate_cfg(&dir, "cargo test");
+        let m = healthy_mock(
+            "0.0.7",
+            r#"{"ok":true,"version":"0.0.7","native_version":"present"}"#,
+        );
+        let report = run_with_plugins_dir(&ws, &m, None);
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "hayven_daemon_7777")
+            .unwrap();
+        assert!(c.pass, "detail: {}", c.detail);
+        assert!(c.detail.contains("SAME build 0.0.7"), "{}", c.detail);
+        // native_version is surfaced verbatim -- hayven reports "present", not a
+        // version, which is the residual gap this check cannot close.
+        assert!(c.detail.contains("native: present"), "{}", c.detail);
+        assert!(report.ok, "checks: {:?}", report.checks);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Upstream spells the CLI version several ways over time ("0.0.7",
+    // "hayven 0.0.7", "v0.0.7"). A cosmetic reword must not manufacture a
+    // false stale-daemon alarm -- that would train operators to ignore it.
+    #[test]
+    fn version_spelling_differences_are_not_skew() {
+        assert!(same_build("hayven 0.0.7", "0.0.7"));
+        assert!(same_build("v0.0.7", " 0.0.7 "));
+        assert!(!same_build("0.0.7", "0.0.6"));
+    }
+
+    // A daemon that will not say what it is cannot be shown to match the CLI.
+    // Fail-closed: an upgrade-straddling daemon looks EXACTLY like this, and
+    // the cost of guessing wrong is a whole fleet run producing nothing.
+    #[test]
+    fn daemon_that_reports_no_build_is_not_blessed() {
+        let (dir, ws) = healthy_ws("mute-daemon");
+        write_gate_cfg(&dir, "cargo test");
+        // /api/health answers, but without a `version` field.
+        let m = healthy_mock("0.0.7", r#"{"ok":true,"pid":1234}"#);
+        let report = run_with_plugins_dir(&ws, &m, None);
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "hayven_daemon_7777")
+            .unwrap();
+        assert!(!c.pass, "unverifiable build must not pass: {}", c.detail);
+        assert!(
+            c.detail.contains("would not report its build"),
+            "{}",
+            c.detail
+        );
+        assert!(
+            c.detail
+                .contains("hayven daemon stop && hayven daemon start"),
+            "{}",
+            c.detail
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- plugin/CLI version skew (check #8, SF-10) --------------------------
+
+    // Informational by construction: a plain CLI run has no plugin around it
+    // and must never fail doctor for that.
+    #[test]
+    fn plugin_version_outside_a_plugin_context_is_advisory_pass() {
+        let c = plugin_version_check(None, "0.1.1");
+        assert!(c.pass && !c.gating);
+        assert!(c.detail.contains("0.1.1"), "{}", c.detail);
+        assert!(c.detail.contains("CLAUDE_PLUGIN_ROOT"), "{}", c.detail);
+    }
+
+    // SF-10: a plugin fix that shipped WITHOUT a manifest bump leaves users on
+    // a stale cached copy forever. Doctor cannot fix that -- it makes it visible
+    // by printing both versions side by side.
+    #[test]
+    fn plugin_version_reports_the_manifest_version_beside_the_cli() {
+        let root = std::env::temp_dir().join(format!("sirius-pv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".claude-plugin")).unwrap();
+        std::fs::write(
+            root.join(".claude-plugin/plugin.json"),
+            r#"{"name":"sirius","version":"0.2.0"}"#,
+        )
+        .unwrap();
+        let c = plugin_version_check(Some(&root), "0.1.1");
+        assert!(c.pass && !c.gating, "must never gate: {}", c.detail);
+        assert!(c.detail.contains("plugin 0.2.0"), "{}", c.detail);
+        assert!(c.detail.contains("0.1.1"), "{}", c.detail);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plugin_version_with_an_unreadable_manifest_still_never_gates() {
+        let root = std::env::temp_dir().join(format!("sirius-pv-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let c = plugin_version_check(Some(&root), "0.1.1");
+        assert!(c.pass && !c.gating);
+        assert!(c.detail.contains("cannot be seen"), "{}", c.detail);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

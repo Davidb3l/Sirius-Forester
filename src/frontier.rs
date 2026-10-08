@@ -854,7 +854,7 @@ mod tests {
         fn tree(&self, at: &str) -> String {
             let t = self.dir.with_extension("review");
             let _ = std::fs::remove_dir_all(&t);
-            let t_str = t.to_string_lossy().to_string();
+            let t_str = crate::gitrange::git_path(&t);
             self.git(&["worktree", "add", "-q", "--detach", &t_str, at]);
             t_str
         }

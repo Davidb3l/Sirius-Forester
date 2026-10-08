@@ -160,7 +160,12 @@ fn cmd_init(ws: &Workspace, json: bool) -> u8 {
     // Committed-defaults config (M5), only if absent.
     let cfg_path = ws.config_path();
     if !cfg_path.exists() {
-        if let Err(e) = std::fs::write(&cfg_path, Config::default_json()) {
+        // SF-11: pre-fill a DETECTED test command instead of writing
+        // `"test_cmd": null`. A null command makes the very first gate on the
+        // new workspace fail closed — after an agent has already done real work
+        // — and strands the issue in in_progress. Still emits null when nothing
+        // is detectable; `sirius doctor` then fails loudly with the reason.
+        if let Err(e) = std::fs::write(&cfg_path, Config::default_json_for_root(&ws.root)) {
             eprint_err(&format!("cannot write config.json: {e}"));
             return 1;
         }
@@ -558,6 +563,12 @@ fn cmd_gate(
                     "tier": o.tier,
                     "gate": if o.passed { "pass" } else { "fail" },
                     "plan": o.plan,
+                    // SF-11: exit 3 is shared with a genuinely blocked gate, so
+                    // the machine-readable discriminator rides in the envelope
+                    // rather than minting a fourth exit code that every 0/1/2/3
+                    // consumer would misread.
+                    "reason_code": o.reason_code,
+                    "structural": o.structural,
                     "ran_tests": o.ran_tests,
                     "advanced_to": o.advanced_to,
                     "tests_selected": o.tests_selected,
@@ -576,6 +587,13 @@ fn cmd_gate(
                         .map(|s| format!(" → {s}"))
                         .unwrap_or_default()
                 );
+                // SF-11: `FAIL [unconfigured] (0 tests)` reads as a test
+                // failure and tells the operator nothing actionable. The one
+                // case a human cannot act on without help gets the remedy
+                // spelled out. stderr, so stdout consumers are unaffected.
+                if o.reason_code == gate::reason_code::UNCONFIGURED_TEST_CMD {
+                    eprintln!("{}", o.reason);
+                }
             }
             if o.passed {
                 0
@@ -993,6 +1011,27 @@ fn cmd_run(
         eprint_err(&e);
         return 2;
     }
+    // SF-14: every worker spawns --agent-cmd per claimed issue. When its
+    // program is not on PATH no agent can ever start, and the fleet claims
+    // issues only to release every one. That is the NORMAL state of a Claude
+    // Code desktop or web session (no `claude` binary on PATH) — exactly where
+    // the documented launch was being tried. Refuse up front and name the way
+    // forward. A command too dynamic to read statically is let through
+    // (`agent_program` returns None): a false "not found" would refuse a
+    // perfectly good fleet.
+    if let Some(prog) = shell::agent_program(agent_cmd) {
+        if shell::find_program(&prog).is_none() {
+            eprint_err(&format!(
+                "--agent-cmd runs `{prog}`, which is not on PATH — no worker could start \
+                 an agent, so the fleet would claim issues only to release every one. In a \
+                 Claude Code desktop or web session there is usually no agent CLI on PATH: \
+                 drive iterations by hand instead (the sirius skill's solo mode — claim → \
+                 map → lock → brief → work → gate → receipt → release), or install the \
+                 agent CLI and rerun"
+            ));
+            return 2;
+        }
+    }
     for m in models::named_models(&cfg.models) {
         if models::looks_like_alias(&m) {
             eprint_err(&format!(
@@ -1103,7 +1142,11 @@ fn cmd_run(
     let mut assignments: Vec<(String, std::path::PathBuf)> = Vec::new();
     for name in &names {
         let wt_path = worktrees_root.join(name.replace('/', "-"));
-        let wt_str = wt_path.to_string_lossy().to_string();
+        // NOT `to_string_lossy()`: the workspace root is canonicalized, so on
+        // Windows this path carries the `\\?\` verbatim prefix, which git
+        // rewrites to `//?/C:/...` and then cannot create. That failed every
+        // worker at the worktree step — no fleet on Windows at all (SF-16).
+        let wt_str = gitrange::git_path(&wt_path);
         // Clear any stale worktree left by a killed run, then create fresh.
         let _ = repo_runner.run("git", &["worktree", "remove", "--force", &wt_str]);
         let _ = std::fs::remove_dir_all(&wt_path);
@@ -1122,6 +1165,9 @@ fn cmd_run(
 
     let iterations = std::sync::atomic::AtomicU32::new(0);
     let any_failed = std::sync::atomic::AtomicBool::new(false);
+    // SF-14: did ANY worker find work? `iterations` cannot say — it only
+    // counts when --max-iterations is set.
+    let claimed_any = std::sync::atomic::AtomicBool::new(false);
     let ledger_path = ws.ledger_path();
     // SIRF-26: one pause flag for the whole fleet (a usage limit stops all).
     let pause: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
@@ -1173,6 +1219,7 @@ fn cmd_run(
                     max_iterations,
                     &iterations,
                     &any_failed,
+                    &claimed_any,
                     &spine,
                 );
             });
@@ -1181,7 +1228,9 @@ fn cmd_run(
     // Tear the worktrees down; completed work is safe — each issue's commits
     // live on its `sirius/<issue>` branch in the SHARED .git.
     for (_, wt_path) in &assignments {
-        let wt_str = wt_path.to_string_lossy().to_string();
+        // Same verbatim-prefix hazard as creation above: a teardown git could
+        // not read the path either, leaving orphaned worktrees behind.
+        let wt_str = gitrange::git_path(wt_path);
         let _ = repo_runner.run("git", &["worktree", "remove", "--force", &wt_str]);
     }
     let _ = std::fs::remove_file(&lock_path);
@@ -1211,7 +1260,47 @@ fn cmd_run(
         });
         return 4;
     }
+    // SF-14: name where the work is parked when `--from` found none of it.
+    // Without --from, amt claims from every claimable stage, so there is
+    // nowhere else for work to hide and nothing to say.
+    if let Some(from) = from.as_deref() {
+        if !claimed_any.load(std::sync::atomic::Ordering::SeqCst) {
+            let amt = Amt::new(&repo_runner);
+            let searched: Vec<&str> = from.split(',').map(str::trim).collect();
+            let parked: Vec<(&str, usize)> = ["backlog", "todo"]
+                .into_iter()
+                .filter(|stage| !searched.contains(stage))
+                .map(|stage| {
+                    let n = amt.issue_list_status(stage).map(|v| v.len());
+                    (stage, n.unwrap_or(0))
+                })
+                .collect();
+            if let Some(hint) = no_work_hint(from, &parked) {
+                eprint_err(&hint);
+            }
+        }
+    }
     u8::from(any_failed.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// SF-14: a run that claimed nothing exited silently, which reads as "the board
+/// is done" — even when every issue was simply parked in a stage `--from`
+/// excluded (the documented launch says `--from todo`, and a fresh board is all
+/// backlog). Name where the work actually is. Pure over the per-stage counts so
+/// it is testable without a board; `None` when nothing is parked elsewhere.
+fn no_work_hint(from: &str, parked: &[(&str, usize)]) -> Option<String> {
+    let waiting: Vec<String> = parked
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(stage, n)| format!("{n} in {stage}"))
+        .collect();
+    if waiting.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "no claimable work in `{from}`, but {} — move it to `{from}`, or pass --from with that stage",
+        waiting.join(", ")
+    ))
 }
 
 /// `sirius run`'s model flags (SIRF-26).
@@ -1312,6 +1401,7 @@ fn worker_loop(
     max_iterations: u32,
     iterations: &std::sync::atomic::AtomicU32,
     any_failed: &std::sync::atomic::AtomicBool,
+    claimed_any: &std::sync::atomic::AtomicBool,
     spine: &spine::Spine,
 ) {
     use std::sync::atomic::Ordering;
@@ -1375,6 +1465,9 @@ fn worker_loop(
             Some(spine),
             Some(fleet),
         );
+        if !matches!(outcome, run::IterationOutcome::NoWork { .. }) {
+            claimed_any.store(true, Ordering::SeqCst);
+        }
         match outcome {
             run::IterationOutcome::NoWork { retry_after } => {
                 // An idle probe did no work — refund its budget slot so
@@ -1568,6 +1661,12 @@ mod tests {
         assert!(regex_is_issue("GRA-12"));
         assert!(regex_is_issue("SIRF-23"));
         assert!(regex_is_issue("BC9-1"));
+        // SF-12: the prefix is workspace-configurable — every one of these must
+        // reach the ISSUE reader, not the symbol reader.
+        assert!(regex_is_issue("AJ-8"));
+        assert!(regex_is_issue("SF-12"));
+        // Decisions keep their own single-letter namespace.
+        assert!(!regex_is_issue("D-1"));
         assert!(!regex_is_issue("some::symbol"));
         assert!(!regex_is_issue("src/review/glob_regex"));
         assert!(!regex_is_issue("AMT-7-extra"));
@@ -1577,6 +1676,23 @@ mod tests {
         );
         assert!(!regex_is_issue("D-3"), "a decision ref is not an issue");
         assert!(!regex_is_issue("src/a-1"));
+    }
+
+    /// SF-14 field case: the documented launch says `--from todo`, a fresh
+    /// board is all backlog, and the run used to exit silently — read as done.
+    #[test]
+    fn no_work_hint_names_where_the_work_is_parked() {
+        let hint = no_work_hint("todo", &[("backlog", 12)]).expect("work is parked");
+        assert!(hint.contains("`todo`"), "{hint}");
+        assert!(hint.contains("12 in backlog"), "{hint}");
+        assert!(hint.contains("--from"), "{hint}");
+    }
+
+    /// A genuinely empty board has nothing to report — no false alarm.
+    #[test]
+    fn no_work_hint_is_silent_when_nothing_is_parked() {
+        assert_eq!(no_work_hint("todo", &[("backlog", 0)]), None);
+        assert_eq!(no_work_hint("todo,backlog", &[]), None);
     }
 
     /// SUITE_CONTRACTS §3.1: under `--json`, an unhealthy-but-speaking tool

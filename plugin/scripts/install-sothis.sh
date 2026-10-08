@@ -30,8 +30,11 @@
 # automatically) or pass --skip-hayven and run /hayvenhurst:install-binary
 # yourself if you'd rather not run a fetched script at all.
 #
-# Idempotent + safe to re-run: anything already on PATH is left alone. POSIX sh
-# (macOS / Linux). Windows: install each tool from its release tarball manually.
+# Idempotent + safe to re-run: anything already on PATH is left alone. POSIX sh,
+# covering macOS, Linux AND Windows under Git Bash / MSYS2 / Cygwin — nothing in
+# this script's own preamble is OS-gated, and the delegated installers handle
+# the MINGW*/MSYS*/CYGWIN* uname themselves (sirius pulls the windows-x64
+# asset and installs sirius.exe). PowerShell-only shells: use install-sirius.ps1.
 #
 # Usage:
 #   install-sothis.sh                   # install every missing suite CLI
@@ -98,6 +101,14 @@ BIN_DIR="$PREFIX/bin"
 # regardless of the caller's cwd.
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
+# Windows (Git Bash / MSYS2 / Cygwin). Nothing here refuses to run there — this
+# only picks the right on-disk binary name and the right PATH advice.
+IS_WINDOWS=0
+EXE=""
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) IS_WINDOWS=1; EXE=".exe" ;;
+esac
+
 log()  { printf '%s\n' "$*" >&2; }
 fail() { log "install-sothis: error: $*"; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -114,12 +125,13 @@ fetch() { # fetch <url> <dest>
 }
 
 # A CLI counts as installed if it's on PATH or sitting in our install dir.
+# $EXE is ".exe" on Windows, empty elsewhere, so the same call works on both.
 tool_present() { # tool_present <bin>
-  have "$1" || [ -x "$BIN_DIR/$1" ]
+  have "$1" || [ -x "$BIN_DIR/$1$EXE" ]
 }
 
 tool_where() { # tool_where <bin> -> human location on stdout
-  if have "$1"; then command -v "$1"; elif [ -x "$BIN_DIR/$1" ]; then echo "$BIN_DIR/$1 (not on PATH)"; else echo "not installed"; fi
+  if have "$1"; then command -v "$1"; elif [ -x "$BIN_DIR/$1$EXE" ]; then echo "$BIN_DIR/$1$EXE (not on PATH)"; else echo "not installed"; fi
 }
 
 # ---- the plugin half (the audited drop-off) ---------------------------------
@@ -146,6 +158,49 @@ plugin_handoff_missing() { # -> " item," list on stdout; empty = complete
   printf '%s' "${pm_missing%,}"
 }
 
+# ---- the SSH-clone trap ------------------------------------------------------
+# Observed on a real Windows box (2026-08-24): `claude plugin install` clones a
+# git-subdir plugin source over SSH. On an HTTPS-only machine that fails first
+# with "No ED25519 host key is known" (strict host checking) and then, once host
+# keys exist, with "Permission denied (publickey)". Note the asymmetry:
+# `claude plugin marketplace add` DOES fall back to HTTPS, `plugin install` does
+# NOT — and this bundle's .claude-plugin/marketplace.json declares hayvenhurst
+# with "source": "git-subdir", exactly the plugin type that fails.
+#
+# This used to be swallowed by `>/dev/null 2>&1`, leaving the user with a bare
+# YOU ARE NOT DONE block, no cause and no fix. So: capture, surface, and when it
+# smells like SSH, print the verified workaround as a ready-to-paste command.
+SSH_FAILURE_SEEN=0
+
+plugin_out_is_ssh_failure() { # plugin_out_is_ssh_failure <captured output>
+  printf '%s\n' "$1" | grep -Eq \
+    'Permission denied \(publickey\)|host key is known|Host key verification failed|ssh: connect|git@github\.com'
+}
+
+log_indented() { # log_indented <captured output>
+  [ -n "$1" ] || return 0
+  printf '%s\n' "$1" | sed 's/^/      /' >&2
+}
+
+# The verified workaround: an env-scoped URL rewrite. It lives only in the
+# environment of the one command, so the user's git config is never touched.
+print_ssh_workaround() { # print_ssh_workaround <command to re-run>
+  SSH_FAILURE_SEEN=1
+  log ""
+  log "  ^ that is the SSH-clone failure: 'claude plugin install' clones"
+  log "    git-subdir plugin sources over SSH, and this machine has no usable"
+  log "    GitHub SSH key. ('claude plugin marketplace add' falls back to HTTPS;"
+  log "    'plugin install' does not.) Re-run it with an env-scoped rewrite that"
+  log "    sends git over HTTPS instead — copy-paste this whole thing:"
+  log ""
+  log "      GIT_CONFIG_COUNT=1 \\"
+  log "      GIT_CONFIG_KEY_0=url.https://github.com/.insteadOf \\"
+  log "      GIT_CONFIG_VALUE_0=git@github.com: \\"
+  log "      $1"
+  log ""
+  log "    It is scoped to that one command; nothing in your git config changes."
+}
+
 # Auto-install the plugin half when possible. Claude Code v2.1.195+ ships a
 # NON-interactive `claude plugin` CLI, so this script can finish the handoff
 # itself instead of printing homework. Guarded three ways: the kill-switch
@@ -162,18 +217,31 @@ attempt_plugin_autoinstall() {
   log ""
   log "install-sothis: finishing the plugin half via the claude CLI (non-interactive)"
   case "$ph" in *bundle-marketplace*)
-    if claude plugin marketplace add Davidb3l/Sirius-Forester </dev/null >/dev/null 2>&1; then
+    # stdin stays redirected from /dev/null so a prompting CLI can never block;
+    # 2>&1 into the capture so the reason survives instead of going to /dev/null.
+    if mp_out="$(claude plugin marketplace add Davidb3l/Sirius-Forester </dev/null 2>&1)"; then
       log "  added marketplace: sirius-forester"
     else
-      log "  marketplace add failed (claude CLI too old? needs v2.1.195+) — see below"
+      log "  marketplace add failed (claude CLI too old? needs v2.1.195+) — it said:"
+      log_indented "$mp_out"
+      if plugin_out_is_ssh_failure "$mp_out"; then
+        print_ssh_workaround "claude plugin marketplace add Davidb3l/Sirius-Forester"
+      fi
+      log "  (routes to finish it by hand are in the block below)"
     fi ;;
   esac
   for p in sirius hayvenhurst catryna; do
     case "$ph" in *" $p-plugin"*|"$p-plugin"*)
-      if claude plugin install "$p@sirius-forester" </dev/null >/dev/null 2>&1; then
+      if pi_out="$(claude plugin install "$p@sirius-forester" </dev/null 2>&1)"; then
         log "  installed plugin: $p@sirius-forester"
       else
-        log "  $p plugin install failed — see below"
+        log "  $p plugin install failed — it said:"
+        log_indented "$pi_out"
+        if plugin_out_is_ssh_failure "$pi_out"; then
+          print_ssh_workaround "claude plugin install $p@sirius-forester"
+        else
+          log "  (routes to finish it by hand are in the block below)"
+        fi
       fi ;;
     esac
   done
@@ -213,6 +281,12 @@ print_plugin_handoff_block() {
   case "$ph" in *" sirius-plugin"*|"sirius-plugin"*) log "       claude plugin install sirius@sirius-forester" ;; esac
   case "$ph" in *hayvenhurst-plugin*) log "       claude plugin install hayvenhurst@sirius-forester" ;; esac
   case "$ph" in *catryna-plugin*)     log "       claude plugin install catryna@sirius-forester" ;; esac
+  if [ "$SSH_FAILURE_SEEN" = "1" ]; then
+    log ""
+    log "     This machine hit the SSH-clone failure above, so those commands need"
+    log "     the HTTPS rewrite in front of them, e.g. on one line:"
+    log "       GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=url.https://github.com/.insteadOf GIT_CONFIG_VALUE_0=git@github.com: claude plugin install hayvenhurst@sirius-forester"
+  fi
   log ""
   log "  b) Claude DESKTOP APP (no terminal): click + next to the prompt box"
   log "     -> Plugins -> Add plugin -> add the Davidb3l/Sirius-Forester"
@@ -343,11 +417,28 @@ check_amt() {
   fi
   log ""
   log "amt (Ametrite, the board): not installed. It's a Rust binary, and this"
-  log "one-shot deliberately does NOT clone or build it for you. Get it by"
-  log "asking Claude Code to \"ametrite this repo\" (the ametrite skill bootstraps"
-  log "the amt CLI), or build it yourself:"
-  log "  git clone https://github.com/$AMETRITE_REPO.git && cd $(basename "$AMETRITE_REPO") && cargo build --release"
-  log "  ln -sf \"\$PWD/target/release/amt\" \"$BIN_DIR/amt\""
+  log "one-shot deliberately does NOT clone or build it for you. Any of:"
+  log ""
+  log "  a) ask Claude Code to \"ametrite this repo\" — the ametrite skill"
+  log "     bootstraps the amt CLI for you."
+  if [ "$IS_WINDOWS" = "1" ]; then
+    log ""
+    log "  b) download the prebuilt Windows binary (Ametrite v0.2.0+):"
+    log "       https://github.com/$AMETRITE_REPO/releases"
+    log "     grab amt-x86_64-pc-windows-msvc.zip (its .sha256 is published"
+    log "     beside it — check it), unzip, and put amt.exe in $BIN_DIR"
+    log ""
+    log "  c) build it yourself:"
+  else
+    log ""
+    log "  b) prebuilt binaries are published on the releases page — including"
+    log "     amt-x86_64-pc-windows-msvc.zip for Windows (Ametrite v0.2.0+):"
+    log "       https://github.com/$AMETRITE_REPO/releases"
+    log ""
+    log "  c) build it yourself:"
+  fi
+  log "       git clone https://github.com/$AMETRITE_REPO.git && cd $(basename "$AMETRITE_REPO") && cargo build --release"
+  log "       ln -sf \"\$PWD/target/release/amt\" \"$BIN_DIR/amt\""
 }
 
 # ---- catryna (a plugin; verify its bun runtime) ----------------------------
@@ -390,13 +481,31 @@ check_amt
 check_catryna
 check_pingmybell
 
-# PATH hint if our install dir isn't on PATH.
+# PATH hint if our install dir isn't on PATH. On Windows this is the common
+# case — ~/.local/bin is a Unix convention nothing on Windows adds — so print
+# the permanent fix too. We never mutate the user's PATH from this script.
 case ":$PATH:" in
   *":$BIN_DIR:"*) : ;;
   *)
     log ""
-    log "note: $BIN_DIR is not on your PATH. Add it, e.g.:"
-    log "      export PATH=\"$BIN_DIR:\$PATH\"   # add to ~/.zshrc or ~/.bashrc"
+    log "note: $BIN_DIR is not on your PATH."
+    if [ "$IS_WINDOWS" = "1" ]; then
+      log ""
+      log "  This shell only (Git Bash):"
+      log "      export PATH=\"$BIN_DIR:\$PATH\"   # add to ~/.bashrc to persist it here"
+      log ""
+      log "  Permanently, for ALL of Windows (PowerShell, cmd, editors, Claude Code)"
+      log "  — run this ONCE in PowerShell, then close and reopen your shells:"
+      log ""
+      log "      [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','User') + ';' + \"\$env:USERPROFILE\\.local\\bin\", 'User')"
+      log ""
+      log "  That one-liner appends the DEFAULT prefix (%USERPROFILE%\\.local\\bin)."
+      log "  You installed into: $BIN_DIR"
+      log "  If those differ, substitute the Windows form of the path above."
+      log "  Already-running shells, editors and apps must be RESTARTED to see it."
+    else
+      log "      export PATH=\"$BIN_DIR:\$PATH\"   # add to ~/.zshrc or ~/.bashrc"
+    fi
     ;;
 esac
 
@@ -408,7 +517,7 @@ log "install-sothis: CLI half done."
 # doctor error out.
 if tool_present sirius; then
   SIRIUS_BIN="sirius"
-  have sirius || SIRIUS_BIN="$BIN_DIR/sirius"
+  have sirius || SIRIUS_BIN="$BIN_DIR/sirius$EXE"
   if [ -d .sirius ]; then
     log "install-sothis: running sirius doctor"
     "$SIRIUS_BIN" doctor || true

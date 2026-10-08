@@ -9,8 +9,9 @@ description: >-
   on this repo", or otherwise asks for all the tools at once (not just Sirius).
   Two halves IN ORDER: the marketplace bundle's plugins first (Claude runs the
   non-interactive `claude plugin` CLI itself — works from a cold start), then
-  the install-sothis.sh one-shot for the CLIs — which auto-installs and
-  verifies any remaining plugin half. To install ONLY the
+  the install-sothis one-shot for the CLIs (install-sothis.sh on macOS/Linux/Git
+  Bash, install-sothis.ps1 on native Windows PowerShell) — which auto-installs
+  and verifies any remaining plugin half. To install ONLY the
   sirius binary, use /sirius:install-binary; to just RUN the foreman once it's
   installed, that's the `sirius` skill.
 ---
@@ -56,6 +57,30 @@ A plugin already installed from its own standalone marketplace
 `claude plugin list` and skip what's present. (Ametrite has no plugin here —
 its `amt` CLI comes from the ametrite skill and Half 2, not from a plugin.)
 
+**If a `plugin install` fails with an SSH error, you can self-repair — don't
+report a dead end.** Symptoms: `No ED25519 host key is known for github.com`, or
+`Permission denied (publickey)`. Cause: `git-subdir` plugin sources (this
+bundle's `hayvenhurst` entry is one) are cloned over SSH, and unlike
+`marketplace add`, `plugin install` does **not** fall back to HTTPS — so it
+fails on any machine without a GitHub SSH key. Re-run the exact command that
+failed with git's env-scoped URL rewrite in front of it (nothing on disk
+changes):
+
+```bash
+GIT_CONFIG_COUNT=1 \
+GIT_CONFIG_KEY_0=url.https://github.com/.insteadOf \
+GIT_CONFIG_VALUE_0=git@github.com: \
+claude plugin install hayvenhurst@sirius-forester
+```
+
+```powershell
+$env:GIT_CONFIG_COUNT=1; $env:GIT_CONFIG_KEY_0='url.https://github.com/.insteadOf'; $env:GIT_CONFIG_VALUE_0='git@github.com:'
+claude plugin install hayvenhurst@sirius-forester
+```
+
+Repeat for each plugin that failed, then re-verify with `claude plugin list`.
+The Half 2 installers print this same command when they detect the failure.
+
 Fallbacks, only if the `claude` CLI is missing or too old for non-interactive
 plugin commands: tell the human to use the desktop app's plugin browser
 (**+** next to the prompt box → Plugins → Add plugin), or the interactive
@@ -68,21 +93,42 @@ session may need a restart to see newly installed plugins.
 Run the bundled one-shot installer. It's idempotent (anything already installed
 is left alone) and delegates each binary to that tool's own authoritative,
 security-reviewed installer — it never re-implements a download or a signature
-check:
+check.
+
+It ships in two equivalent forms — same order, same delegation, same
+verification. **Pick by shell, not by OS branding:** if `sh` / `bash` resolves
+(macOS, Linux, or Windows under Git Bash / MSYS2 / WSL), run the `.sh`;
+otherwise, on native Windows PowerShell, run the `.ps1`. A stock Windows box has
+no Git Bash — don't detour the human into installing one.
 
 ```bash
+# POSIX: macOS, Linux, Git Bash
 "${CLAUDE_PLUGIN_ROOT}/scripts/install-sothis.sh"
 ```
 
-What it does, in order:
+```powershell
+# Native Windows PowerShell (no POSIX shell needed)
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_PLUGIN_ROOT}/scripts/install-sothis.ps1"
+```
 
-1. **sirius** — installs via the bundled `install-sirius.sh` (verifies a Sigstore
-   signature; a bad or missing signature aborts).
-2. **hayven** — installs via Hayvenhurst's own `install-hayven.sh` (verifies a
-   sha256). It prefers a copy already on disk from an installed Hayvenhurst
-   plugin, and only falls back to fetching that script over HTTPS from the
-   Hayvenhurst repo. If you'd rather install hayven through its plugin, pass
-   `--skip-hayven` and run `/hayvenhurst:install-binary`.
+Flags translate to PowerShell switch form: `--skip-hayven` → `-SkipHayven`,
+`--skip-amt` → `-SkipAmt`, `--skip-plugins` → `-SkipPlugins`,
+`--require-signature` → `-RequireSignature`, `--check` → `-Check`,
+`--prefix DIR` → `-Prefix DIR`. Don't pass the POSIX spellings to the `.ps1`.
+(`-ExecutionPolicy Bypass` is scoped to that one process so the bundled script
+can run at all; it changes no checksum or signature check.)
+
+What it does, in order (identical on both paths):
+
+1. **sirius** — installs via the bundled `install-sirius.sh` (or
+   `install-sirius.ps1` from the PowerShell one-shot; both verify a Sigstore
+   signature — a bad or missing signature aborts).
+2. **hayven** — installs via Hayvenhurst's own `install-hayven.sh` /
+   `install-hayven.ps1` (verifies a sha256). It prefers a copy already on disk
+   from an installed Hayvenhurst plugin, and only falls back to fetching that
+   script over HTTPS from the Hayvenhurst repo. If you'd rather install hayven
+   through its plugin, pass `--skip-hayven` (`-SkipHayven`) and run
+   `/hayvenhurst:install-binary`.
 3. **amt** — detected only. If missing, the script prints how to get it; the
    fastest path is asking Claude to **"ametrite this repo"** (the ametrite skill
    bootstraps `amt`). It deliberately does not clone or `cargo build` for you.
@@ -108,8 +154,9 @@ app's + → Plugins browser) and re-verify. **Never** work around a
 
 ## Done when
 
-- `install-sothis.sh --check` reports `sirius` and `hayven` present (exit 0),
-  `amt` + `bun` present, and **`claude code plugin half: complete`**.
+- `install-sothis.sh --check` (or `install-sothis.ps1 -Check`) reports `sirius`
+  and `hayven` present (exit 0), `amt` + `bun` present, and **`claude code
+  plugin half: complete`**.
 - `sirius doctor` is clean in a repo with a `.sirius/` workspace (run `sirius
   init` first if there isn't one) — including no `plugin_handoff` warning.
 

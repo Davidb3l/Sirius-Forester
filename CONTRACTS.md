@@ -141,9 +141,16 @@ sirius init                 -> {"ok":true,"ledger":".sirius/sirius.db","schema_v
 sirius doctor --json        -> {"ok":bool,"checks":[{"name":str,"pass":bool,"detail":str}, ...]}
                                # the five §6 contract facts: amt present+schema, hayven daemon,
                                # claim exit-code semantics, gate exit codes, fleet-memory write path
+                               # + gate_configured (GATING: fails while gate.test_cmd is null — SF-11).
+                               # hayven_daemon_7777 compares the daemon's BUILD (/api/health "version")
+                               # to the CLI's and fails on skew (SF-13). Advisory checks (plugin_handoff,
+                               # fleet_models, integration, plugin_version) never affect "ok".
 
 sirius link AMT-7 --symbols a,b,c [--changed [--range <git-range>]] --json
    # --changed resolves files → entities by PATH (hayven affected-tests roots);
+   # with no --range and a CLEAN tree it diffs HEAD~1..HEAD — the commit just made,
+   # so the documented order (work → gate → commit → receipt) files a receipt (SF-12);
+   # an explicit --range is never second-guessed.
    # the --json object also carries "changed_files": int|null
    -> {"ok":true,"receipt_id":12,"kind":"issue","ref":"AMT-7",
        "symbols":["a","b","c"],"forward_ok":true,"reverse_ok":true}
@@ -160,10 +167,17 @@ sirius why AMT-7 --json     -> {"ref":"AMT-7","symbols":[str],"decisions":[str],
 sirius gate AMT-7 [--tier safe] [--target-status in_review] [--range <git-range>] --json
    -> {"ok":bool,"issue":"AMT-7","tier":"safe","gate":"pass|fail",
        "plan":"subset(n)|full-suite|blocked|pass-with-warning|unconfigured",
+       "reason_code":"pass|tests_failed|blocked_by_policy|passed_without_tests|unconfigured_test_cmd|shell_spawn_failed",
+       "structural":bool,
        "ran_tests":bool,"advanced_to":"in_review"|null,
        "tests_selected":int,"comment_filed":bool}
    # Selects affected tests over the changed files, then RUNS them via
    # gate.test_cmd (full suite on any doubt); verdict = the runner's exit code.
+   # Exit 3 covers EVERY non-pass, including an unconfigured workspace; "reason_code"
+   # tells them apart (SF-11), "structural":true = no retry can change the verdict.
+   # gate.test_cmd runs through an EXPLICIT shell, never the launcher's (SF-15):
+   # $SIRIUS_SHELL if set; else /bin/sh -c on unix; else the first sh.exe on PATH;
+   # else %ComSpec% /C.
 
 sirius escape <ISSUE> --kind <slug> -m "<what escaped>" [--found-by <who>] [--fix <commit>] [--json]
    -> {"ok":true,"id":int,"issue":str,"kind":str,"kind_count":int,"unretired":str|null,"nudge":str|null}
@@ -244,6 +258,11 @@ sirius run --workers N --agent-cmd "<cmd>" [--from todo] [--review-cmd "<cmd>"]
    # work/fix events carry "model" and "tier":"primary|fallback"
    # claim events carry "model" (this ticket's worker model) and "review_model"
    # exit 2 when no worker model resolves (unless --allow-default-model / models.allow_default);
+   # exit 2 also when --agent-cmd's program is not on PATH (SF-14) — a command too dynamic to
+   # read statically ($VAR, $(…), {model}, a builtin) is let through rather than refused.
+   # --agent-cmd runs through the same explicit shell as gate.test_cmd (SF-15); the reviewer
+   # stays on `sh -c` (its script is sirius-built POSIX). --from omitted = todo AND backlog;
+   # a run under --from that claimed nothing names the parked work on stderr.
    # exit 3 = refused to launch: integration red with integration.on_fail "block" (SIRF-32)
    # exit 4 = PAUSED: a fleet stop with nowhere to fall back — a usage/plan limit or an
    # unsupported model on the fallback tier (or with no fallback), or a logged-out CLI

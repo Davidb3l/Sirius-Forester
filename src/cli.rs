@@ -114,6 +114,11 @@ pub enum Command {
     Run {
         #[arg(long, default_value_t = 1)]
         workers: u32,
+        /// Shell command each worker runs per claimed issue (e.g. `claude -p
+        /// "…"`). Its program must be on PATH — `run` refuses to start (exit 2)
+        /// when it is not. A Claude Code desktop or web session usually has no
+        /// agent CLI on PATH: drive iterations by hand instead (sirius skill,
+        /// solo mode).
         #[arg(long)]
         agent_cmd: String,
         /// Restrict claimable stages (e.g. todo, backlog).

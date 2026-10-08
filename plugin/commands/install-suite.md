@@ -1,7 +1,7 @@
 ---
 description: Install the whole Sothis suite in one shot — the sirius + hayven CLIs (and a check for amt + catryna/bun), verified by each tool's own installer, running `sirius doctor` and ending with a verification of the Claude Code plugin half. Use for "let's Sothis this up" / installing the full fleet, not just sirius.
 argument-hint: "[--skip-hayven] [--skip-amt] [--require-signature]"
-allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/scripts/install-sothis.sh:*)
+allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/scripts/install-sothis.sh:*), Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File ${CLAUDE_PLUGIN_ROOT}/scripts/install-sothis.ps1:*)
 ---
 
 # Install the Sothis suite
@@ -16,7 +16,15 @@ Run the bundled one-shot. It installs every missing suite CLI by delegating to
 each tool's own authoritative installer (sirius verifies a Sigstore signature,
 hayven verifies a sha256), detects `amt` (guiding you to the ametrite skill if
 missing — it never auto-builds), checks `bun` for Catryna, then runs
-`sirius doctor`:
+`sirius doctor`.
+
+Two one-shots ship side by side — same order, same delegation, same
+verification. **Pick by shell, not by OS branding:** if `sh` / `bash` resolves
+(macOS, Linux, or Windows under Git Bash / MSYS2 / WSL), run the `.sh`;
+otherwise, on native Windows PowerShell, run the `.ps1`. A stock Windows box has
+no Git Bash — do not send the user off to install one.
+
+### POSIX (macOS / Linux / Git Bash)
 
 ```sh
 "${CLAUDE_PLUGIN_ROOT}/scripts/install-sothis.sh" $ARGUMENTS
@@ -26,7 +34,30 @@ Forward any flags the user passed (`--skip-hayven`, `--skip-amt`,
 `--require-signature`, `--prefix DIR`) verbatim as `$ARGUMENTS`. If none were
 passed, run it with no arguments.
 
-After it finishes:
+### Windows PowerShell
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_PLUGIN_ROOT}/scripts/install-sothis.ps1"
+```
+
+Translate any flags the user passed into their PowerShell switch form and
+append them — do NOT pass the POSIX spellings through verbatim, they will be
+rejected:
+
+| POSIX | PowerShell |
+| --- | --- |
+| `--skip-hayven` | `-SkipHayven` |
+| `--skip-amt` | `-SkipAmt` |
+| `--skip-plugins` | `-SkipPlugins` |
+| `--require-signature` | `-RequireSignature` |
+| `--check` | `-Check` |
+| `--prefix DIR` | `-Prefix DIR` |
+
+`-ExecutionPolicy Bypass` is scoped to this one process and only allows the
+bundled script to run at all; it changes nothing about the checksum and
+signature verification the delegated installers perform.
+
+After it finishes (either path):
 
 - **Honor the plugin-half verdict — it is checked, not assumed.** The script
   ends by AUTO-INSTALLING any missing Claude Code plugin half via the

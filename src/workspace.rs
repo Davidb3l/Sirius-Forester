@@ -116,18 +116,30 @@ mod tests {
         // discover_bounded: these tests pin discovery MECHANICS; `discover`
         // itself additionally canonicalizes (macOS /var → /private/var), which
         // would make raw-path equality here compare different spellings.
-        let ws = Workspace::discover_bounded(&nested, None);
+        // The bound is the test's own temp dir — see `tempdir` for why a
+        // `None` bound here is a test-isolation trap, not a stricter test.
+        let ws = Workspace::discover_bounded(&nested, Some(&tmp));
         assert_eq!(ws.root, repo);
         assert_eq!(ws.sirius_dir(), repo.join(".sirius"));
         assert!(ws.ametrite_db.is_some());
+        // Nothing in the fixture has a `.hayven/`; with the walk fenced at the
+        // fixture root this is genuinely absent rather than "whatever the
+        // developer's real home happens to contain".
+        assert!(ws.hayven_dir.is_none());
     }
 
     #[test]
     fn falls_back_to_cwd_without_ametrite() {
         let tmp = tempdir();
-        let ws = Workspace::discover_bounded(&tmp, None);
-        assert_eq!(ws.root, tmp);
+        // Start one level BELOW the bound so the walk actually runs (and finds
+        // nothing) instead of returning at the first `d == home` check.
+        let repo = tmp.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+
+        let ws = Workspace::discover_bounded(&repo, Some(&tmp));
+        assert_eq!(ws.root, repo);
         assert!(ws.ametrite_db.is_none());
+        assert!(ws.hayven_dir.is_none());
     }
 
     // The 2026-08-05 defect: ~/.ametrite and ~/.hayven are the parents' GLOBAL
@@ -171,11 +183,38 @@ mod tests {
         let repo = tmp.join("repo");
         fs::create_dir_all(&repo).unwrap();
         fs::write(repo.join(".hayven"), b"not a dir").unwrap();
-        let ws = Workspace::discover_bounded(&repo, None);
-        assert!(ws.hayven_dir.is_none());
+
+        // Bound at the fixture root: `repo` itself IS still examined (the
+        // `d == home` check fires one level up), so the file-vs-dir rejection
+        // is what this asserts — not the fence. Unbounded, this test walked out
+        // of the temp dir and adopted the developer's real `~/.hayven`, which
+        // the hayven daemon creates for multi-repo serving: it failed for every
+        // user who had ever started the daemon while the product code was
+        // correct all along.
+        let ws = Workspace::discover_bounded(&repo, Some(&tmp));
+        assert!(
+            ws.hayven_dir.is_none(),
+            "a FILE named .hayven must never be adopted as a workspace"
+        );
+
+        // Positive control, same fence, same starting dir: swap the file for a
+        // directory and discovery must find it. Without this, the assertion
+        // above could pass for the wrong reason (a fence that hid everything)
+        // and the test would silently stop testing `want_dir` at all.
+        fs::remove_file(repo.join(".hayven")).unwrap();
+        fs::create_dir_all(repo.join(".hayven")).unwrap();
+        let ws = Workspace::discover_bounded(&repo, Some(&tmp));
+        assert_eq!(ws.hayven_dir, Some(repo.join(".hayven")));
     }
 
     /// Minimal unique temp dir without pulling in the `tempfile` crate.
+    ///
+    /// Every test here passes this directory as the `$HOME` bound. That is not
+    /// decoration: `walk_up` climbs until it hits the bound, so a `None` bound
+    /// lets a test escape `%TEMP%`/`/tmp` and inspect whatever the machine
+    /// happens to have above it — and `~/.hayven` and `~/.ametrite` are exactly
+    /// what real users accumulate. Fencing at the fixture root makes these
+    /// tests depend only on files the test itself created.
     fn tempdir() -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);

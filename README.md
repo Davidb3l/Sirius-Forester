@@ -1,9 +1,18 @@
 # Sirius Forester
 
-**A local-first foreman for AI coding agents: it claims tasks from a local issue
-tracker, locks the code each task touches, runs your agent, refuses to mark
-anything done until the affected tests pass, and files a two-way receipt linking
-every change to the decision behind it.**
+**Sirius Forester is the foreman of the Sothis suite — a local-first fleet
+orchestrator for Claude Code and other AI coding agents: it claims tasks from a
+local issue tracker, locks the code each task touches, runs your agent, refuses
+to mark anything done until the affected tests pass, and files a two-way receipt
+linking every change to the decision behind it.**
+
+> **Part of the [Sothis suite](https://github.com/Davidb3l/Sothis)** — the
+> local-first fleet for Claude Code agents:
+> **Sirius Forester** (foreman) ·
+> [Hayvenhurst](https://hayvenhurst.dev) (code graph) ·
+> [Ametrite](https://ametrite.com) (board) ·
+> [Catryna Wikinelli](https://catrynawiki.com) (docs) ·
+> [PingMyBell](https://github.com/Davidb3l/pingmybell) (the bell)
 
 Website & docs: **[siriusforester.com](https://siriusforester.com)** ·
 [Getting started](https://siriusforester.com/docs/getting-started/)

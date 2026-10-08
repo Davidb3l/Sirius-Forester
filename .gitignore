@@ -10,6 +10,7 @@ bench/fixtures/*.db-*
 # Hayvenhurst (added by `hayven init`) — generated index + installed skill
 .hayven/
 .claude/skills/
+.agents/skills/
 
 # Suite event spine — local telemetry, per SUITE_CONTRACTS §2 ("SHOULD gitignore")
 .suite/

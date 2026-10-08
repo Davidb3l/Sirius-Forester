@@ -80,11 +80,26 @@ pub enum GateFallback {
 /// The Gate's runner config (SIRF-5 / D-3). `hayven affected-tests` only
 /// *selects* tests; Sirius runs them. `test_cmd` is the full-suite command;
 /// when a trustworthy narrow selection exists its ids are appended.
+///
+/// SF-11 naming note: `fallback` is NOT renamed and `full-suite` keeps its
+/// spelling. The ticket is right that `"fallback": "full-suite"` beside
+/// `"test_cmd": null` reads as a promise to run everything when there is
+/// nothing to run — but the two fields are orthogonal (`fallback` picks the
+/// SELECTION policy, `test_cmd` supplies the RUNNER), and every
+/// `.sirius/config.json` in the field spells them this way. Renaming the key,
+/// or accepting a second spelling for it, buys clarity in one file at the cost
+/// of two valid names for one knob forever. The nonsense *state* is what got
+/// fixed instead: `sirius init` now writes a detected `test_cmd` (see
+/// [`Config::default_json_for_root`]) so the pair is coherent from the first
+/// run, and `sirius doctor`'s `gate_configured` fact fails loudly when it is
+/// not. A rename remains available as a deliberate breaking change.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GateConfig {
-    /// Full-suite test command, run verbatim via `sh -c` (e.g. `cargo test`,
-    /// `bun test`, `pytest -q`). Unset ⇒ the gate cannot run tests and refuses
-    /// to pass (fail-closed).
+    /// Full-suite test command, run verbatim through a shell (e.g.
+    /// `cargo test`, `bun test`, `pytest -q`) — see `shell::resolve_shell` for
+    /// WHICH shell. Unset ⇒ the gate cannot run tests and refuses to pass
+    /// (fail-closed). Backward compatible: `"test_cmd": null` still parses,
+    /// which is the shape every workspace initialised before SF-11 has on disk.
     #[serde(default)]
     pub test_cmd: Option<String>,
     /// Behavior when the selection cannot be trusted to be complete.
@@ -215,6 +230,97 @@ impl Default for ReviewConfig {
             skip_paths: default_review_skip_paths(),
             sequences: Vec::new(),
         }
+    }
+}
+
+// ── Ecosystem detection (SF-11) ─────────────────────────────────────────────
+
+/// A `gate.test_cmd` suggestion, with the file it was inferred from so the
+/// operator can check our reasoning rather than trust it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedTestCmd {
+    /// The suggested command, e.g. `cargo test --workspace`.
+    pub cmd: String,
+    /// The workspace-root file that produced it, e.g. `Cargo.toml`.
+    pub from: String,
+}
+
+/// Infer a full-suite test command from what is present at a workspace root.
+///
+/// Pure over `root` — it reads only `root/<marker>`, never walks up and never
+/// consults the process cwd — so it is unit-testable against a temp fixture
+/// instead of against whatever repo the test binary happens to be built in.
+///
+/// Order is deliberate: Rust first (a `Cargo.toml` at the root means the crate
+/// IS the project), then JS, then Python, then Go. A polyglot repo gets the
+/// first match; the suggestion is a starting point a human edits, never a
+/// silently-applied default.
+pub fn detect_test_cmd(root: &Path) -> Option<DetectedTestCmd> {
+    let has = |name: &str| root.join(name).exists();
+    let detected = |cmd: &str, from: &str| {
+        Some(DetectedTestCmd {
+            cmd: cmd.to_string(),
+            from: from.to_string(),
+        })
+    };
+
+    if has("Cargo.toml") {
+        return detected("cargo test --workspace", "Cargo.toml");
+    }
+    // package.json only counts when it actually declares a test script —
+    // a manifest with no `scripts.test` makes `npm test` exit 1 ("missing
+    // script: test"), which would hand the operator a test_cmd that fails
+    // every gate closed for a reason unrelated to their code.
+    if has("package.json") && package_json_has_test_script(&root.join("package.json")) {
+        // Prefer bun when the lockfile proves the repo is a bun repo: `npm
+        // test` in a bun workspace re-resolves against a different lockfile.
+        let bun = has("bun.lock") || has("bun.lockb");
+        return if bun {
+            detected("bun test", "package.json + bun.lock")
+        } else {
+            detected("npm test", "package.json")
+        };
+    }
+    if has("pyproject.toml") {
+        return detected("pytest", "pyproject.toml");
+    }
+    if has("pytest.ini") {
+        return detected("pytest", "pytest.ini");
+    }
+    if has("go.mod") {
+        return detected("go test ./...", "go.mod");
+    }
+    None
+}
+
+/// True when `package.json` declares a `scripts.test`. Unreadable/unparseable
+/// counts as false — we will not suggest a command we cannot see evidence for.
+fn package_json_has_test_script(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| {
+            v.get("scripts")
+                .and_then(|s| s.get("test"))
+                .and_then(|t| t.as_str())
+                .map(|t| !t.trim().is_empty())
+        })
+        .unwrap_or(false)
+}
+
+/// One sentence naming the detected command AND the file it came from, for
+/// `sirius doctor`. Naming the file matters: an operator whose repo was
+/// detected wrongly can see why in the same line.
+pub fn test_cmd_suggestion(root: &Path) -> String {
+    match detect_test_cmd(root) {
+        Some(d) => format!(
+            "set \"gate\": {{\"test_cmd\": \"{}\"}} in .sirius/config.json (detected from {})",
+            d.cmd, d.from
+        ),
+        None => "set \"gate\": {\"test_cmd\": \"<your full-suite test command>\"} in \
+                 .sirius/config.json (no Cargo.toml / package.json / pyproject.toml / \
+                 pytest.ini / go.mod at the workspace root to infer one from)"
+            .into(),
     }
 }
 
@@ -394,10 +500,22 @@ impl Config {
         Ok(())
     }
 
-    /// The committed-defaults JSON, pretty-printed. Used by `sirius init` to
-    /// write a starter config, and as documentation.
-    pub fn default_json() -> String {
-        serde_json::to_string_pretty(&Config::default()).unwrap()
+    /// SF-11: the starter config for `sirius init`, with `gate.test_cmd`
+    /// PRE-FILLED from whatever ecosystem `root` looks like.
+    ///
+    /// A null `test_cmd` makes the very first gate on a fresh workspace fail
+    /// closed — correct, but the operator only learns it after an agent has
+    /// already done real work and the issue is stranded in `in_progress`.
+    /// Writing a detected command turns that into a config an operator
+    /// *corrects* rather than one they must discover. When nothing is
+    /// detectable the field stays null and `sirius doctor` says so.
+    ///
+    /// Called by `cmd_init` in src/main.rs, which is what makes a fresh
+    /// workspace gateable instead of inert.
+    pub fn default_json_for_root(root: &Path) -> String {
+        let mut c = Config::default();
+        c.gate.test_cmd = detect_test_cmd(root).map(|d| d.cmd);
+        serde_json::to_string_pretty(&c).unwrap()
     }
 
     /// Compute exponential backoff for the Nth consecutive 409, clamped to
@@ -496,11 +614,172 @@ mod tests {
         assert!(c.claim_order_enforced);
     }
 
+    /// A root with no recognisable ecosystem yields exactly the committed
+    /// defaults — so `sirius init` never invents a test command it could not
+    /// detect, and the starter config still round-trips.
     #[test]
     fn default_json_roundtrips() {
-        let json = Config::default_json();
+        let root = fixture("roundtrip");
+        let json = Config::default_json_for_root(&root);
         let c: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(c, Config::default());
+    }
+
+    // ---- SF-11 ecosystem detection ----------------------------------------
+
+    /// Unique temp dir; every detection test builds its own fixture so nothing
+    /// depends on the layout of the repo the test binary was built in.
+    fn fixture(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let p =
+            std::env::temp_dir().join(format!("sirius-detect-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn touch(dir: &Path, name: &str, body: &str) {
+        std::fs::write(dir.join(name), body).unwrap();
+    }
+
+    #[test]
+    fn detects_cargo_workspace() {
+        let d = fixture("cargo");
+        touch(&d, "Cargo.toml", "[package]\nname=\"x\"\n");
+        let got = detect_test_cmd(&d).unwrap();
+        assert_eq!(got.cmd, "cargo test --workspace");
+        assert_eq!(got.from, "Cargo.toml");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn detects_npm_from_a_declared_test_script() {
+        let d = fixture("npm");
+        touch(&d, "package.json", r#"{"scripts":{"test":"vitest run"}}"#);
+        let got = detect_test_cmd(&d).unwrap();
+        assert_eq!(got.cmd, "npm test");
+        assert_eq!(got.from, "package.json");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // A bun lockfile means the repo resolves with bun; `npm test` there would
+    // re-resolve against a different lockfile.
+    #[test]
+    fn prefers_bun_when_a_bun_lockfile_is_present() {
+        for lock in ["bun.lock", "bun.lockb"] {
+            let d = fixture("bun");
+            touch(&d, "package.json", r#"{"scripts":{"test":"bun test"}}"#);
+            touch(&d, lock, "");
+            let got = detect_test_cmd(&d).unwrap();
+            assert_eq!(got.cmd, "bun test", "lockfile {lock}");
+            assert!(got.from.contains("bun.lock"), "{}", got.from);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    // `npm test` with no `scripts.test` exits 1 ("missing script: test"), which
+    // would fail every gate closed for a reason that has nothing to do with the
+    // agent's code. Suggest nothing rather than something broken.
+    #[test]
+    fn package_json_without_a_test_script_is_not_detected() {
+        let d = fixture("noscript");
+        touch(
+            &d,
+            "package.json",
+            r#"{"name":"x","scripts":{"build":"tsc"}}"#,
+        );
+        assert_eq!(detect_test_cmd(&d), None);
+        // Same for an empty test script and for unparseable JSON.
+        touch(&d, "package.json", r#"{"scripts":{"test":"  "}}"#);
+        assert_eq!(detect_test_cmd(&d), None);
+        touch(&d, "package.json", "{ not json");
+        assert_eq!(detect_test_cmd(&d), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn detects_python_and_go() {
+        let d = fixture("py");
+        touch(&d, "pyproject.toml", "[project]\nname=\"x\"\n");
+        assert_eq!(detect_test_cmd(&d).unwrap().cmd, "pytest");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let d = fixture("pyini");
+        touch(&d, "pytest.ini", "[pytest]\n");
+        let got = detect_test_cmd(&d).unwrap();
+        assert_eq!(
+            (got.cmd.as_str(), got.from.as_str()),
+            ("pytest", "pytest.ini")
+        );
+        let _ = std::fs::remove_dir_all(&d);
+
+        let d = fixture("go");
+        touch(&d, "go.mod", "module x\n");
+        assert_eq!(detect_test_cmd(&d).unwrap().cmd, "go test ./...");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn undetectable_root_yields_no_suggestion_but_still_explains() {
+        let d = fixture("bare");
+        assert_eq!(detect_test_cmd(&d), None);
+        let s = test_cmd_suggestion(&d);
+        assert!(s.contains("gate"), "{s}");
+        assert!(s.contains("no Cargo.toml"), "{s}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn suggestion_names_the_file_it_was_detected_from() {
+        let d = fixture("sugg");
+        touch(&d, "Cargo.toml", "[package]\nname=\"x\"\n");
+        let s = test_cmd_suggestion(&d);
+        assert!(s.contains("cargo test --workspace"), "{s}");
+        assert!(s.contains("detected from Cargo.toml"), "{s}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // SF-11: `sirius init` must not mint the inert `test_cmd: null` config in a
+    // repo whose ecosystem is obvious.
+    #[test]
+    fn init_json_prefills_a_detected_test_cmd() {
+        let d = fixture("init");
+        touch(&d, "Cargo.toml", "[package]\nname=\"x\"\n");
+        let c: Config = serde_json::from_str(&Config::default_json_for_root(&d)).unwrap();
+        assert_eq!(c.gate.test_cmd.as_deref(), Some("cargo test --workspace"));
+        // Everything else stays at the committed defaults.
+        assert_eq!(c.gate.fallback, GateFallback::FullSuite);
+        assert_eq!(
+            Config {
+                gate: GateConfig::default(),
+                ..c.clone()
+            },
+            Config::default()
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn init_json_leaves_test_cmd_null_when_nothing_is_detectable() {
+        let d = fixture("initbare");
+        let c: Config = serde_json::from_str(&Config::default_json_for_root(&d)).unwrap();
+        assert_eq!(c.gate.test_cmd, None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // Backward compatibility is load-bearing: every workspace initialised
+    // before SF-11 has `"test_cmd": null` on disk and must keep parsing.
+    #[test]
+    fn legacy_null_test_cmd_still_parses() {
+        let json = r#"{"gate":{"test_cmd":null,"fallback":"full-suite"}}"#;
+        let c: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(c.gate.test_cmd, None);
+        assert_eq!(c.gate.fallback, GateFallback::FullSuite);
+        // …as does a gate object that omits the key entirely.
+        let c2: Config = serde_json::from_str(r#"{"gate":{}}"#).unwrap();
+        assert_eq!(c2.gate, GateConfig::default());
     }
 
     #[test]
