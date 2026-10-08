@@ -2105,7 +2105,7 @@ fn add_review_tree(cx: &ReviewCtx, at: &str) -> Result<std::path::PathBuf, Strin
 
 /// Remove a throwaway review tree (always — even on error paths).
 fn remove_review_tree(cx: &ReviewCtx, t: &std::path::Path) {
-    let t_str = crate::gitrange::git_path(&t);
+    let t_str = crate::gitrange::git_path(t);
     worktree_admin(|| {
         let _ = crate::gitrange::run_git(cx.runner, &["worktree", "remove", "--force", &t_str]);
     });

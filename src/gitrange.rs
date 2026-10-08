@@ -371,7 +371,12 @@ mod tests {
         let hv = Hayven::new(&m);
         let got = changed_symbols(&m, &hv, Some("main..HEAD")).unwrap();
         assert_eq!(got, ChangedSymbols::default());
-        assert_eq!(m.recorded().len(), 1, "no fallback probe: {:?}", m.recorded());
+        assert_eq!(
+            m.recorded().len(),
+            1,
+            "no fallback probe: {:?}",
+            m.recorded()
+        );
     }
 
     /// A root-commit repo has no HEAD~1; that must stay an empty answer, not an

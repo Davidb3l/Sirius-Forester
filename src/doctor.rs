@@ -881,7 +881,7 @@ mod tests {
 
         let report = run_with_plugins_dir(&ws, &m, None);
         assert!(report.ok, "checks: {:?}", report.checks);
-        assert_eq!(report.checks.len(), 8);
+        assert_eq!(report.checks.len(), 10);
         // With no plugins dir the handoff check is an advisory PASS (skipped),
         // clearly labeled — a CI box is not an incomplete install.
         let ph = report
