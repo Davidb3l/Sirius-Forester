@@ -362,7 +362,7 @@ fn run_cmd(
     let mut full = cmd.to_string();
     for id in ids {
         full.push(' ');
-        full.push_str(&shell_quote(id));
+        full.push_str(&shell_quote(id, shell.posix));
     }
     match run_in_shell(runner, shell, &full) {
         Ok(out) => GateVerdict {
@@ -555,14 +555,20 @@ fn last_lines(stdout: &str, stderr: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
-/// Minimal POSIX single-quote for a test id passed to `sh -c`.
-fn shell_quote(s: &str) -> String {
+/// Minimal quoting for a test id appended to `gate.test_cmd`: POSIX single
+/// quotes for `sh -c`; for `cmd.exe` (no POSIX sh on a Windows box), double
+/// quotes — cmd keeps single quotes literally, so a pytest `test_x[a b]` id
+/// would reach the runner as `'test_x[a` + `b]'` and match nothing. An inner
+/// `"` is escaped the MSVC way the test runner's own argv parser reads.
+fn shell_quote(s: &str, posix: bool) -> String {
     if s.chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '='))
     {
         s.to_string()
-    } else {
+    } else if posix {
         format!("'{}'", s.replace('\'', r"'\''"))
+    } else {
+        format!("\"{}\"", s.replace('"', r#"\""#))
     }
 }
 
@@ -577,6 +583,15 @@ mod tests {
     /// shell the developer happens to have installed.
     fn test_shell() -> ShellCmd {
         ShellCmd::posix_sh()
+    }
+
+    #[test]
+    fn test_ids_are_quoted_for_the_resolved_shell() {
+        assert_eq!(shell_quote("tests/a.py::t", true), "tests/a.py::t");
+        assert_eq!(shell_quote("t[a b]", true), "'t[a b]'");
+        assert_eq!(shell_quote("it's", true), r"'it'\''s'");
+        assert_eq!(shell_quote("t[a b]", false), r#""t[a b]""#);
+        assert_eq!(shell_quote(r#"say "hi""#, false), r#""say \"hi\"""#);
     }
 
     fn sel_json(ok: bool, roots: usize, note: &str, runnables: &[&str]) -> Selection {

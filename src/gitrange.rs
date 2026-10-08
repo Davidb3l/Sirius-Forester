@@ -141,6 +141,7 @@ pub fn changed_symbols(
     runner: &dyn Runner,
     hv: &Hayven,
     range: Option<&str>,
+    fleet_base: Option<&str>,
 ) -> Result<ChangedSymbols, String> {
     let mut files = changed_files(runner, range)?;
     // SF-12: `--changed` with no `--range` means "working tree vs HEAD", so the
@@ -148,17 +149,38 @@ pub fn changed_symbols(
     // files and `sirius link --changed` no-oped with "no symbols to link" — the
     // receipt silently never got filed, on the exact workflow the skill
     // prescribes. When the caller named no range and the tree is clean, the
-    // change they mean is the commit they just made, so diff that instead.
+    // change they mean is the work they just committed, so diff that instead.
     // Only the no-range case: an EXPLICIT range that resolves nothing is the
     // caller's own answer and must be left empty, never second-guessed.
     if files.is_empty() && range.is_none() {
-        // A repo whose HEAD is the root commit has no HEAD~1; that is not an
-        // error here, there is simply nothing earlier to diff against.
-        // `--verify --quiet` exits non-zero in that case, which run_git turns
-        // into an Err we deliberately swallow.
-        if let Ok(prev) = run_git(runner, &["rev-parse", "--verify", "--quiet", "HEAD~1"]) {
-            if !prev.stdout.trim().is_empty() {
-                files = changed_files(runner, Some("HEAD~1..HEAD"))?;
+        // "Clean" must count untracked files: `git diff HEAD` never shows them,
+        // so new, uncommitted files would otherwise send us to the PREVIOUS
+        // commit — someone else's work — and stamp its symbols on this issue.
+        let untracked = untracked_files(runner)?;
+        if let Some(first) = untracked.first() {
+            return Err(format!(
+                "no tracked changes against HEAD, but {} untracked file(s) (e.g. `{first}`) — \
+                 commit (or `git add`) the work first, or pass --range; refusing to guess \
+                 which commit is yours",
+                untracked.len()
+            ));
+        }
+        match fleet_base.map(str::trim).filter(|b| !b.is_empty()) {
+            // Inside a fleet iteration the base the worker started from is
+            // known ($SIRIUS_BASE): diff ALL of this worker's commits — and
+            // nothing at all when it has committed none (HEAD == base), instead
+            // of the base branch's last commit.
+            Some(base) => files = changed_files(runner, Some(&format!("{base}..HEAD")))?,
+            // Solo: the commit just made. A repo whose HEAD is the root commit
+            // has no HEAD~1; that is not an error here, there is simply nothing
+            // earlier to diff against. `--verify --quiet` exits non-zero in that
+            // case, which run_git turns into an Err we deliberately swallow.
+            None => {
+                if let Ok(prev) = run_git(runner, &["rev-parse", "--verify", "--quiet", "HEAD~1"]) {
+                    if !prev.stdout.trim().is_empty() {
+                        files = changed_files(runner, Some("HEAD~1..HEAD"))?;
+                    }
+                }
             }
         }
     }
@@ -357,9 +379,68 @@ mod tests {
             "",
         ));
         let hv = Hayven::new(&m);
-        let got = changed_symbols(&m, &hv, None).unwrap();
+        let got = changed_symbols(&m, &hv, None, None).unwrap();
         assert_eq!(got.files, vec!["src/math.rs"]);
         assert_eq!(got.symbols, vec!["src/math::add"]);
+    }
+
+    /// New, uncommitted files are work in progress, not a clean tree: the
+    /// fallback must refuse rather than stamp the PREVIOUS commit's symbols.
+    #[test]
+    fn changed_symbols_refuses_to_guess_with_untracked_work() {
+        let m = MockRunner::new();
+        m.expect(&["git", "diff"], 0, "");
+        m.expect(&["git", "ls-files", "--others"], 0, "src/new.rs\n");
+        m.expect(&["git", "rev-parse", "--verify"], 0, "abc123\n");
+        let hv = Hayven::new(&m);
+        let e = changed_symbols(&m, &hv, None, None).unwrap_err();
+        assert!(e.contains("src/new.rs"), "{e}");
+        assert!(
+            !m.recorded().iter().any(|c| c.contains("HEAD~1")),
+            "{:?}",
+            m.recorded()
+        );
+    }
+
+    /// In a fleet iteration ($SIRIUS_BASE known) the fallback diffs every
+    /// commit since the worker's base — not just the last one.
+    #[test]
+    fn changed_symbols_uses_the_fleet_base_when_known() {
+        let m = MockRunner::new();
+        m.push(MockResponse::new(
+            &["git", "diff", "--name-only", "HEAD"],
+            0,
+            "",
+            "",
+        ));
+        m.push(MockResponse::new(
+            &["git", "diff", "--name-only", "base1..HEAD"],
+            0,
+            "src/a.rs\nsrc/b.rs\n",
+            "",
+        ));
+        m.expect(
+            &["hayven", "affected-tests"],
+            0,
+            r#"{"roots":["src/a","src/b"],"tests":[]}"#,
+        );
+        let hv = Hayven::new(&m);
+        let got = changed_symbols(&m, &hv, None, Some("base1")).unwrap();
+        assert_eq!(got.files, vec!["src/a.rs", "src/b.rs"]);
+        assert!(!m.recorded().iter().any(|c| c.contains("HEAD~1")));
+    }
+
+    /// A worker that committed nothing (HEAD == base) links nothing — never
+    /// the base branch's last commit, which is someone else's work.
+    #[test]
+    fn changed_symbols_with_no_fleet_commits_is_empty() {
+        let m = MockRunner::new();
+        m.expect(&["git", "diff"], 0, "");
+        m.expect(&["git", "rev-parse", "--verify"], 0, "abc123\n");
+        let hv = Hayven::new(&m);
+        let got = changed_symbols(&m, &hv, None, Some("base1")).unwrap();
+        assert_eq!(got, ChangedSymbols::default());
+        assert!(!m.recorded().iter().any(|c| c.contains("HEAD~1")));
     }
 
     /// The fallback must NOT override an explicit range: an empty answer to a
@@ -369,7 +450,7 @@ mod tests {
         let m = MockRunner::new();
         m.push(MockResponse::new(&["git", "diff"], 0, "", ""));
         let hv = Hayven::new(&m);
-        let got = changed_symbols(&m, &hv, Some("main..HEAD")).unwrap();
+        let got = changed_symbols(&m, &hv, Some("main..HEAD"), None).unwrap();
         assert_eq!(got, ChangedSymbols::default());
         assert_eq!(
             m.recorded().len(),
@@ -392,7 +473,7 @@ mod tests {
             "",
         ));
         let hv = Hayven::new(&m);
-        let got = changed_symbols(&m, &hv, None).unwrap();
+        let got = changed_symbols(&m, &hv, None, None).unwrap();
         assert_eq!(got, ChangedSymbols::default());
     }
 
@@ -414,7 +495,7 @@ mod tests {
             r#"{"hits":[{"id":"a/types"},{"id":"b/types"}]}"#,
         );
         let hv = Hayven::new(&m);
-        let got = changed_symbols(&m, &hv, Some("x~1..x")).unwrap();
+        let got = changed_symbols(&m, &hv, Some("x~1..x"), None).unwrap();
         assert_eq!(got.files, vec!["a/types.ts", "bun.lock"]);
         assert_eq!(
             got.symbols,
@@ -443,14 +524,14 @@ mod tests {
             "daemon serves a DIFFERENT project",
         ));
         let hv = Hayven::new(&m);
-        let e = changed_symbols(&m, &hv, None).unwrap_err();
+        let e = changed_symbols(&m, &hv, None, None).unwrap_err();
         assert!(e.contains("DIFFERENT project"), "{e}");
         // An empty range is just empty — not an error, and no hayven call.
         let m2 = MockRunner::new();
         m2.expect(&["git", "diff"], 0, "");
         let hv2 = Hayven::new(&m2);
         assert_eq!(
-            changed_symbols(&m2, &hv2, None).unwrap(),
+            changed_symbols(&m2, &hv2, None, None).unwrap(),
             ChangedSymbols::default()
         );
         assert!(!m2.recorded().iter().any(|c| c.starts_with("hayven")));

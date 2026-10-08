@@ -101,6 +101,40 @@ pub trait Runner: Send + Sync {
     }
 }
 
+/// Build the `Command` for `program args`.
+///
+/// One exception to plain `args`: a script handed to `cmd.exe /C` on Windows.
+/// Rust quotes an argument the MSVC way (`"` inside becomes `\"`), which cmd.exe
+/// does not understand — `claude -p "work the claimed issue"` reached claude as
+/// the four words `"work`, `the`, `claimed`, `issue"`. So the script goes on the
+/// command line RAW, as `/S /C "<script>"`: `/S` makes cmd strip exactly the
+/// outer pair of quotes and run the rest verbatim, whatever quotes it contains.
+fn command_for(program: &str, args: &[&str]) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    if let [flag, script] = args {
+        if flag.eq_ignore_ascii_case("/c") && is_cmd_exe(program) {
+            use std::os::windows::process::CommandExt;
+            cmd.raw_arg(cmd_exe_raw_args(script));
+            return cmd;
+        }
+    }
+    cmd.args(args);
+    cmd
+}
+
+/// Whether `program` is `cmd.exe` (by file stem, so `%ComSpec%`'s absolute
+/// path and a bare `cmd` both count).
+fn is_cmd_exe(program: &str) -> bool {
+    matches!(program_stem(program).as_str(), "cmd" | "command")
+}
+
+/// The raw `cmd.exe` tail that runs `script` verbatim (see [`command_for`]).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn cmd_exe_raw_args(script: &str) -> String {
+    format!("/S /C \"{script}\"")
+}
+
 /// Spawns real subprocesses.
 #[derive(Debug, Default, Clone)]
 pub struct RealRunner {
@@ -112,8 +146,7 @@ pub struct RealRunner {
 
 impl Runner for RealRunner {
     fn run(&self, program: &str, args: &[&str]) -> std::io::Result<CmdOutput> {
-        let mut cmd = Command::new(program);
-        cmd.args(args);
+        let mut cmd = command_for(program, args);
         if let Some(d) = &self.cwd {
             cmd.current_dir(d);
         }
@@ -157,12 +190,11 @@ impl Runner for RealRunner {
             None => (Stdio::null(), Stdio::null()),
         };
 
-        let mut cmd = Command::new(program);
+        let mut cmd = command_for(program, args);
         // Agents are non-interactive: an inherited stdin makes CLIs like
         // `claude -p` wait for piped input (observed: a 3s stall + warning on
         // every run) or, worse, read the fleet's own terminal.
-        cmd.args(args)
-            .stdin(Stdio::null())
+        cmd.stdin(Stdio::null())
             .stdout(stdout_cfg)
             .stderr(stderr_cfg);
         cmd.envs(opts.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
@@ -334,7 +366,7 @@ impl ShellCmd {
     /// Build an invocation for an explicitly-named program, inferring its
     /// "run this string" flag from the program name (`cmd.exe` wants `/C`).
     fn for_program(program: &str) -> ShellCmd {
-        let cmd_like = matches!(program_stem(program).as_str(), "cmd" | "command");
+        let cmd_like = is_cmd_exe(program);
         ShellCmd {
             program: program.to_string(),
             flag: if cmd_like { "/C".into() } else { "-c".into() },
@@ -475,6 +507,15 @@ pub fn agent_program(cmd: &str) -> Option<String> {
             || tok.starts_with(['(', '-', '!'])
             || tok.contains(['$', '`', '{', '}', '*', '?', '<', '>', '|', '&', ';']);
         if dynamic || SHELL_BUILTINS.contains(&tok.as_str()) {
+            return None;
+        }
+        // A PATH that is not absolute cannot be checked from here: `~` is the
+        // shell's to expand, and a relative path resolves against the worker's
+        // worktree (the repo root), not wherever sirius was launched. On Windows
+        // an MSYS-style `/c/Users/...` is not absolute either (no drive) — the
+        // POSIX sh that runs it maps it, `Path::is_file` cannot.
+        let is_path = tok.contains('/') || (cfg!(windows) && tok.contains('\\'));
+        if tok.starts_with('~') || (is_path && !Path::new(&tok).is_absolute()) {
             return None;
         }
         return Some(tok);
@@ -1302,6 +1343,10 @@ mod tests {
             "",
             "   ",
             r#""unterminated -p go"#,
+            // Paths only the shell (or the worktree cwd) can resolve.
+            "~/bin/claude -p go",
+            "./scripts/agent.sh go",
+            "scripts/agent.sh go",
         ] {
             assert_eq!(
                 agent_program(cmd),
@@ -1309,6 +1354,31 @@ mod tests {
                 "should skip the preflight: {cmd:?}"
             );
         }
+    }
+
+    /// An absolute path is still checked (it means the same thing everywhere).
+    #[test]
+    fn agent_program_checks_an_absolute_path() {
+        let abs = if cfg!(windows) {
+            r"C:\bin\claude.exe -p go"
+        } else {
+            "/usr/local/bin/claude -p go"
+        };
+        let want = abs.split(' ').next().unwrap();
+        assert_eq!(agent_program(abs).as_deref(), Some(want));
+    }
+
+    /// cmd.exe gets the script raw inside one outer quote pair that `/S`
+    /// strips — so the script's own quotes reach the program intact.
+    #[test]
+    fn cmd_exe_script_is_wrapped_for_slash_s() {
+        assert_eq!(
+            cmd_exe_raw_args(r#"claude -p "work the claimed issue""#),
+            r#"/S /C "claude -p "work the claimed issue"""#
+        );
+        assert!(is_cmd_exe(r"C:\Windows\system32\cmd.exe"));
+        assert!(is_cmd_exe("CMD"));
+        assert!(!is_cmd_exe("/usr/bin/sh"));
     }
 
     /// The SF-14 field case: npm installs `claude` on Windows as `claude.cmd`,

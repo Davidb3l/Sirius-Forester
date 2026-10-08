@@ -307,7 +307,12 @@ fn cmd_link(
 
     let mut changed_files: Option<usize> = None;
     if changed {
-        match gitrange::changed_symbols(runner, &hv, range.as_deref()) {
+        match gitrange::changed_symbols(
+            runner,
+            &hv,
+            range.as_deref(),
+            std::env::var("SIRIUS_BASE").ok().as_deref(),
+        ) {
             Ok(c) => {
                 // The count is printed WITH its file count (SIRF-20) so an
                 // over-broad stamp is visible. (No ratio heuristic: hayven's
