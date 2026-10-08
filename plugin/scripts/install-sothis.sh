@@ -32,9 +32,12 @@
 #
 # Idempotent + safe to re-run: anything already on PATH is left alone. POSIX sh,
 # covering macOS, Linux AND Windows under Git Bash / MSYS2 / Cygwin — nothing in
-# this script's own preamble is OS-gated, and the delegated installers handle
-# the MINGW*/MSYS*/CYGWIN* uname themselves (sirius pulls the windows-x64
-# asset and installs sirius.exe). PowerShell-only shells: use install-sirius.ps1.
+# this script's own preamble is OS-gated. Of the delegated installers, only
+# install-sirius.sh handles the MINGW*/MSYS*/CYGWIN* uname (it pulls the
+# windows-x64 asset and installs sirius.exe). Hayvenhurst's install-hayven.sh
+# does NOT — it refuses those shells as an "unsupported OS" — so on Windows a
+# hayven failure is a WARNING with the manual route, and the run carries on
+# (anywhere else it stays fatal). PowerShell-only shells: use install-sothis.ps1.
 #
 # Usage:
 #   install-sothis.sh                   # install every missing suite CLI
@@ -373,6 +376,27 @@ find_local_hayven_installer() {
   return 1
 }
 
+# On Windows a hayven failure is a WARNING, not an abort. Hayvenhurst's
+# install-hayven.sh refuses MINGW*/MSYS*/CYGWIN* ("unsupported OS") and there is
+# no native Windows installer yet, so on this platform the delegated install is
+# EXPECTED to fail — and a `fail` here would take amt / catryna / sirius doctor /
+# the plugin half down with it. Say what happened, how to get hayven by hand,
+# and carry on. On macOS/Linux a failure is a real failure: still fatal.
+hayven_failed() { # hayven_failed <reason>
+  [ "$IS_WINDOWS" = "1" ] || fail "$1"
+  log ""
+  log "hayven: WARNING: $1"
+  log "        Skipping hayven and carrying on with the rest of the suite."
+  log "        Hayvenhurst has no native Windows installer yet (its install-hayven.sh"
+  log "        only covers macOS/Linux), so install hayven by hand: from"
+  log "          https://github.com/$HAYVEN_REPO/releases/latest"
+  log "        take hayvenhurst-<version>-windows-x64.tar.gz, check it against the"
+  log "        .sha256 published beside it, extract it (tar -xzf), and put hayven.exe"
+  log "        (plus hayven-native.exe if present) in $BIN_DIR"
+  log "        Until then sirius still runs, with reduced function: no Hayvenhurst"
+  log "        code graph (locks, maps, impact), and sirius doctor will flag hayven."
+}
+
 install_hayven() {
   if [ "$SKIP_HAYVEN" = "1" ]; then
     log "hayven: --skip-hayven set; skipping."
@@ -386,7 +410,7 @@ install_hayven() {
     log "hayven: installing via local install-hayven.sh ($local_installer)"
     set --
     [ "$PREFIX_EXPLICIT" = "1" ] && set -- --prefix "$PREFIX"
-    sh "$local_installer" "$@" || fail "install-hayven.sh failed"
+    sh "$local_installer" "$@" || hayven_failed "install-hayven.sh failed"
     return 0
   fi
   url="https://raw.githubusercontent.com/$HAYVEN_REPO/$HAYVEN_INSTALLER_REF/plugin/scripts/install-hayven.sh"
@@ -394,15 +418,29 @@ install_hayven() {
   tmp="$(mktemp "${TMPDIR:-/tmp}/install-hayven.XXXXXX")" || fail "mktemp failed"
   # shellcheck disable=SC2064
   trap "rm -f \"$tmp\"" EXIT INT TERM
-  fetch "$url" "$tmp" || fail "could not download install-hayven.sh from $HAYVEN_REPO@$HAYVEN_INSTALLER_REF
+  # Every exit below cleans up $tmp and drops the trap itself: on Windows
+  # hayven_failed RETURNS (the run carries on), so the EXIT trap alone would
+  # leave the temp file around until the very end — and then fire on a stale
+  # path. On other platforms hayven_failed exits, and the cleanup has already run.
+  if ! fetch "$url" "$tmp"; then
+    rm -f "$tmp"; trap - EXIT INT TERM
+    hayven_failed "could not download install-hayven.sh from $HAYVEN_REPO@$HAYVEN_INSTALLER_REF
         (need curl or wget). Install hayven yourself with /hayvenhurst:install-binary,
         or re-run with --skip-hayven."
-  [ -s "$tmp" ] || fail "downloaded install-hayven.sh was empty"
+    return 0
+  fi
+  if [ ! -s "$tmp" ]; then
+    rm -f "$tmp"; trap - EXIT INT TERM
+    hayven_failed "downloaded install-hayven.sh was empty"
+    return 0
+  fi
   set --
   [ "$PREFIX_EXPLICIT" = "1" ] && set -- --prefix "$PREFIX"
-  sh "$tmp" "$@" || fail "install-hayven.sh failed"
+  hayven_rc=0
+  sh "$tmp" "$@" || hayven_rc=$?
   rm -f "$tmp"
   trap - EXIT INT TERM
+  [ "$hayven_rc" = "0" ] || hayven_failed "install-hayven.sh failed (exit $hayven_rc)"
 }
 
 # ---- amt (detect only; never auto-build) -----------------------------------

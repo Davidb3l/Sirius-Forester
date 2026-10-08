@@ -1,7 +1,7 @@
 ---
 description: Download and install the platform-correct `sirius` CLI binary for this OS/arch from the latest Sirius Forester GitHub release, verifying its checksum and Sigstore signature. Use when `sirius` is not yet installed.
 argument-hint: "[vX.Y.Z]"
-allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/scripts/install-sirius.sh:*), Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File ${CLAUDE_PLUGIN_ROOT}/scripts/install-sirius.ps1:*)
+allowed-tools: Bash("${CLAUDE_PLUGIN_ROOT}/scripts/install-sirius.sh":*), Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_PLUGIN_ROOT}/scripts/install-sirius.ps1":*)
 ---
 
 # Install the `sirius` binary
@@ -15,16 +15,25 @@ and installs `sirius` into the plugin's persistent data directory.
 Two installers ship side by side — the same download, the same checksum, the
 same Sigstore verification. **Pick by shell, not by OS branding:**
 
-- **A POSIX shell** (macOS, Linux, or Windows under Git Bash / MSYS2 / WSL) →
-  run `install-sirius.sh`.
+- **A POSIX shell** (macOS, Linux, or Windows under Git Bash / MSYS2 /
+  Cygwin) → run `install-sirius.sh`.
 - **Native Windows PowerShell**, with no POSIX shell available → run
   `install-sirius.ps1`. A stock Windows box has no Git Bash; do not send the
   user off to install one, and do not fall back to hand-extracting a tarball.
 
-Determine which you have before running anything: if `sh` / `bash` resolves,
-take the POSIX path; otherwise take the PowerShell path.
+**WSL is not a Windows route.** Inside WSL `uname` reports Linux, so the `.sh`
+installs a *Linux* `sirius` into the WSL filesystem — usable only from inside
+WSL, invisible to a Windows-native Claude Code. Only take it when the user
+actually runs Claude Code inside WSL. On Windows, `bash` on `PATH` may be the
+WSL launcher (`C:\Windows\System32\bash.exe`); that does not count as a POSIX
+shell here — use the PowerShell path.
 
-### POSIX (macOS / Linux / Git Bash)
+Determine which you have before running anything: if `sh` / `bash` resolves
+(and is not the WSL launcher), take the POSIX path; otherwise take the
+PowerShell path. Run the commands below exactly as written — the quoting
+matches this command's allowed-tools rules.
+
+### POSIX (macOS / Linux / Git Bash / MSYS2 / Cygwin)
 
 If the user passed a tag (e.g. `v0.1.0`), forward it explicitly:
 

@@ -10,7 +10,8 @@ description: >-
   Two halves IN ORDER: the marketplace bundle's plugins first (Claude runs the
   non-interactive `claude plugin` CLI itself — works from a cold start), then
   the install-sothis one-shot for the CLIs (install-sothis.sh on macOS/Linux/Git
-  Bash, install-sothis.ps1 on native Windows PowerShell) — which auto-installs
+  Bash, install-sothis.ps1 on native Windows PowerShell; WSL's .sh installs Linux
+  binaries for use inside WSL only) — which auto-installs
   and verifies any remaining plugin half. To install ONLY the
   sirius binary, use /sirius:install-binary; to just RUN the foreman once it's
   installed, that's the `sirius` skill.
@@ -97,12 +98,18 @@ check.
 
 It ships in two equivalent forms — same order, same delegation, same
 verification. **Pick by shell, not by OS branding:** if `sh` / `bash` resolves
-(macOS, Linux, or Windows under Git Bash / MSYS2 / WSL), run the `.sh`;
+(macOS, Linux, or Windows under Git Bash / MSYS2 / Cygwin), run the `.sh`;
 otherwise, on native Windows PowerShell, run the `.ps1`. A stock Windows box has
 no Git Bash — don't detour the human into installing one.
 
+**WSL is not a Windows route:** inside WSL `uname` reports Linux, so the `.sh`
+installs *Linux* binaries into the WSL filesystem — usable only from inside
+WSL, invisible to a Windows-native Claude Code. Take it only when Claude Code
+itself runs inside WSL. (The WSL launcher `C:\Windows\System32\bash.exe` on a
+Windows `PATH` does not count as a POSIX shell — use the `.ps1`.)
+
 ```bash
-# POSIX: macOS, Linux, Git Bash
+# POSIX: macOS, Linux, Git Bash / MSYS2 / Cygwin
 "${CLAUDE_PLUGIN_ROOT}/scripts/install-sothis.sh"
 ```
 
@@ -123,12 +130,18 @@ What it does, in order (identical on both paths):
 1. **sirius** — installs via the bundled `install-sirius.sh` (or
    `install-sirius.ps1` from the PowerShell one-shot; both verify a Sigstore
    signature — a bad or missing signature aborts).
-2. **hayven** — installs via Hayvenhurst's own `install-hayven.sh` /
-   `install-hayven.ps1` (verifies a sha256). It prefers a copy already on disk
-   from an installed Hayvenhurst plugin, and only falls back to fetching that
-   script over HTTPS from the Hayvenhurst repo. If you'd rather install hayven
-   through its plugin, pass `--skip-hayven` (`-SkipHayven`) and run
-   `/hayvenhurst:install-binary`.
+2. **hayven** — installs via Hayvenhurst's own `install-hayven.sh` (verifies a
+   sha256). It prefers a copy already on disk from an installed Hayvenhurst
+   plugin, and only falls back to fetching that script over HTTPS from the
+   Hayvenhurst repo. If you'd rather install hayven through its plugin, pass
+   `--skip-hayven` (`-SkipHayven`) and run `/hayvenhurst:install-binary`.
+   **On Windows this step is best-effort:** Hayvenhurst ships no native
+   Windows installer yet (no `install-hayven.ps1`, and `install-hayven.sh`
+   refuses Git Bash / MSYS / Cygwin), so both one-shots print a
+   `hayven: WARNING` with the manual route (the `windows-x64` release tarball,
+   checked against its `.sha256`) and carry on. Relay it — sirius runs without
+   hayven, with reduced function, until it's installed. Elsewhere a hayven
+   failure still aborts.
 3. **amt** — detected only. If missing, the script prints how to get it; the
    fastest path is asking Claude to **"ametrite this repo"** (the ametrite skill
    bootstraps `amt`). It deliberately does not clone or `cargo build` for you.

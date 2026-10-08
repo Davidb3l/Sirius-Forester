@@ -64,9 +64,10 @@
     (A BAD signature and a MISSING bundle are fatal regardless.)
 
 .PARAMETER AddToPath
-    When the install dir is not on the user PATH, add it via
-    [Environment]::SetEnvironmentVariable('Path', ..., 'User'). Without this
-    switch the exact command is printed instead and nothing is changed.
+    When the install dir is not on the user PATH, append it to the user Path
+    in HKCU\Environment (keeping the value's REG_EXPAND_SZ kind, so %VARS% in
+    it stay live) and broadcast the change. Without this switch the exact
+    command is printed instead and nothing is changed.
 
 .PARAMETER Force
     Reinstall even when the requested version is already installed.
@@ -187,6 +188,24 @@ function Get-CommandPath {
     return $c.Name
 }
 
+# The path of something Start-Process can actually launch. A plain Get-Command
+# prefers PowerShell's own command types, so for `claude` it returns npm's
+# `claude.ps1` shim (npm installs .ps1, .cmd AND an extensionless sh shim side
+# by side). A .ps1 is not a Win32 executable: Start-Process throws on it, the
+# caller turns that into exit -1, and every `claude plugin ...` call would be
+# reported as failed. -CommandType Application restricts the lookup to real
+# programs; the extension filter then keeps exactly the shapes Invoke-Native
+# knows how to launch (.exe/.com directly, .cmd/.bat via cmd.exe) and drops
+# the extensionless sh shim. $null when nothing launchable matches.
+function Get-NativeExePath {
+    param([string]$Name)
+    $hits = @(Get-Command $Name -CommandType Application -All -ErrorAction SilentlyContinue)
+    foreach ($h in $hits) {
+        if ($null -ne $h.Path -and $h.Path -match '\.(exe|com|cmd|bat)$') { return $h.Path }
+    }
+    return $null
+}
+
 # False when the resolved command is a Windows "App Execution Alias" stub: a
 # 0-byte reparse point that launches the Microsoft Store instead of a program.
 function Test-SafeToProbe {
@@ -234,7 +253,7 @@ function Invoke-Native {
         [switch]$NullStdin
     )
 
-    $exe = Get-CommandPath $FilePath
+    $exe = Get-NativeExePath $FilePath
     if ($null -eq $exe) { $exe = $FilePath }
 
     $quoted = @()
@@ -322,7 +341,21 @@ function Get-RemoteString {
     param([Parameter(Mandatory = $true)][string]$Uri)
     Enable-Tls12
     $resp = Invoke-WebRequest -Uri $Uri -UseBasicParsing -UserAgent $UserAgent -ErrorAction Stop
-    return [string]$resp.Content
+    $content = $resp.Content
+    if ($null -eq $content) { return '' }
+    # GitHub serves release assets (our `.sha256` included) as
+    # application/octet-stream, and for a non-text content type Invoke-WebRequest
+    # hands back .Content as a byte[] (5.1 and 7+ alike). A plain [string] cast
+    # of that array yields "53 100 48 ..." - the decimal byte values joined by
+    # spaces - so every checksum would "fail" as not-a-hex-digest. Decode the
+    # bytes instead. The checksum file is ASCII hex, so UTF-8 is exact; strip a
+    # BOM in case one was ever written. The hex-digest check in the caller still
+    # runs on the result, so anything odd here fails closed, never open.
+    if ($content -is [byte[]]) {
+        $text = [System.Text.Encoding]::UTF8.GetString($content)
+        return $text.TrimStart([char]0xFEFF)
+    }
+    return [string]$content
 }
 
 # ---- suite awareness --------------------------------------------------------
@@ -500,26 +533,72 @@ $PathAddCommand = '[Environment]::SetEnvironmentVariable(''Path'', [Environment]
 
 function Add-BinDirToUserPath {
     # Writes the USER (not machine) Path only - no elevation, no other user
-    # affected, and reversible from the same API.
-    $current = [Environment]::GetEnvironmentVariable('Path', 'User')
-    if ($null -eq $current) { $current = '' }
-    if (Test-DirInPathString -PathValue $current -Dir $BinDir) {
-        Write-Log ('install-sirius: ' + $BinDir + ' is already on your user PATH.')
+    # affected.
+    #
+    # NOT via [Environment]::SetEnvironmentVariable('Path', ..., 'User'): that
+    # API reads the value EXPANDED and writes it back as REG_SZ, which silently
+    # and permanently turns a REG_EXPAND_SZ Path into a plain string - every
+    # %USERPROFILE% / %LOCALAPPDATA% entry in it gets frozen to today's value.
+    # So go to HKCU\Environment directly: read the RAW value (unexpanded), append,
+    # and write it back with the SAME registry kind it had (ExpandString when
+    # there was no Path yet, which is what Windows itself uses).
+    $envKey = $null
+    try {
+        # CreateSubKey opens the existing key for writing (or creates it on a
+        # box that somehow has none).
+        $envKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+    } catch {
+        $envKey = $null
+    }
+    if ($null -eq $envKey) {
+        Write-Log 'install-sirius: WARNING: could not open HKCU\Environment to update the user PATH.'
+        Write-Log 'install-sirius: WARNING: add it yourself with:'
+        Write-Log ('      ' + $PathAddCommand)
         return
     }
-    if ($current -eq '') {
-        $updated = $BinDir
-    } else {
-        $updated = $current.TrimEnd(';') + ';' + $BinDir
-    }
     try {
-        [Environment]::SetEnvironmentVariable('Path', $updated, 'User')
+        $current = ''
+        $kind = [Microsoft.Win32.RegistryValueKind]::ExpandString
+        $raw = $envKey.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        if ($null -ne $raw) { $current = [string]$raw }
+        if ($envKey.GetValueNames() -contains 'Path') { $kind = $envKey.GetValueKind('Path') }
+
+        # Compare against the expanded form too: an entry written as
+        # %USERPROFILE%\.local\bin is the same directory as our literal BinDir.
+        if ((Test-DirInPathString -PathValue $current -Dir $BinDir) -or
+            (Test-DirInPathString -PathValue ([Environment]::ExpandEnvironmentVariables($current)) -Dir $BinDir)) {
+            Write-Log ('install-sirius: ' + $BinDir + ' is already on your user PATH.')
+            return
+        }
+        if ($current -eq '') {
+            $updated = $BinDir
+        } else {
+            $updated = $current.TrimEnd(';') + ';' + $BinDir
+        }
+        $envKey.SetValue('Path', $updated, $kind)
     } catch {
         Write-Log ('install-sirius: WARNING: could not update the user PATH: ' + $_.Exception.Message)
         Write-Log ('install-sirius: WARNING: add it yourself with:')
         Write-Log ('      ' + $PathAddCommand)
         return
+    } finally {
+        $envKey.Close()
     }
+
+    # A raw registry write does not tell anyone it happened; Explorer (and so
+    # every process it launches next) keeps the old environment until it gets a
+    # WM_SETTINGCHANGE "Environment" broadcast. The simplest robust way to send
+    # one from 5.1 without Add-Type (a C# compile: slow, and blocked under
+    # Constrained Language Mode) is to let .NET do it: SetEnvironmentVariable
+    # with a User target broadcasts unconditionally after its registry write.
+    # Deleting a variable that does not exist is a no-op write, so the only
+    # lasting effect is the broadcast itself.
+    try {
+        [Environment]::SetEnvironmentVariable('SIRIUS_INSTALL_PATH_BROADCAST', $null, 'User')
+    } catch {
+        # Harmless: new shells started after a logoff still see the new Path.
+    }
+
     # Make it usable in THIS process too; the persisted value only reaches new
     # processes.
     if ([string]::IsNullOrEmpty($env:PATH)) {

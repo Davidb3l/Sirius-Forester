@@ -1,7 +1,7 @@
 ---
 description: Install the whole Sothis suite in one shot — the sirius + hayven CLIs (and a check for amt + catryna/bun), verified by each tool's own installer, running `sirius doctor` and ending with a verification of the Claude Code plugin half. Use for "let's Sothis this up" / installing the full fleet, not just sirius.
 argument-hint: "[--skip-hayven] [--skip-amt] [--require-signature]"
-allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/scripts/install-sothis.sh:*), Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File ${CLAUDE_PLUGIN_ROOT}/scripts/install-sothis.ps1:*)
+allowed-tools: Bash("${CLAUDE_PLUGIN_ROOT}/scripts/install-sothis.sh":*), Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_PLUGIN_ROOT}/scripts/install-sothis.ps1":*)
 ---
 
 # Install the Sothis suite
@@ -20,11 +20,19 @@ missing — it never auto-builds), checks `bun` for Catryna, then runs
 
 Two one-shots ship side by side — same order, same delegation, same
 verification. **Pick by shell, not by OS branding:** if `sh` / `bash` resolves
-(macOS, Linux, or Windows under Git Bash / MSYS2 / WSL), run the `.sh`;
+(macOS, Linux, or Windows under Git Bash / MSYS2 / Cygwin), run the `.sh`;
 otherwise, on native Windows PowerShell, run the `.ps1`. A stock Windows box has
 no Git Bash — do not send the user off to install one.
 
-### POSIX (macOS / Linux / Git Bash)
+**WSL is not a Windows route:** inside WSL `uname` reports Linux, so the `.sh`
+installs *Linux* binaries into the WSL filesystem — usable only from inside
+WSL, invisible to a Windows-native Claude Code. Take it only when Claude Code
+itself runs inside WSL. (The WSL launcher `C:\Windows\System32\bash.exe` on a
+Windows `PATH` does not count as a POSIX shell — use the `.ps1`.) Run the
+commands below exactly as written; the quoting matches this command's
+allowed-tools rules.
+
+### POSIX (macOS / Linux / Git Bash / MSYS2 / Cygwin)
 
 ```sh
 "${CLAUDE_PLUGIN_ROOT}/scripts/install-sothis.sh" $ARGUMENTS
@@ -78,6 +86,11 @@ After it finishes (either path):
 - If it noted **pingmybell not installed**, mention it once as optional — the
   bell (voice callouts + notch board) is a desktop app built from source at
   https://github.com/Davidb3l/pingmybell; never attempt to install it yourself.
+- **On Windows, a `hayven: WARNING` is expected, not a failure.** Hayvenhurst
+  has no native Windows installer yet (its `install-hayven.sh` refuses Git Bash
+  / MSYS / Cygwin), so both one-shots warn, print the manual route (the
+  `windows-x64` release tarball + its `.sha256`), and carry on. Relay that
+  route; sirius works without hayven, with reduced function, until it's done.
 - If the script **fetched and ran hayven's installer over HTTPS** (no local copy
   found), that's expected; but if a download, checksum, or **signature
   verification failed**, report the exact error and stop — never work around a

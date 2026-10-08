@@ -102,9 +102,11 @@ BIN_DIR="$PREFIX/bin"
 # `sirius` to sirius.exe, but relying on that magic makes the script read as if
 # a Unix-named file were installed, which it is not.)
 IS_WINDOWS=0
+IS_CYGWIN=0
 BIN_NAME="sirius"
 case "$(uname -s)" in
-  MINGW*|MSYS*|CYGWIN*) IS_WINDOWS=1; BIN_NAME="sirius.exe" ;;
+  CYGWIN*) IS_WINDOWS=1; IS_CYGWIN=1; BIN_NAME="sirius.exe" ;;
+  MINGW*|MSYS*) IS_WINDOWS=1; BIN_NAME="sirius.exe" ;;
 esac
 
 log()  { printf '%s\n' "$*" >&2; }
@@ -346,6 +348,17 @@ fi
 verify_signature() {
   bundle="$1"
   artifact="$2"
+  # Under Cygwin the verifier is almost always a NATIVE Windows program
+  # (winget's cosign.exe, a Windows python.exe), and unlike MSYS2/Git Bash,
+  # Cygwin does not rewrite POSIX path arguments for native programs — so
+  # cosign.exe would be handed "/tmp/sirius-install.X/..." and fail to open it,
+  # which reads exactly like a verification failure. Give it the Windows form.
+  # (A Cygwin-built verifier accepts C:\... paths too, so this is safe either
+  # way.) MSYS2/Git Bash already convert these arguments automatically.
+  if [ "$IS_CYGWIN" = "1" ] && have cygpath; then
+    bundle="$(cygpath -w "$bundle")"
+    artifact="$(cygpath -w "$artifact")"
+  fi
   identity="https://github.com/$REPO/.github/workflows/release.yml@refs/tags/$TAG"
   issuer="https://token.actions.githubusercontent.com"
 
@@ -415,6 +428,14 @@ $verify_out"
 # ---- install ---------------------------------------------------------------
 detect_platform
 resolve_latest_tag
+# Release tags are always v-prefixed. Accept a bare "0.1.6" from --version /
+# SIRIUS_RELEASE_TAG as "v0.1.6" (as install-sirius.ps1 does) instead of
+# building a /releases/download/0.1.6/ URL that 404s. A tag resolved from
+# /releases/latest already carries its "v", so this leaves it untouched.
+case "$TAG" in
+  v*) ;;
+  *) TAG="v$TAG" ;;
+esac
 VERSION="${TAG#v}"
 TARBALL="sirius-forester-${VERSION}-${PLATFORM}.tar.gz"
 BASE_URL="https://github.com/$REPO/releases/download/$TAG"

@@ -22,6 +22,11 @@
       catryna  - bun-based MCP plugin    -> bun checked; the plugin comes from the
                                            marketplace bundle (auto-installed below)
 
+    On Windows the hayven step is best-effort: Hayvenhurst has no native
+    Windows installer yet (no install-hayven.ps1, and its install-hayven.sh
+    refuses Git Bash / MSYS / Cygwin), so a failure there prints a WARNING
+    with the manual route and the run carries on. Elsewhere it stays fatal.
+
     WHY a .ps1 next to the .sh: install-sothis.sh is POSIX sh and needs a POSIX
     shell. A stock Windows box - and a Claude Code agent running in a
     PowerShell-only session - may have no Git Bash at all. This file is a
@@ -158,6 +163,12 @@ if ([string]::IsNullOrEmpty($ScriptDir)) {
     $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 }
 
+# Windows PowerShell 5.1 has no $IsWindows and only runs on Windows; 6+ defines
+# it. Decides whether a hayven install failure is fatal (see Install-Hayven).
+$OnWindows = $true
+$isWinVar = Get-Variable -Name 'IsWindows' -ErrorAction SilentlyContinue
+if ($null -ne $isWinVar) { $OnWindows = [bool]$isWinVar.Value }
+
 # ---- tiny helpers -----------------------------------------------------------
 
 # install-sothis.sh logs to stderr so stdout stays clean for callers; mirror it.
@@ -185,6 +196,24 @@ function Get-CommandPath {
     return $c.Name
 }
 
+# The path of something Start-Process can actually launch. A plain Get-Command
+# prefers PowerShell's own command types, so for `claude` it returns npm's
+# `claude.ps1` shim (npm installs .ps1, .cmd AND an extensionless sh shim side
+# by side). A .ps1 is not a Win32 executable: Start-Process throws on it, the
+# caller turns that into exit -1, and every `claude plugin ...` call would be
+# reported as failed. -CommandType Application restricts the lookup to real
+# programs; the extension filter then keeps exactly the shapes
+# Get-NativeInvocation knows how to launch (.exe/.com directly, .cmd/.bat via
+# cmd.exe) and drops the extensionless sh shim. $null when nothing matches.
+function Get-NativeExePath {
+    param([string]$Name)
+    $hits = @(Get-Command $Name -CommandType Application -All -ErrorAction SilentlyContinue)
+    foreach ($h in $hits) {
+        if ($null -ne $h.Path -and $h.Path -match '\.(exe|com|cmd|bat)$') { return $h.Path }
+    }
+    return $null
+}
+
 # Windows command-line quoting; Start-Process -ArgumentList joins an array with
 # plain spaces in 5.1, which silently breaks any path containing a space.
 function Format-NativeArg {
@@ -199,7 +228,7 @@ function Format-NativeArg {
 function Get-NativeInvocation {
     param([string]$FilePath, [string[]]$ArgumentList = @())
 
-    $exe = Get-CommandPath $FilePath
+    $exe = Get-NativeExePath $FilePath
     if ($null -eq $exe) { $exe = $FilePath }
 
     $quoted = @()
@@ -603,7 +632,9 @@ function Install-Sirius {
 #                                          the Sothis bundle; accept any.
 #
 # A native install-hayven.ps1 wins over the .sh: on a PowerShell-only box the
-# POSIX script needs an interpreter we may not have.
+# POSIX script needs an interpreter we may not have. (Hayvenhurst ships no .ps1
+# today, and its .sh refuses Windows shells - so on Windows this step is
+# expected to end in Stop-HayvenInstall's warning, not an abort.)
 function Find-LocalHayvenInstaller {
     $roots = @(
         (Join-Path $ClaudePluginsDir 'marketplaces\hayvenhurst\plugin\scripts'),
@@ -618,12 +649,81 @@ function Find-LocalHayvenInstaller {
     return $null
 }
 
+# The WSL launcher (%SystemRoot%\System32\bash.exe) is a `bash` on PATH on any
+# box with WSL enabled - and often the FIRST one, since System32 leads PATH.
+# It is not a POSIX shell for Windows paths: it starts a Linux distro, where
+# C:\...\install-hayven.sh does not exist (and, if it ran, it would install a
+# LINUX hayven inside WSL). Never accept anything under %SystemRoot% (that also
+# covers SysWOW64 / Sysnative), nor the WindowsApps App Execution Alias stubs.
+function Test-UsablePosixShell {
+    param([string]$Path)
+    if ([string]::IsNullOrEmpty($Path)) { return $false }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $full = [System.IO.Path]::GetFullPath($Path)
+    if (-not [string]::IsNullOrEmpty($env:SystemRoot)) {
+        $sysRoot = $env:SystemRoot.TrimEnd('\') + '\'
+        if ($full.StartsWith($sysRoot, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+    }
+    if ($full -match '\\Microsoft\\WindowsApps\\') { return $false }
+    return $true
+}
+
+# Prefer Git for Windows' own bash (an MSYS2 bash that maps C:\ paths). Find it
+# from wherever git.exe lives - the installer puts git.exe in <Git>\cmd\, and
+# some setups expose <Git>\bin\ or <Git>\mingw64\bin\ instead, so walk up a few
+# levels looking for <dir>\bin\bash.exe - then the standard install locations,
+# then any other bash/sh on PATH that survives Test-UsablePosixShell.
 function Get-PosixShell {
+    $candidates = @()
+
+    $git = Get-NativeExePath 'git'
+    if ($null -ne $git) {
+        $dir = Split-Path -Parent $git
+        for ($i = 0; $i -lt 3 -and -not [string]::IsNullOrEmpty($dir); $i++) {
+            $candidates += (Join-Path $dir 'bin\bash.exe')
+            $dir = Split-Path -Parent $dir
+        }
+    }
+    foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432)) {
+        if (-not [string]::IsNullOrEmpty($root)) { $candidates += (Join-Path $root 'Git\bin\bash.exe') }
+    }
+    if (-not [string]::IsNullOrEmpty($env:LOCALAPPDATA)) {
+        # Git for Windows' per-user ("only for me") install location.
+        $candidates += (Join-Path $env:LOCALAPPDATA 'Programs\Git\bin\bash.exe')
+    }
     foreach ($sh in @('bash', 'sh')) {
-        $p = Get-CommandPath $sh
-        if ($null -ne $p) { return $p }
+        foreach ($hit in @(Get-Command $sh -CommandType Application -All -ErrorAction SilentlyContinue)) {
+            if ($null -ne $hit.Path) { $candidates += $hit.Path }
+        }
+    }
+
+    foreach ($c in $candidates) {
+        if (Test-UsablePosixShell $c) { return $c }
     }
     return $null
+}
+
+# On Windows a hayven failure is a WARNING, not an abort. Hayvenhurst ships no
+# native install-hayven.ps1 yet, and its install-hayven.sh refuses
+# MINGW/MSYS/CYGWIN ("unsupported OS"), so on this platform the delegated
+# install is expected to fail - and aborting would take amt / catryna /
+# sirius doctor / the plugin half down with it. Say what happened, how to get
+# hayven by hand, and carry on. Anywhere else (pwsh on macOS/Linux) a failure
+# is a real failure, so it stays fatal, exactly like install-sothis.sh.
+function Stop-HayvenInstall {
+    param([string]$Reason)
+    if (-not $OnWindows) { Stop-WithError $Reason }
+    Write-Log ''
+    Write-Log ('hayven: WARNING: ' + $Reason)
+    Write-Log '        Skipping hayven and carrying on with the rest of the suite.'
+    Write-Log '        Hayvenhurst has no native Windows installer yet (its install-hayven.sh'
+    Write-Log '        only covers macOS/Linux), so install hayven by hand: from'
+    Write-Log ('          https://github.com/' + $HayvenRepo + '/releases/latest')
+    Write-Log '        take hayvenhurst-<version>-windows-x64.tar.gz, check it against the'
+    Write-Log '        .sha256 published beside it, extract it (tar -xzf), and put hayven.exe'
+    Write-Log ('        (plus hayven-native.exe if present) in ' + $BinDir)
+    Write-Log '        Until then sirius still runs, with reduced function: no Hayvenhurst'
+    Write-Log '        code graph (locks, maps, impact), and sirius doctor will flag hayven.'
 }
 
 function Invoke-HayvenInstaller {
@@ -639,9 +739,13 @@ function Invoke-HayvenInstaller {
         try {
             & $Path @hayArgs
         } catch {
-            Stop-WithError ('install-hayven.ps1 failed: ' + $_.Exception.Message)
+            Stop-HayvenInstall ('install-hayven.ps1 failed: ' + $_.Exception.Message)
+            return $false
         }
-        if ($LASTEXITCODE -ne 0) { Stop-WithError 'install-hayven.ps1 failed' }
+        if ($LASTEXITCODE -ne 0) {
+            Stop-HayvenInstall 'install-hayven.ps1 failed'
+            return $false
+        }
         return $true
     }
 
@@ -650,17 +754,23 @@ function Invoke-HayvenInstaller {
     # install-sothis.sh (it IS a POSIX shell), so it has no mirror image in the
     # shell script: rather than aborting the whole one-shot over one tool, warn
     # and carry on so amt / catryna / the plugin half still get handled.
+    #
+    # No "install Git for Windows and re-run" advice here any more: Git Bash's
+    # bash IS what Get-PosixShell picks when present, but install-hayven.sh
+    # refuses MINGW/MSYS/CYGWIN anyway, so sending the user off to install Git
+    # would not get them hayven. Stop-HayvenInstall prints the route that does.
     $shell = Get-PosixShell
     if ($null -eq $shell) {
-        Write-Log ''
-        Write-Log 'hayven: WARNING: found only the POSIX installer (install-hayven.sh) and this'
-        Write-Log '        machine has no sh/bash to run it with. Skipping hayven. Finish it with'
-        Write-Log '        /hayvenhurst:install-binary in Claude Code, or install Git for Windows'
-        Write-Log '        (which provides bash) and re-run this script.'
+        Stop-HayvenInstall ('found only the POSIX installer (install-hayven.sh) and no usable sh/bash
+        to run it with (Git for Windows'' <Git>\bin\bash.exe is used when present;
+        the WSL launcher in System32 never is - it would run a LINUX install inside WSL)')
         return $false
     }
     $code = Invoke-NativePassthru -FilePath $shell -ArgumentList (@($Path) + $fwd)
-    if ($code -ne 0) { Stop-WithError 'install-hayven.sh failed' }
+    if ($code -ne 0) {
+        Stop-HayvenInstall ('install-hayven.sh failed (exit ' + $code + ')')
+        return $false
+    }
     return $true
 }
 
@@ -682,7 +792,8 @@ function Install-Hayven {
     }
 
     # No local copy. Fetch the installer from the pinned ref - preferring a
-    # native .ps1 if Hayvenhurst ships one, else its .sh.
+    # native .ps1 if Hayvenhurst ships one (it does not yet; the 404 is
+    # expected), else its .sh.
     $base = 'https://raw.githubusercontent.com/' + $HayvenRepo + '/' + $HayvenInstallerRef + '/plugin/scripts/install-hayven.'
     $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ('hayven-install.' + [System.Guid]::NewGuid().ToString('N').Substring(0, 8))
     New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
@@ -703,8 +814,9 @@ function Install-Hayven {
             }
         }
         if ($null -eq $fetched) {
-            Stop-WithError ('could not download install-hayven from ' + $HayvenRepo + '@' + $HayvenInstallerRef + '.
+            Stop-HayvenInstall ('could not download install-hayven from ' + $HayvenRepo + '@' + $HayvenInstallerRef + '.
         Install hayven yourself with /hayvenhurst:install-binary, or re-run with -SkipHayven.')
+            return
         }
         [void](Invoke-HayvenInstaller -Path $fetched)
     } finally {
