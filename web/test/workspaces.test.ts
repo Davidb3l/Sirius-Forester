@@ -80,7 +80,9 @@ test("lists every repo with a Sirius ledger — running first — and the launch
 });
 
 test("?ws= serves that fleet's ledger; no ws serves the launch repo", async () => {
-  const real = (p: string) => realpathSync(p);
+  // .native, as the server uses: the JS realpath leaves a Windows 8.3 short
+  // name (C:\Users\RUNNER~1\...) unexpanded, so the two never compared equal.
+  const real = (p: string) => realpathSync.native(p);
   const lydgr = (await (await get("/api/health?ws=lydgr")).json()) as { workspace: string };
   expect(real(lydgr.workspace)).toBe(real(join(dir, "Lydgr")));
   const home = (await (await get("/api/health")).json()) as { workspace: string };
