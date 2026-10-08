@@ -1074,7 +1074,12 @@ fn cmd_run(
     // observed in the field. Refuse to start rather than letting the operator
     // discover it one expensive agent run at a time. (pass-with-warning is
     // the one fallback that can advance without a test_cmd.)
-    if cfg.gate.test_cmd.is_none() && cfg.gate.fallback != config::GateFallback::PassWithWarning {
+    let test_cmd_unset = cfg
+        .gate
+        .test_cmd
+        .as_deref()
+        .map_or(true, |c| c.trim().is_empty());
+    if test_cmd_unset && cfg.gate.fallback != config::GateFallback::PassWithWarning {
         eprint_err(
             "gate.test_cmd is not set — every gate would fail closed and no issue could \
              advance; set gate.test_cmd in .sirius/config.json (or gate.fallback to \

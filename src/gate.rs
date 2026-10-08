@@ -335,7 +335,9 @@ fn run_cmd(
     plan_label: &str,
     reason: String,
 ) -> GateVerdict {
-    let Some(cmd) = test_cmd else {
+    // A blank command is no command: it would reach the shell, run nothing,
+    // exit 0, and pass everything. Fail it closed like an unset one.
+    let Some(cmd) = test_cmd.filter(|c| !c.trim().is_empty()) else {
         return GateVerdict {
             passed: false,
             // The one STRUCTURAL verdict: no test_cmd exists, so no fresh
@@ -620,6 +622,19 @@ mod tests {
     /// shell the developer happens to have installed.
     fn test_shell() -> ShellCmd {
         ShellCmd::posix_sh()
+    }
+
+    #[test]
+    fn blank_test_cmd_fails_closed_like_an_unset_one() {
+        let m = MockRunner::new();
+        let v = run_cmd(&m, &test_shell(), Some("   "), &[], "full", "x".into());
+        assert!(!v.passed && v.structural, "{v:?}");
+        assert_eq!(v.reason_code, reason_code::UNCONFIGURED_TEST_CMD);
+        assert!(
+            m.recorded().is_empty(),
+            "nothing may run: {:?}",
+            m.recorded()
+        );
     }
 
     #[test]
