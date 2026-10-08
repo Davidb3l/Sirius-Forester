@@ -141,41 +141,67 @@ pub fn changed_symbols(
     runner: &dyn Runner,
     hv: &Hayven,
     range: Option<&str>,
-    fleet_base: Option<&str>,
+    fleet: Option<FleetBase<'_>>,
 ) -> Result<ChangedSymbols, String> {
-    let fleet_base = if range.is_none() {
-        usable_fleet_base(runner, fleet_base)
+    let fleet = if range.is_none() {
+        fleet.filter(|f| usable_fleet_base(runner, f.base))
     } else {
         None
     };
-    let files = match (range, fleet_base) {
+    let files = match (range, fleet) {
         (Some(r), _) => changed_files(runner, Some(r))?,
         // Inside a fleet iteration the base the worker started from is known
-        // ($SIRIUS_BASE): the change is everything the worker did since —
-        // its own commits plus anything still uncommitted. Commits are listed
-        // per commit, merges excluded: a tree diff `base..HEAD` would also
-        // stamp other workers' landed files once a fix round merges the base
-        // in. A worker that did nothing (HEAD == base, clean tree) links
-        // nothing — never the base branch's last commit.
-        (None, Some(base)) => {
-            let log = run_git(
+        // ($SIRIUS_BASE): the change is everything the worker did since — its
+        // own commits plus anything still uncommitted. `--first-parent`: the
+        // worker's line is always first-parent (detached at base; a fix round
+        // merges the CURRENT base into its HEAD), so other workers' commits
+        // that a fix round merged in stay out — a plain `base..HEAD` (tree
+        // diff or log) would stamp them on this issue. Work resumed from an
+        // earlier run arrives as a second parent, so it is added explicitly.
+        // A worker that did nothing (HEAD == base, clean tree) links nothing —
+        // never the base branch's last commit.
+        (None, Some(f)) => {
+            let own = run_git(
                 runner,
                 &[
                     "log",
+                    "--first-parent",
                     "--no-merges",
                     "--name-only",
                     "--format=",
-                    &format!("{base}..HEAD"),
+                    &format!("{}..HEAD", f.base),
                 ],
             )?;
+            let resumed = match f.resumed_from.map(str::trim).filter(|r| !r.is_empty()) {
+                Some(r) => run_git(
+                    runner,
+                    &[
+                        "log",
+                        "--no-merges",
+                        "--name-only",
+                        "--format=",
+                        &format!("{}..{r}", f.base),
+                    ],
+                )
+                .map(|o| stdout_lines(&o))
+                .unwrap_or_default(),
+                None => Vec::new(),
+            };
             let mut files: Vec<String> = Vec::new();
-            for f in stdout_lines(&log)
+            for f in stdout_lines(&own)
                 .into_iter()
+                .chain(resumed)
                 .chain(changed_files(runner, None)?)
             {
                 if !files.contains(&f) {
                     files.push(f);
                 }
+            }
+            if files.is_empty() {
+                // New files only, not yet committed: say so rather than
+                // silently linking nothing (they are not stamped either — a
+                // non-isolated run can't tell them from scratch files).
+                refuse_if_untracked_pending(runner)?;
             }
             files
         }
@@ -213,14 +239,20 @@ pub fn changed_symbols(
     Ok(ChangedSymbols { files, symbols })
 }
 
-/// `$SIRIUS_BASE`, if it names a commit HEAD descends from. Anything else — a
-/// stale or foreign SHA left exported in a human's shell — is ignored rather
-/// than trusted: an old base would stamp every file changed since then.
-fn usable_fleet_base<'a>(runner: &dyn Runner, base: Option<&'a str>) -> Option<&'a str> {
-    let base = base.map(str::trim).filter(|b| !b.is_empty())?;
-    run_git(runner, &["merge-base", "--is-ancestor", base, "HEAD"])
-        .ok()
-        .map(|_| base)
+/// A fleet iteration's starting point, from its env: `$SIRIUS_BASE` and, when
+/// held work from an earlier run was merged in, `$SIRIUS_RESUMED_FROM`.
+#[derive(Debug, Clone, Copy)]
+pub struct FleetBase<'a> {
+    pub base: &'a str,
+    pub resumed_from: Option<&'a str>,
+}
+
+/// Whether `base` names a commit HEAD descends from. Anything else — a stale
+/// or foreign SHA left exported in a human's shell — is ignored rather than
+/// trusted (exit 1 "not an ancestor" and 128 "bad revision" alike).
+fn usable_fleet_base(runner: &dyn Runner, base: &str) -> bool {
+    let base = base.trim();
+    !base.is_empty() && run_git(runner, &["merge-base", "--is-ancestor", base, "HEAD"]).is_ok()
 }
 
 /// Untracked paths the suite's own tools write into a repo (event spine,
@@ -242,6 +274,20 @@ fn solo_changed_files(runner: &dyn Runner) -> Result<Vec<String>, String> {
     if !files.is_empty() {
         return Ok(files);
     }
+    refuse_if_untracked_pending(runner)?;
+    // A repo whose HEAD is the root commit has no HEAD~1; that is not an error
+    // here, there is simply nothing earlier to diff against. `--verify --quiet`
+    // exits non-zero in that case, which run_git turns into an Err we
+    // deliberately swallow.
+    match run_git(runner, &["rev-parse", "--verify", "--quiet", "HEAD~1"]) {
+        Ok(prev) if !prev.stdout.trim().is_empty() => changed_files(runner, Some("HEAD~1..HEAD")),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Err when untracked files (suite-owned dirs excepted) are pending: the work
+/// exists but is not committed, so no commit range can stand in for it.
+fn refuse_if_untracked_pending(runner: &dyn Runner) -> Result<(), String> {
     let untracked: Vec<String> = untracked_files(runner)?
         .into_iter()
         .filter(|f| !SUITE_DIRS.iter().any(|d| f.starts_with(d)))
@@ -254,14 +300,7 @@ fn solo_changed_files(runner: &dyn Runner) -> Result<Vec<String>, String> {
             untracked.len()
         ));
     }
-    // A repo whose HEAD is the root commit has no HEAD~1; that is not an error
-    // here, there is simply nothing earlier to diff against. `--verify --quiet`
-    // exits non-zero in that case, which run_git turns into an Err we
-    // deliberately swallow.
-    match run_git(runner, &["rev-parse", "--verify", "--quiet", "HEAD~1"]) {
-        Ok(prev) if !prev.stdout.trim().is_empty() => changed_files(runner, Some("HEAD~1..HEAD")),
-        _ => Ok(Vec::new()),
-    }
+    Ok(())
 }
 
 /// Pull entity ids out of a `hayven query` result (`{"hits":[{"id":..}]}`).
@@ -459,7 +498,7 @@ mod tests {
         let m = MockRunner::new();
         m.expect(&["git", "merge-base", "--is-ancestor"], 0, "");
         m.expect(
-            &["git", "log", "--no-merges"],
+            &["git", "log", "--first-parent"],
             0,
             "src/a.rs\n\nsrc/b.rs\nsrc/a.rs\n",
         );
@@ -474,16 +513,66 @@ mod tests {
             r#"{"roots":["src/a","src/b","src/c"],"tests":[]}"#,
         );
         let hv = Hayven::new(&m);
-        let got = changed_symbols(&m, &hv, None, Some("base1")).unwrap();
+        let got = changed_symbols(
+            &m,
+            &hv,
+            None,
+            Some(FleetBase {
+                base: "base1",
+                resumed_from: None,
+            }),
+        )
+        .unwrap();
         assert_eq!(got.files, vec!["src/a.rs", "src/b.rs", "src/c.rs"]);
         let calls = m.recorded();
         assert!(
-            calls
-                .iter()
-                .any(|c| c == "git log --no-merges --name-only --format= base1..HEAD"),
+            calls.iter().any(
+                |c| c == "git log --first-parent --no-merges --name-only --format= base1..HEAD"
+            ),
             "{calls:?}"
         );
         assert!(!calls.iter().any(|c| c.contains("HEAD~1")), "{calls:?}");
+    }
+
+    /// Work resumed from an earlier run sits on a second parent, outside the
+    /// first-parent walk — it is this issue's work, so it is listed too.
+    #[test]
+    fn changed_symbols_includes_resumed_work() {
+        let m = MockRunner::new();
+        m.expect(&["git", "merge-base", "--is-ancestor"], 0, "");
+        m.expect(&["git", "log", "--first-parent"], 0, "src/new.rs\n");
+        m.expect(&["git", "log", "--no-merges"], 0, "src/held.rs\n");
+        m.expect(&["git", "diff", "--name-only", "HEAD"], 0, "");
+        m.expect(&["hayven", "affected-tests"], 0, r#"{"roots":["a","b"]}"#);
+        let hv = Hayven::new(&m);
+        let fleet = FleetBase {
+            base: "base1",
+            resumed_from: Some("held1"),
+        };
+        let got = changed_symbols(&m, &hv, None, Some(fleet)).unwrap();
+        assert_eq!(got.files, vec!["src/new.rs", "src/held.rs"]);
+        assert!(m
+            .recorded()
+            .iter()
+            .any(|c| c == "git log --no-merges --name-only --format= base1..held1"));
+    }
+
+    /// Fleet worker with only new, uncommitted files: refuse loudly instead of
+    /// silently linking nothing.
+    #[test]
+    fn changed_symbols_fleet_refuses_with_only_untracked_work() {
+        let m = MockRunner::new();
+        m.expect(&["git", "merge-base", "--is-ancestor"], 0, "");
+        m.expect(&["git", "log"], 0, "");
+        m.expect(&["git", "diff"], 0, "");
+        m.expect(&["git", "ls-files", "--others"], 0, "src/brand_new.rs\n");
+        let hv = Hayven::new(&m);
+        let fleet = FleetBase {
+            base: "base1",
+            resumed_from: None,
+        };
+        let e = changed_symbols(&m, &hv, None, Some(fleet)).unwrap_err();
+        assert!(e.contains("src/brand_new.rs"), "{e}");
     }
 
     /// A stale or foreign $SIRIUS_BASE (not an ancestor of HEAD) is ignored:
@@ -495,7 +584,16 @@ mod tests {
         m.expect(&["git", "diff"], 0, "src/a.rs\n");
         m.expect(&["hayven", "affected-tests"], 0, r#"{"roots":["src/a"]}"#);
         let hv = Hayven::new(&m);
-        let got = changed_symbols(&m, &hv, None, Some("oldsha")).unwrap();
+        let got = changed_symbols(
+            &m,
+            &hv,
+            None,
+            Some(FleetBase {
+                base: "oldsha",
+                resumed_from: None,
+            }),
+        )
+        .unwrap();
         assert_eq!(got.files, vec!["src/a.rs"]);
         assert!(!m.recorded().iter().any(|c| c.starts_with("git log")));
     }
@@ -543,7 +641,16 @@ mod tests {
         m.expect(&["git", "diff"], 0, "");
         m.expect(&["git", "rev-parse", "--verify"], 0, "abc123\n");
         let hv = Hayven::new(&m);
-        let got = changed_symbols(&m, &hv, None, Some("base1")).unwrap();
+        let got = changed_symbols(
+            &m,
+            &hv,
+            None,
+            Some(FleetBase {
+                base: "base1",
+                resumed_from: None,
+            }),
+        )
+        .unwrap();
         assert_eq!(got, ChangedSymbols::default());
         assert!(!m.recorded().iter().any(|c| c.contains("HEAD~1")));
     }

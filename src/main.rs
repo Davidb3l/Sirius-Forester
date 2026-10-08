@@ -306,17 +306,21 @@ fn cmd_link(
     };
 
     let mut changed_files: Option<usize> = None;
+    // Only an iteration's own env: SIRIUS_BASE travels with SIRIUS_ISSUE
+    // (run.rs base_env), never alone in a human shell.
+    let fleet_base = std::env::var("SIRIUS_ISSUE")
+        .ok()
+        .and_then(|_| std::env::var("SIRIUS_BASE").ok());
+    let resumed_from = std::env::var("SIRIUS_RESUMED_FROM").ok();
     if changed {
         match gitrange::changed_symbols(
             runner,
             &hv,
             range.as_deref(),
-            // Only an iteration's own env: SIRIUS_BASE travels with
-            // SIRIUS_ISSUE (run.rs base_env), never alone in a human shell.
-            std::env::var("SIRIUS_ISSUE")
-                .ok()
-                .and_then(|_| std::env::var("SIRIUS_BASE").ok())
-                .as_deref(),
+            fleet_base.as_deref().map(|base| gitrange::FleetBase {
+                base,
+                resumed_from: resumed_from.as_deref(),
+            }),
         ) {
             Ok(c) => {
                 // The count is printed WITH its file count (SIRF-20) so an

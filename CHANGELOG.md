@@ -28,7 +28,7 @@ release moves them under its version (see AGENTS.md → "Releases are batched").
 - Console: the header and tab title name the fleet being watched and the real port (it always said `:1777`).
 - Windows: every `git worktree` sirius creates — fleet workers, review trees, `sirius integrate`, frontier checks, review canaries — failed on the `\\?\` path prefix, so the fleet could not start at all. (SF-16)
 - `sirius doctor` blessed a stale hayven daemon that 500s on every claim; it now compares the daemon's build to the CLI's. (SF-13)
-- `sirius link --changed` right after a commit silently filed no receipt; it now uses the work just committed (every commit since `$SIRIUS_BASE` inside a fleet, else the last commit), and refuses to guess while untracked files are pending. (SF-12)
+- `sirius link --changed` right after a commit silently filed no receipt; it now uses the work just committed (inside a fleet, the worker's own commits since `$SIRIUS_BASE` plus resumed work; else the last commit), and refuses to guess while untracked files are pending. (SF-12)
 - A shell that cannot start is named as the shell, instead of reading as a missing test binary. (SF-15)
 
 ## 0.1.6 — 2026-10-04
