@@ -311,7 +311,12 @@ fn cmd_link(
             runner,
             &hv,
             range.as_deref(),
-            std::env::var("SIRIUS_BASE").ok().as_deref(),
+            // Only an iteration's own env: SIRIUS_BASE travels with
+            // SIRIUS_ISSUE (run.rs base_env), never alone in a human shell.
+            std::env::var("SIRIUS_ISSUE")
+                .ok()
+                .and_then(|_| std::env::var("SIRIUS_BASE").ok())
+                .as_deref(),
         ) {
             Ok(c) => {
                 // The count is printed WITH its file count (SIRF-20) so an

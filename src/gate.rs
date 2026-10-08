@@ -556,10 +556,9 @@ fn last_lines(stdout: &str, stderr: &str, n: usize) -> String {
 }
 
 /// Minimal quoting for a test id appended to `gate.test_cmd`: POSIX single
-/// quotes for `sh -c`; for `cmd.exe` (no POSIX sh on a Windows box), double
-/// quotes — cmd keeps single quotes literally, so a pytest `test_x[a b]` id
-/// would reach the runner as `'test_x[a` + `b]'` and match nothing. An inner
-/// `"` is escaped the MSVC way the test runner's own argv parser reads.
+/// quotes for `sh -c`; for `cmd.exe` (no POSIX sh on a Windows box), see
+/// [`cmd_quote`] — cmd keeps single quotes literally, so a pytest `test_x[a b]`
+/// id would reach the runner as `'test_x[a` + `b]'` and match nothing.
 fn shell_quote(s: &str, posix: bool) -> String {
     if s.chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '='))
@@ -568,8 +567,46 @@ fn shell_quote(s: &str, posix: bool) -> String {
     } else if posix {
         format!("'{}'", s.replace('\'', r"'\''"))
     } else {
-        format!("\"{}\"", s.replace('"', r#"\""#))
+        cmd_quote(s)
     }
+}
+
+/// Quote `s` as ONE argument for a program launched by `cmd.exe`, in two
+/// layers. Inner: the MSVC argv rules the test runner itself parses (wrap in
+/// `"`, escape an embedded `"` as `\"`, double backslashes that precede a
+/// quote). Outer: caret-escape every character cmd would act on — including
+/// the quotes themselves, because cmd toggles its quote state on each `"` and
+/// ignores the backslash, so an id like `a "b & c"` would otherwise put the `&`
+/// outside cmd's quotes and split the command. `^%` likewise stops `%VAR%`
+/// expansion. cmd strips the carets and hands the inner layer through intact.
+fn cmd_quote(s: &str) -> String {
+    let mut msvc = String::from("\"");
+    let mut backslashes = 0usize;
+    for c in s.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                msvc.push_str(&"\\".repeat(backslashes * 2 + 1));
+                msvc.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                msvc.push_str(&"\\".repeat(backslashes));
+                msvc.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    msvc.push_str(&"\\".repeat(backslashes * 2));
+    msvc.push('"');
+    let mut out = String::with_capacity(msvc.len() * 2);
+    for c in msvc.chars() {
+        if matches!(c, '^' | '&' | '|' | '<' | '>' | '(' | ')' | '%' | '!' | '"') {
+            out.push('^');
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -590,8 +627,12 @@ mod tests {
         assert_eq!(shell_quote("tests/a.py::t", true), "tests/a.py::t");
         assert_eq!(shell_quote("t[a b]", true), "'t[a b]'");
         assert_eq!(shell_quote("it's", true), r"'it'\''s'");
-        assert_eq!(shell_quote("t[a b]", false), r#""t[a b]""#);
-        assert_eq!(shell_quote(r#"say "hi""#, false), r#""say \"hi\"""#);
+        // cmd.exe: MSVC-quoted, then every cmd metachar (quotes too) careted.
+        assert_eq!(shell_quote("t[a b]", false), r#"^"t[a b]^""#);
+        assert_eq!(shell_quote(r#"a "b & c""#, false), r#"^"a \^"b ^& c\^"^""#);
+        assert_eq!(shell_quote("t[%PATH%]", false), r#"^"t[^%PATH^%]^""#);
+        // A trailing backslash must not escape the closing quote.
+        assert_eq!(shell_quote(r"dir\", false), r#"^"dir\\^""#);
     }
 
     fn sel_json(ok: bool, roots: usize, note: &str, runnables: &[&str]) -> Selection {
