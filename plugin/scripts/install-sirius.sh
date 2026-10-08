@@ -35,8 +35,14 @@
 # proves "that repo signed its own artifact". Do not set it to a repo you do
 # not trust.
 #
-# Idempotent + safe to re-run. POSIX sh (macOS / Linux). Windows is not
-# covered here — install from the release tarball manually.
+# Idempotent + safe to re-run. POSIX sh, covering macOS, Linux AND Windows:
+# under Git Bash / MSYS2 / Cygwin `uname -s` reports MINGW*/MSYS*/CYGWIN*, and
+# this script installs the windows-x64 release asset (the binary inside is
+# sirius.exe). windows-x64 is the only Windows asset, so a non-x64 Windows box
+# is refused by name rather than 404ing on a download.
+#
+# If you have no POSIX layer at all (PowerShell only), use the native
+# install-sirius.ps1 alongside this script instead.
 #
 # Usage:
 #   install-sirius.sh                 # download + install latest release
@@ -77,7 +83,7 @@ while [ $# -gt 0 ]; do
       [ -n "${2:-}" ] || { echo "install-sirius: --prefix needs a directory" >&2; exit 2; }
       PREFIX="$2"; shift ;;
     --help|-h)
-      sed -n '2,54p' "$0"
+      sed -n '2,60p' "$0"
       exit 0
       ;;
     *) echo "install-sirius: unknown argument: $1" >&2; exit 2 ;;
@@ -86,6 +92,20 @@ while [ $# -gt 0 ]; do
 done
 
 BIN_DIR="$PREFIX/bin"
+
+# Host-shape facts we need BEFORE the platform→asset mapping runs: --check
+# returns long before detect_platform is called, but it still has to look for
+# the right file name and print the right PATH advice.
+#
+# On Windows the release tarball contains sirius.exe, so every place that names
+# the binary on disk goes through $BIN_NAME. (MSYS/Cygwin also resolve a bare
+# `sirius` to sirius.exe, but relying on that magic makes the script read as if
+# a Unix-named file were installed, which it is not.)
+IS_WINDOWS=0
+BIN_NAME="sirius"
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) IS_WINDOWS=1; BIN_NAME="sirius.exe" ;;
+esac
 
 log()  { printf '%s\n' "$*" >&2; }
 fail() { log "install-sirius: error: $*"; exit 1; }
@@ -136,7 +156,11 @@ detect_platform() {
   case "$uname_s" in
     Linux)  os="linux" ;;
     Darwin) os="macos" ;;
-    *) fail "unsupported OS '$uname_s' (this script covers macOS + Linux; on Windows install from the release tarball manually)" ;;
+    # Git Bash reports MINGW64_NT-10.0-<build>; MSYS2's msys shell reports
+    # MSYS_NT-...; Cygwin reports CYGWIN_NT-.... All three run this script
+    # fine and all three want the windows-x64 asset.
+    MINGW*|MSYS*|CYGWIN*) os="windows" ;;
+    *) fail "unsupported OS '$uname_s' (this script covers macOS, Linux, and Windows under Git Bash / MSYS / Cygwin)" ;;
   esac
   case "$uname_m" in
     x86_64|amd64) arch="x64" ;;
@@ -146,6 +170,15 @@ detect_platform() {
   # The only x64 Linux release is the glibc build; musl is not a release target.
   if [ "$os" = "linux" ] && [ "$arch" = "x64" ]; then
     PLATFORM="linux-x64-glibc"
+  elif [ "$os" = "windows" ]; then
+    # windows-x64 is the ONLY Windows asset in release.yml's matrix. Fail here
+    # by name rather than letting the download 404 on an asset that was never
+    # built. (Windows-on-ARM usually reports x86_64 through the x64 emulation
+    # layer, in which case the x64 build is the correct answer anyway.)
+    [ "$arch" = "x64" ] || fail "no Windows release asset for CPU arch '$uname_m'.
+        The only Windows asset is sirius-forester-<version>-windows-x64.tar.gz (x86_64).
+        Run this from an x64 Git Bash, or build sirius from source."
+    PLATFORM="windows-x64"
   else
     PLATFORM="${os}-${arch}"
   fi
@@ -176,10 +209,16 @@ fetch_stdout() { # fetch_stdout <url>
 
 sha256_of() { # sha256_of <file> -> hex on stdout
   f="$1"
+  # Fed a FILENAME containing a backslash — which is what $TMP looks like on
+  # Windows whenever TMPDIR is inherited as a native path like C:\Users\...\Temp
+  # — both shasum and sha256sum escape the output line and prefix it with a
+  # literal "\", so awk '{print $1}' yields "\<hex>" and every comparison below
+  # fails as a bogus checksum mismatch. Fed on stdin there is no filename to
+  # escape, and the digest is identical on every platform.
   if have shasum; then
-    shasum -a 256 "$f" | awk '{print $1}'
+    shasum -a 256 < "$f" | awk '{print $1}'
   elif have sha256sum; then
-    sha256sum "$f" | awk '{print $1}'
+    sha256sum < "$f" | awk '{print $1}'
   else
     fail "need shasum or sha256sum to verify the download"
   fi
@@ -206,15 +245,33 @@ resolve_latest_tag() {
   [ -n "$TAG" ] || fail "could not resolve the latest release tag for $REPO (pass --version vX.Y.Z)"
 }
 
+# On Windows this is the norm, not the exception: ~/.local/bin is a Unix
+# convention that nothing on Windows puts on PATH, so a fresh install lands a
+# working sirius.exe that PowerShell, cmd, editors and Claude Code cannot see.
+# We PRINT the fix; we never mutate the user's PATH from a shell script.
 print_path_hint() {
   case ":$PATH:" in
-    *":$BIN_DIR:"*) : ;; # already on PATH
-    *)
-      log ""
-      log "note: $BIN_DIR is not on your PATH. Add it, e.g.:"
-      log "      export PATH=\"$BIN_DIR:\$PATH\"   # add to ~/.zshrc or ~/.bashrc"
-      ;;
+    *":$BIN_DIR:"*) return 0 ;; # already on PATH
   esac
+  log ""
+  log "note: $BIN_DIR is not on your PATH."
+  if [ "$IS_WINDOWS" = "1" ]; then
+    log ""
+    log "  This shell only (Git Bash):"
+    log "      export PATH=\"$BIN_DIR:\$PATH\"   # add to ~/.bashrc to persist it here"
+    log ""
+    log "  Permanently, for ALL of Windows (PowerShell, cmd, editors, Claude Code)"
+    log "  — run this ONCE in PowerShell, then close and reopen your shells:"
+    log ""
+    log "      [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','User') + ';' + \"\$env:USERPROFILE\\.local\\bin\", 'User')"
+    log ""
+    log "  That one-liner appends the DEFAULT prefix (%USERPROFILE%\\.local\\bin)."
+    log "  You installed into: $BIN_DIR"
+    log "  If those differ, substitute the Windows form of the path above."
+    log "  Already-running shells, editors and apps must be RESTARTED to see it."
+  else
+    log "      export PATH=\"$BIN_DIR:\$PATH\"   # add to ~/.zshrc or ~/.bashrc"
+  fi
 }
 
 # ---- --check: status only, never downloads ---------------------------------
@@ -270,8 +327,8 @@ if [ "$MODE" = "check" ]; then
     if suite_repo; then suite_hint; update_hint sirius || true; fi
     exit 0
   fi
-  if [ -x "$BIN_DIR/sirius" ]; then
-    log "sirius: installed at $BIN_DIR/sirius (not on PATH)"
+  if [ -x "$BIN_DIR/$BIN_NAME" ]; then
+    log "sirius: installed at $BIN_DIR/$BIN_NAME (not on PATH)"
     print_path_hint
     if suite_repo; then suite_hint; update_hint "$BIN_DIR/sirius" || true; fi
     exit 0
@@ -377,7 +434,18 @@ if [ "${SIRIUS_INSTALL_DRY_RUN:-}" = "1" ]; then
   exit 0
 fi
 
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/sirius-install.XXXXXX")"
+# Windows inherits TMPDIR as a NATIVE path (C:\Users\...\Temp) often enough to
+# matter here, and GNU tar reads a leading "C:" as a remote host:path spec —
+# `tar -xzf C:\...\x.tar.gz` dies with "Cannot connect to C: resolve failed"
+# rather than extracting anything. Fall back to the POSIX /tmp that MSYS always
+# provides when TMPDIR looks native.
+TMP_BASE="${TMPDIR:-/tmp}"
+if [ "$IS_WINDOWS" = "1" ]; then
+  case "$TMP_BASE" in
+    *\\*|?:*) TMP_BASE="/tmp" ;;
+  esac
+fi
+TMP="$(mktemp -d "$TMP_BASE/sirius-install.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
 log "install-sirius: downloading $TARBALL_URL"
@@ -420,15 +488,18 @@ tar -xzf "$TMP/$TARBALL" -C "$TMP"
 # The tarball expands to a top-level dir: sirius-forester-<version>-<platform>/
 STAGE="$TMP/sirius-forester-${VERSION}-${PLATFORM}"
 [ -d "$STAGE" ] || fail "unexpected tarball layout (no $STAGE)"
-[ -f "$STAGE/sirius" ] || fail "tarball is missing the sirius binary"
+# $BIN_NAME is sirius.exe on Windows, sirius everywhere else.
+[ -f "$STAGE/$BIN_NAME" ] || fail "tarball is missing the $BIN_NAME binary"
 
 mkdir -p "$BIN_DIR"
 # Atomic-ish: write then move into place.
 tmp_dst="$BIN_DIR/.sirius.tmp.$$"
-cp "$STAGE/sirius" "$tmp_dst"
+cp "$STAGE/$BIN_NAME" "$tmp_dst"
+# Harmless (and still the right thing) under MSYS/Cygwin, which map the x bit
+# onto the file's ACL.
 chmod +x "$tmp_dst"
-mv -f "$tmp_dst" "$BIN_DIR/sirius"
-log "install-sirius: installed $BIN_DIR/sirius"
+mv -f "$tmp_dst" "$BIN_DIR/$BIN_NAME"
+log "install-sirius: installed $BIN_DIR/$BIN_NAME"
 
 log ""
 log "install-sirius: done. sirius $VERSION installed for $PLATFORM."

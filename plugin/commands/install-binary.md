@@ -1,7 +1,7 @@
 ---
 description: Download and install the platform-correct `sirius` CLI binary for this OS/arch from the latest Sirius Forester GitHub release, verifying its checksum and Sigstore signature. Use when `sirius` is not yet installed.
 argument-hint: "[vX.Y.Z]"
-allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/scripts/install-sirius.sh:*)
+allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/scripts/install-sirius.sh:*), Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File ${CLAUDE_PLUGIN_ROOT}/scripts/install-sirius.ps1:*)
 ---
 
 # Install the `sirius` binary
@@ -12,8 +12,21 @@ so it is not committed to the repo). This command bridges that gap: it downloads
 the release tarball matching this machine's OS + CPU arch, verifies its sha256,
 and installs `sirius` into the plugin's persistent data directory.
 
-Run the bundled install script. If the user passed a tag (e.g. `v0.1.0`),
-forward it explicitly:
+Two installers ship side by side — the same download, the same checksum, the
+same Sigstore verification. **Pick by shell, not by OS branding:**
+
+- **A POSIX shell** (macOS, Linux, or Windows under Git Bash / MSYS2 / WSL) →
+  run `install-sirius.sh`.
+- **Native Windows PowerShell**, with no POSIX shell available → run
+  `install-sirius.ps1`. A stock Windows box has no Git Bash; do not send the
+  user off to install one, and do not fall back to hand-extracting a tarball.
+
+Determine which you have before running anything: if `sh` / `bash` resolves,
+take the POSIX path; otherwise take the PowerShell path.
+
+### POSIX (macOS / Linux / Git Bash)
+
+If the user passed a tag (e.g. `v0.1.0`), forward it explicitly:
 
 ```sh
 "${CLAUDE_PLUGIN_ROOT}/scripts/install-sirius.sh" --version "$ARGUMENTS"
@@ -26,7 +39,26 @@ If no tag was passed, install the latest release instead (do NOT pass an empty
 "${CLAUDE_PLUGIN_ROOT}/scripts/install-sirius.sh"
 ```
 
-After it finishes:
+### Windows PowerShell
+
+Same contract, PowerShell-native flags (`-Version`, not `--version`). With a tag:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_PLUGIN_ROOT}/scripts/install-sirius.ps1" -Version "$ARGUMENTS"
+```
+
+With no tag, install the latest release (do NOT pass an empty `-Version`):
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_PLUGIN_ROOT}/scripts/install-sirius.ps1"
+```
+
+`-ExecutionPolicy Bypass` is scoped to this one process and only allows the
+bundled script to run at all; it changes nothing about the checksum or
+signature verification the script performs. Other switches map one-to-one:
+`-Prefix DIR`, `-RequireSignature`, `-Check`, `-AddToPath`, `-Force`.
+
+After it finishes (either path):
 
 - If the script printed a PATH note (the install dir isn't on `PATH`), relay that
   to the user verbatim so they can add it to their shell rc.
@@ -42,4 +74,4 @@ After it finishes:
 - If the script warned that no signature verifier was found, relay that: the
   binary installed on the strength of TLS and a checksum alone. Suggest
   `brew install cosign` (or `pip install sigstore`) and re-running with
-  `--require-signature`.
+  `--require-signature` (`-RequireSignature` on the PowerShell path).
