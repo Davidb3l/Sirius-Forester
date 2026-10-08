@@ -1226,7 +1226,20 @@ pub fn run_iteration(
                 env,
             };
             let cmd = template_cmd(agent_cmd, &issue, worker, phase_model);
-            let work = runner.run_agent("sh", &["-c", &cmd], &opts, &mut heartbeat);
+            // SF-15: the agent command is the operator's own string (template_cmd
+            // only fills {issue}/{worker}/{model}), so it gets the same explicit
+            // shell resolution as gate.test_cmd. Spawning the literal program
+            // `sh` inherited whoever launched sirius: from PowerShell on a box
+            // with no `sh` on PATH, no agent could ever start. (The REVIEW spawn
+            // below deliberately stays on `sh`: it runs a script sirius builds in
+            // POSIX syntax, which cmd.exe could not run even if we handed it over.)
+            let sh = crate::shell::resolve_shell();
+            let work = runner.run_agent(
+                &sh.program,
+                &[sh.flag.as_str(), &cmd],
+                &opts,
+                &mut heartbeat,
+            );
             let timed_out = work.as_ref().map(AgentOutcome::timed_out).unwrap_or(false);
             work_ok = work.as_ref().map(AgentOutcome::success).unwrap_or(false);
             // Agent exit code, from the captured output (durably logged by the runner).
@@ -2081,7 +2094,7 @@ fn add_review_tree(cx: &ReviewCtx, at: &str) -> Result<std::path::PathBuf, Strin
         .sirius_dir
         .join("worktrees")
         .join(format!("{}-review", safe_name(cx.worker)));
-    let t_str = t.to_string_lossy().to_string();
+    let t_str = crate::gitrange::git_path(&t);
     remove_review_tree(cx, &t);
     worktree_admin(|| {
         crate::gitrange::run_git(cx.runner, &["worktree", "add", "--detach", &t_str, at])
@@ -2092,7 +2105,7 @@ fn add_review_tree(cx: &ReviewCtx, at: &str) -> Result<std::path::PathBuf, Strin
 
 /// Remove a throwaway review tree (always — even on error paths).
 fn remove_review_tree(cx: &ReviewCtx, t: &std::path::Path) {
-    let t_str = t.to_string_lossy().to_string();
+    let t_str = crate::gitrange::git_path(&t);
     worktree_admin(|| {
         let _ = crate::gitrange::run_git(cx.runner, &["worktree", "remove", "--force", &t_str]);
     });
@@ -2199,7 +2212,7 @@ fn review_once(
                 }
             }
         };
-        let t_str = t.to_string_lossy().to_string();
+        let t_str = crate::gitrange::git_path(&t);
         // Merge only the oldest MAX_SIBLINGS (next in line); the sequence
         // check above already covered every sibling.
         let merge_sibs = &sibs[..sibs.len().min(crate::frontier::MAX_SIBLINGS)];
@@ -2268,7 +2281,7 @@ fn review_once(
                         }
                     }
                 };
-                let t_str = t.to_string_lossy().to_string();
+                let t_str = crate::gitrange::git_path(&t);
                 // A throwaway merge commit, never on any branch — so a fixed
                 // identity is fine and the user's git config is not needed.
                 let mut args = vec!["-C", t_str.as_str()];
@@ -2958,6 +2971,27 @@ fn decision_text(issue: &str, review: &ReviewStage) -> (String, String) {
 mod tests {
     use super::*;
     use crate::shell::{MockResponse, MockRunner};
+
+    /// The recorded argv for a WORKER agent invocation, built from whatever
+    /// shell `resolve_shell` picks on THIS machine.
+    ///
+    /// SF-15: worker spawns resolve their shell explicitly now, so asserting
+    /// the literal `"sh -c …"` only held where an MSYS `sh` happened to be on
+    /// PATH — the inherited-shell assumption the ticket is about, reproduced
+    /// inside our own suite. `MockRunner`'s PREFIX matching is shell-
+    /// canonicalized, but `recorded()` returns the raw argv joined by spaces,
+    /// so exact-string expectations have to be built. Review spawns still run
+    /// literal `sh` (their script is sirius-built POSIX), so those assertions
+    /// deliberately stay literal.
+    fn agent_call(cmd: &str) -> String {
+        format!("{}{cmd}", shell_prefix())
+    }
+
+    /// `"<resolved shell> <flag> "` — the recorded prefix of any worker spawn.
+    fn shell_prefix() -> String {
+        let sh = crate::shell::resolve_shell();
+        format!("{} {} ", sh.program, sh.flag)
+    }
 
     /// A fleet context rooted in a private temp dir (review files land there,
     /// never in the repo's own `.sirius/`).
@@ -3834,7 +3868,7 @@ mod tests {
         let calls = m.recorded();
         // The agent never spawned, and the issue was NOT amt-released (the
         // lease is not ours to release).
-        assert!(!calls.iter().any(|c| c == "sh -c true"), "{calls:?}");
+        assert!(!calls.iter().any(|c| *c == agent_call("true")), "{calls:?}");
         assert!(
             !calls.iter().any(|c| c.starts_with("amt --json release")),
             "{calls:?}"
@@ -3878,7 +3912,7 @@ mod tests {
         }
         // The agent never ran.
         assert!(
-            !m.recorded().iter().any(|c| c == "sh -c true"),
+            !m.recorded().iter().any(|c| *c == agent_call("true")),
             "{:?}",
             m.recorded()
         );
@@ -3932,7 +3966,11 @@ mod tests {
         );
         assert_eq!(o, IterationOutcome::Deadend);
         // ONE agent run, despite retry_budget=3.
-        let agent_runs = m.recorded().iter().filter(|c| **c == "sh -c true").count();
+        let agent_runs = m
+            .recorded()
+            .iter()
+            .filter(|c| **c == agent_call("true"))
+            .count();
         assert_eq!(
             agent_runs, 1,
             "a structurally-unpassable gate must not re-run the agent"
@@ -4170,7 +4208,7 @@ mod tests {
         assert!(m
             .recorded()
             .iter()
-            .any(|c| c == "sh -c agent --issue AMT-51 --as sirius/oak"));
+            .any(|c| *c == agent_call("agent --issue AMT-51 --as sirius/oak")));
         let env = &m.agent_envs()[0];
         assert_eq!(env_of(env, "SIRIUS_ISSUE").as_deref(), Some("AMT-51"));
         assert_eq!(env_of(env, "SIRIUS_WORKER").as_deref(), Some("sirius/oak"));
@@ -4318,7 +4356,7 @@ mod tests {
         assert!(m
             .recorded()
             .iter()
-            .any(|c| c == "sh -c agent --model claude-opus-5-5 AMT-81"));
+            .any(|c| *c == agent_call("agent --model claude-opus-5-5 AMT-81")));
     }
 
     #[test]
@@ -5760,7 +5798,7 @@ mod tests {
         program_held(&m, "amt-91");
         let rec = iterate(&m, &cfg());
         let merge = rec.iter().position(|c| c == "git merge --no-edit heldsha");
-        let agent = rec.iter().position(|c| c.starts_with("sh -c"));
+        let agent = rec.iter().position(|c| c.starts_with(&shell_prefix()));
         assert!(
             merge.is_some() && merge < agent,
             "held work merged before the agent runs: {rec:?}"
@@ -6292,7 +6330,11 @@ mod tests {
         assert_eq!(o, IterationOutcome::Completed);
 
         // The agent ran twice (two attempts).
-        let agent_runs = m.recorded().iter().filter(|c| **c == "sh -c true").count();
+        let agent_runs = m
+            .recorded()
+            .iter()
+            .filter(|c| **c == agent_call("true"))
+            .count();
         assert_eq!(agent_runs, 2, "one retry means two agent runs");
         // Exactly one retry policy event for the first failed attempt.
         assert_eq!(led.count_policy_events("retry_budget", 100).unwrap(), 1);
@@ -6376,7 +6418,7 @@ mod tests {
 
         let calls = m.recorded();
         // Two agent runs (attempt 1 + one retry).
-        let agent_runs = calls.iter().filter(|c| **c == "sh -c true").count();
+        let agent_runs = calls.iter().filter(|c| **c == agent_call("true")).count();
         assert_eq!(agent_runs, 2);
         // Exactly one retry event (the final failure does not schedule a retry).
         assert_eq!(led.count_policy_events("retry_budget", 100).unwrap(), 1);
@@ -6438,7 +6480,7 @@ mod tests {
         let agent_runs = m
             .recorded()
             .iter()
-            .filter(|c| **c == "sh -c sleep 999")
+            .filter(|c| **c == agent_call("sleep 999"))
             .count();
         assert_eq!(agent_runs, 1, "a killed agent must not consume retries");
         assert_eq!(led.count_policy_events("retry_budget", 100).unwrap(), 0);

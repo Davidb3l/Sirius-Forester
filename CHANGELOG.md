@@ -5,6 +5,29 @@ release moves them under its version (see AGENTS.md → "Releases are batched").
 
 ## Unreleased
 
+### Plugin — bump its version at release (the plugin cache is keyed on version, so an unbumped change reaches no installed user — SF-10)
+- Windows: native PowerShell installers `install-sirius.ps1` and `install-sothis.ps1`; `/sirius:install-binary` and `/sirius:install-suite` now reach them (their allow-lists were `.sh`-only).
+- `install-sirius.sh` and `install-sothis.sh` run from Git Bash / MSYS / Cygwin — they refused `MINGW64_NT-*` although the Windows tarballs have always shipped. On Windows they print the exact PowerShell line to put the install dir on PATH.
+- A failed `claude plugin install` now prints its real error, and on an SSH clone failure the HTTPS `GIT_CONFIG_*` workaround, instead of a bare "YOU ARE NOT DONE".
+- The sirius skill: omitting `--from` claims from todo AND backlog (it said todo); `--agent-cmd`'s program must be on PATH, and solo mode is the path when it is not.
+
+### Added
+- `sirius doctor` `gate_configured` (gating): fails while `gate.test_cmd` is unset, naming a command detected from the repo. (SF-11)
+- `sirius init` pre-fills `gate.test_cmd` from the repo (Cargo.toml; package.json with a test script; pyproject.toml / pytest.ini; go.mod). (SF-11)
+- `sirius gate --json` carries `reason_code` and `structural`, so an unconfigured workspace is distinguishable from failing tests (both exit 3). (SF-11)
+- `SIRIUS_SHELL` overrides the shell that gate commands and agents run through. (SF-15)
+- `sirius doctor` prints the plugin version beside the CLI's (advisory). (SF-10)
+
+### Changed
+- `gate.test_cmd` and `--agent-cmd` run through an explicitly resolved shell instead of a bare `sh` inherited from the launcher, so a compound command (`a && b`) no longer passes from Git Bash and fails from PowerShell. (SF-15)
+- `sirius run` refuses to start (exit 2) when `--agent-cmd`'s program is not on PATH, and a `--from` run that claimed nothing names where the work is parked. (SF-14)
+
+### Fixed
+- Windows: every `git worktree` sirius creates — fleet workers, review trees, `sirius integrate`, frontier checks, review canaries — failed on the `\\?\` path prefix, so the fleet could not start at all. (SF-16)
+- `sirius doctor` blessed a stale hayven daemon that 500s on every claim; it now compares the daemon's build to the CLI's. (SF-13)
+- `sirius link --changed` right after a commit silently filed no receipt; it now uses the commit just made. (SF-12)
+- A shell that cannot start is named as the shell, instead of reading as a missing test binary. (SF-15)
+
 ## 0.1.6 — 2026-10-04
 
 ### Plugin 0.2.5 (terminal and the Claude app alike)

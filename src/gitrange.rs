@@ -24,6 +24,37 @@ pub fn run_git(runner: &dyn Runner, args: &[&str]) -> Result<crate::shell::CmdOu
     Ok(out)
 }
 
+/// Render a filesystem path for handing to `git`.
+///
+/// On Windows `std::fs::canonicalize` — which `Workspace::discover` uses to
+/// resolve the workspace root — returns EXTENDED-LENGTH "verbatim" paths:
+/// `\\?\C:\...`. Rust's own file APIs accept those happily, so they flow
+/// through the codebase unnoticed. Git for Windows does not: it is MSYS-based
+/// and rewrites `\\?\C:\...` into `//?/C:/...`, which it then cannot create.
+///
+///     fatal: could not create leading directories of
+///     '//?/C:/.../.sirius/worktrees/sirius-oak/.git': Invalid argument
+///
+/// That killed `sirius run` on Windows outright — every worker died at the
+/// worktree step, before a single issue was claimed (SF-16, observed
+/// 2026-08-25). Proven rather than inferred: handing `git worktree add` the
+/// same absolute path twice, plain succeeds (exit 0) and verbatim fails
+/// (exit 128) with the message above.
+///
+/// So every path handed to git goes through here. `\\?\UNC\server\share` is
+/// the verbatim spelling of `\\server\share` and needs the extra rewrite;
+/// anything else — including all unix paths — passes through untouched.
+pub fn git_path(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s.into_owned()
+    }
+}
+
 /// Split command stdout into trimmed, non-empty lines.
 fn stdout_lines(out: &crate::shell::CmdOutput) -> Vec<String> {
     out.stdout
@@ -111,7 +142,26 @@ pub fn changed_symbols(
     hv: &Hayven,
     range: Option<&str>,
 ) -> Result<ChangedSymbols, String> {
-    let files = changed_files(runner, range)?;
+    let mut files = changed_files(runner, range)?;
+    // SF-12: `--changed` with no `--range` means "working tree vs HEAD", so the
+    // documented worker order (work → gate → COMMIT → receipt) resolved zero
+    // files and `sirius link --changed` no-oped with "no symbols to link" — the
+    // receipt silently never got filed, on the exact workflow the skill
+    // prescribes. When the caller named no range and the tree is clean, the
+    // change they mean is the commit they just made, so diff that instead.
+    // Only the no-range case: an EXPLICIT range that resolves nothing is the
+    // caller's own answer and must be left empty, never second-guessed.
+    if files.is_empty() && range.is_none() {
+        // A repo whose HEAD is the root commit has no HEAD~1; that is not an
+        // error here, there is simply nothing earlier to diff against.
+        // `--verify --quiet` exits non-zero in that case, which run_git turns
+        // into an Err we deliberately swallow.
+        if let Ok(prev) = run_git(runner, &["rev-parse", "--verify", "--quiet", "HEAD~1"]) {
+            if !prev.stdout.trim().is_empty() {
+                files = changed_files(runner, Some("HEAD~1..HEAD"))?;
+            }
+        }
+    }
     if files.is_empty() {
         return Ok(ChangedSymbols::default());
     }
@@ -168,6 +218,43 @@ pub fn extract_ids(v: &Value) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::shell::{MockResponse, MockRunner};
+
+    /// The SF-16 regression: a verbatim path reaches git as `//?/C:/...` and
+    /// it cannot create the leading directories, so no worker worktree is ever
+    /// built and the whole fleet is dead on Windows.
+    #[test]
+    fn git_path_strips_the_windows_verbatim_prefix() {
+        assert_eq!(
+            git_path(std::path::Path::new(
+                r"\\?\C:\repo\.sirius\worktrees\sirius-oak"
+            )),
+            r"C:\repo\.sirius\worktrees\sirius-oak"
+        );
+    }
+
+    /// `\\?\UNC\server\share` is the verbatim spelling of `\\server\share`;
+    /// stripping only the prefix would leave the bogus path `UNC\server\share`.
+    #[test]
+    fn git_path_rewrites_verbatim_unc_back_to_a_real_unc_path() {
+        assert_eq!(
+            git_path(std::path::Path::new(r"\\?\UNC\server\share\repo")),
+            r"\\server\share\repo"
+        );
+    }
+
+    #[test]
+    fn git_path_leaves_ordinary_paths_alone() {
+        assert_eq!(git_path(std::path::Path::new(r"C:\repo\wt")), r"C:\repo\wt");
+        assert_eq!(
+            git_path(std::path::Path::new("/home/u/repo/wt")),
+            "/home/u/repo/wt"
+        );
+        // A real UNC path is already what git wants — do not touch it.
+        assert_eq!(
+            git_path(std::path::Path::new(r"\\server\share")),
+            r"\\server\share"
+        );
+    }
 
     #[test]
     fn changed_files_splits_lines() {
@@ -236,6 +323,72 @@ mod tests {
     fn extract_ids_from_hits() {
         let v = serde_json::json!({"hits":[{"id":"a::f"},{"id":"b::g"}]});
         assert_eq!(extract_ids(&v), vec!["a::f", "b::g"]);
+    }
+
+    /// SF-12: committing before filing the receipt is the natural order, and it
+    /// used to make `--changed` resolve nothing at all.
+    #[test]
+    fn changed_symbols_falls_back_to_the_last_commit_when_the_tree_is_clean() {
+        let m = MockRunner::new();
+        // Working tree vs HEAD: clean, because the agent committed.
+        m.push(MockResponse::new(
+            &["git", "diff", "--name-only", "HEAD"],
+            0,
+            "",
+            "",
+        ));
+        m.push(MockResponse::new(
+            &["git", "rev-parse", "--verify"],
+            0,
+            "abc123\n",
+            "",
+        ));
+        m.push(MockResponse::new(
+            &["git", "diff", "--name-only", "HEAD~1..HEAD"],
+            0,
+            "src/math.rs\n",
+            "",
+        ));
+        // Path-exact resolution (SIRF-20): the committed file's own entities.
+        m.push(MockResponse::new(
+            &["hayven", "affected-tests"],
+            0,
+            r#"{"changed":["src/math.rs"],"roots":["src/math::add"],"tests":[]}"#,
+            "",
+        ));
+        let hv = Hayven::new(&m);
+        let got = changed_symbols(&m, &hv, None).unwrap();
+        assert_eq!(got.files, vec!["src/math.rs"]);
+        assert_eq!(got.symbols, vec!["src/math::add"]);
+    }
+
+    /// The fallback must NOT override an explicit range: an empty answer to a
+    /// range the caller named is the truth, not a footgun.
+    #[test]
+    fn changed_symbols_does_not_second_guess_an_explicit_range() {
+        let m = MockRunner::new();
+        m.push(MockResponse::new(&["git", "diff"], 0, "", ""));
+        let hv = Hayven::new(&m);
+        let got = changed_symbols(&m, &hv, Some("main..HEAD")).unwrap();
+        assert_eq!(got, ChangedSymbols::default());
+        assert_eq!(m.recorded().len(), 1, "no fallback probe: {:?}", m.recorded());
+    }
+
+    /// A root-commit repo has no HEAD~1; that must stay an empty answer, not an
+    /// error.
+    #[test]
+    fn changed_symbols_survives_a_repo_with_no_parent_commit() {
+        let m = MockRunner::new();
+        m.push(MockResponse::new(&["git", "diff"], 0, "", ""));
+        m.push(MockResponse::new(
+            &["git", "rev-parse", "--verify"],
+            1,
+            "",
+            "",
+        ));
+        let hv = Hayven::new(&m);
+        let got = changed_symbols(&m, &hv, None).unwrap();
+        assert_eq!(got, ChangedSymbols::default());
     }
 
     #[test]

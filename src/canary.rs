@@ -173,7 +173,12 @@ fn sweep_dead_runs(runner: &dyn Runner, sirius_dir: &Path) {
             if sub == "worktrees" {
                 let _ = run_git(
                     runner,
-                    &["worktree", "remove", "--force", &path.to_string_lossy()],
+                    &[
+                        "worktree",
+                        "remove",
+                        "--force",
+                        &crate::gitrange::git_path(&path),
+                    ],
                 );
                 let _ = std::fs::remove_dir_all(&path);
             } else {
@@ -240,7 +245,7 @@ fn apply(runner: &dyn Runner, t: &str, src: &Source, cfg: &Config) -> Result<Vec
             }
         }
         Source::Patch(p) | Source::Control(Some(p)) => {
-            if let Err(err) = git(&["apply", "--index", &p.to_string_lossy()]) {
+            if let Err(err) = git(&["apply", "--index", &crate::gitrange::git_path(p)]) {
                 return Err(Skip::Stale(format!("the patch no longer applies: {err}")));
             }
         }
@@ -294,7 +299,7 @@ fn tree_of(sirius_dir: &Path) -> PathBuf {
 /// does) and the files it changed.
 fn replay(cx: &Ctx, src: &Source, i: usize) -> Result<(Vec<Finding>, Vec<String>), Skip> {
     let t_path = tree_of(cx.sirius_dir);
-    let t = t_path.to_string_lossy().to_string();
+    let t = crate::gitrange::git_path(&t_path);
     let _ = run_git(cx.runner, &["worktree", "remove", "--force", &t]);
     let _ = std::fs::remove_dir_all(&t_path);
     run_git(cx.runner, &["worktree", "add", "--detach", &t, &cx.base])

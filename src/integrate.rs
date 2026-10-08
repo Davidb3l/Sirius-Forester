@@ -255,7 +255,7 @@ pub fn integrate(
     );
 
     let t = sirius_dir.join("worktrees").join("integrate");
-    let t_str = t.to_string_lossy().to_string();
+    let t_str = crate::gitrange::git_path(&t);
     let _ = run_git(runner, &["worktree", "remove", "--force", &t_str]);
     let _ = std::fs::remove_dir_all(&t);
     run_git(runner, &["worktree", "add", "--detach", &t_str, &cur])

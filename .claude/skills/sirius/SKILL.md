@@ -48,12 +48,19 @@ they want the foreman working the board on the current repo.
    agents that edit code autonomously, without asking per change — so on the
    first run in a repo, confirm scope with the human and settle three flags:
    - `--workers N` — how many workers (start small, e.g. 2–3);
-   - `--from <stage>` — which column to pull from (default `todo`);
+   - `--from <stage>` — restrict which column to pull from. **Omit it to pull
+     from both `todo` and `backlog`** (amt's default). `--from todo` keeps
+     backlog off-limits — but a fresh board is usually ALL backlog, so it finds
+     nothing; `run` then names where the work is parked.
    - `--agent-cmd '<command>'` — the command each iteration runs to do the work,
      e.g. `claude -p "work issue {issue} the Sirius way"`. This is the agent;
      without it the loop has nothing to run. `{issue}`/`{worker}` are filled in,
      and the agent also gets `SIRIUS_ISSUE`, `SIRIUS_WORKER`, `SIRIUS_WORKTREE`,
-     `SIRIUS_PHASE` and `AMT_AGENT` in its environment.
+     `SIRIUS_PHASE` and `AMT_AGENT` in its environment. **Its program must be on
+     PATH** — `sirius run` refuses to start (exit 2) when it is not. A Claude
+     Code desktop or web session usually has **no `claude` on PATH**: check
+     with `command -v claude`, and if it is missing do not launch a fleet —
+     work the issues yourself in solo mode (section B).
    - `--model <id>` — **always pass YOUR OWN exact model id** (the model you,
      the launching session, are running as — e.g. `claude-opus-5-5`; never an
      alias like `opus` or `fable[1m]`). Without it `sirius run` refuses: every
@@ -75,7 +82,7 @@ they want the foreman working the board on the current repo.
      fleet run passed 9/9 gates with 25 confirmed bugs among them.
 3. **Run it and watch the fleet.**
    ```bash
-   sirius run --workers 2 --from todo \
+   sirius run --workers 2 \
      --agent-cmd 'claude -p "work the claimed issue the Sirius way"'
    ```
    It streams one NDJSON event per phase (`claim` → … → `release`), and each
@@ -84,15 +91,20 @@ they want the foreman working the board on the current repo.
    ```bash
    tail -f .suite/events/$(date -u +%F).jsonl
    ```
-   The loop exits when a full round finds no claimable work. Exit codes: `0` ok,
-   `1` failure, `2` usage (incl. no model set), `3` gate blocked, `4` **paused**:
+   The loop exits when a full round finds no claimable work (with `--from`, it
+   says where any parked work sits). Exit codes: `0` ok, `1` failure, `2` usage
+   (incl. no model set, or `--agent-cmd`'s program not on PATH), `3` gate
+   blocked, `4` **paused**:
    an agent hit a usage/plan limit, so every worker stopped claiming and the
    unworked issues stay in `todo` — relaunch once the limit resets.
 4. **Read the receipts.** Every completed issue leaves a two-way receipt; spot
    check with `sirius why <symbol>` and `sirius why <ISSUE>` — both must answer.
 
 Want a single iteration by hand instead of spawning subprocess workers (solo
-mode, tighter control, no autonomous fan-out)? That's section B.
+mode, tighter control, no autonomous fan-out)? That's section B. Solo mode is
+also **the** path whenever no agent CLI is on PATH — the usual case inside a
+Claude Code desktop or web session: you are the agent, so work the issues
+yourself with the full etiquette.
 
 ---
 

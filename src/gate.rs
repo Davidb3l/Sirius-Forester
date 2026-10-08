@@ -23,8 +23,31 @@ use crate::amt::Amt;
 use crate::config::{GateConfig, GateFallback};
 use crate::hayven::Hayven;
 use crate::ledger::Ledger;
-use crate::shell::Runner;
+use crate::shell::{resolve_shell, run_in_shell, Runner, ShellCmd};
 use serde_json::Value;
+
+/// Stable machine-readable verdict codes (SF-11).
+///
+/// The `plan` label is HUMAN copy — it has already been reworded once and will
+/// be again. A script that has to tell "your tests failed" from "this workspace
+/// was never configured to run tests" must not have to string-match it, and it
+/// cannot use the exit code either: `sirius gate` deliberately keeps exit 3 for
+/// BOTH (see `run_gate`). These codes are the contract for that distinction.
+pub mod reason_code {
+    /// Tests ran and the runner said pass.
+    pub const PASS: &str = "pass";
+    /// Tests ran and the runner said fail — a genuine, retryable blocked gate.
+    pub const TESTS_FAILED: &str = "tests_failed";
+    /// `gate.fallback = fail` refused to run the whole suite on doubt.
+    pub const BLOCKED_BY_POLICY: &str = "blocked_by_policy";
+    /// `gate.fallback = pass-with-warning` advanced without running anything.
+    pub const PASSED_WITHOUT_TESTS: &str = "passed_without_tests";
+    /// `gate.test_cmd` is unset: this workspace CANNOT run tests. Structural —
+    /// no retry, no fresh agent run, and no code change will alter it.
+    pub const UNCONFIGURED_TEST_CMD: &str = "unconfigured_test_cmd";
+    /// The shell itself could not be spawned (SF-15). Also not about the code.
+    pub const SHELL_SPAWN_FAILED: &str = "shell_spawn_failed";
+}
 
 #[derive(Debug, Clone)]
 pub struct GateOutcome {
@@ -38,8 +61,18 @@ pub struct GateOutcome {
     pub test_ids: Vec<String>,
     pub comment_filed: bool,
     /// How the gate ran: `subset(n)`, `full-suite`, `blocked`, `pass-with-warning`,
-    /// `unconfigured`, or `skipped`.
+    /// `unconfigured`, or `skipped`. HUMAN copy — see [`reason_code`].
     pub plan: String,
+    /// Stable machine-readable code for the verdict; one of [`reason_code`].
+    /// Surfaced by `cmd_gate` in the `--json` envelope, so a consumer can tell
+    /// an unconfigured workspace from a genuinely failing gate without parsing
+    /// the human `plan` string (both exit 3).
+    pub reason_code: &'static str,
+    /// Human explanation behind `reason_code`, carrying any remedy.
+    pub reason: String,
+    /// TRUE when no fresh attempt can change this verdict (today: an
+    /// unconfigured `test_cmd`). Mirrors [`GateVerdict::structural`].
+    pub structural: bool,
     /// Whether a test command was actually executed.
     pub ran_tests: bool,
 }
@@ -239,19 +272,33 @@ pub struct GateVerdict {
     /// a full-suite run (the runner picks) or when no tests ran.
     pub test_ids: Vec<String>,
     pub detail: String,
+    /// Stable machine-readable code for this verdict; one of [`reason_code`].
+    pub reason_code: &'static str,
     /// TRUE when the verdict cannot change on a fresh attempt (today: an
     /// unconfigured `test_cmd`). Typed here — at the source of the verdict —
     /// so retry policy never string-matches the human-facing `plan` label.
     pub structural: bool,
 }
 
-/// Execute a plan against the configured `test_cmd`. Fail-closed: if a run is
-/// required but no command is configured, the gate does NOT pass.
-pub fn execute_plan(runner: &dyn Runner, test_cmd: Option<&str>, plan: GatePlan) -> GateVerdict {
+/// Execute a plan against the configured `test_cmd`, through `shell`.
+/// Fail-closed: if a run is required but no command is configured, the gate
+/// does NOT pass.
+///
+/// The shell is a PARAMETER, not a constant: `resolve_shell()` legitimately
+/// answers `/bin/sh`, a Git-for-Windows `sh.exe`, or `cmd.exe` depending on the
+/// machine (SF-15), and a gate test that had to guess which one would be a test
+/// of the developer's box.
+pub fn execute_plan(
+    runner: &dyn Runner,
+    shell: &ShellCmd,
+    test_cmd: Option<&str>,
+    plan: GatePlan,
+) -> GateVerdict {
     match plan {
         GatePlan::Block(reason) => GateVerdict {
             passed: false,
             structural: false,
+            reason_code: reason_code::BLOCKED_BY_POLICY,
             plan: "blocked".into(),
             reason,
             ran_tests: false,
@@ -262,6 +309,7 @@ pub fn execute_plan(runner: &dyn Runner, test_cmd: Option<&str>, plan: GatePlan)
         GatePlan::WarnPass(reason) => GateVerdict {
             passed: true,
             structural: false,
+            reason_code: reason_code::PASSED_WITHOUT_TESTS,
             plan: "pass-with-warning".into(),
             reason,
             ran_tests: false,
@@ -269,18 +317,19 @@ pub fn execute_plan(runner: &dyn Runner, test_cmd: Option<&str>, plan: GatePlan)
             test_ids: vec![],
             detail: String::new(),
         },
-        GatePlan::Full(reason) => run_cmd(runner, test_cmd, &[], "full-suite", reason),
+        GatePlan::Full(reason) => run_cmd(runner, shell, test_cmd, &[], "full-suite", reason),
         GatePlan::Subset(ids, reason) => {
             let label = format!("subset({})", ids.len());
-            run_cmd(runner, test_cmd, &ids, &label, reason)
+            run_cmd(runner, shell, test_cmd, &ids, &label, reason)
         }
     }
 }
 
-/// Run `test_cmd` (optionally with selected ids appended) via `sh -c` and read
-/// the verdict from its exit code.
+/// Run `test_cmd` (optionally with selected ids appended) through `shell` and
+/// read the verdict from its exit code.
 fn run_cmd(
     runner: &dyn Runner,
+    shell: &ShellCmd,
     test_cmd: Option<&str>,
     ids: &[String],
     plan_label: &str,
@@ -292,8 +341,18 @@ fn run_cmd(
             // The one STRUCTURAL verdict: no test_cmd exists, so no fresh
             // attempt can change this — retry policy reads this field.
             structural: true,
+            reason_code: reason_code::UNCONFIGURED_TEST_CMD,
             plan: "unconfigured".into(),
-            reason: "gate.test_cmd is not set — cannot run tests, refusing to pass".into(),
+            // SF-11: this is NOT "your tests failed" — this workspace has never
+            // been able to run tests at all, and every gate here has failed
+            // closed since `sirius init`. Say which, and say what to do; the
+            // repo-specific command comes from `sirius doctor`, which knows the
+            // workspace root (the gate does not).
+            reason: "gate.test_cmd is not set — this workspace cannot run tests, so the \
+                     gate refuses to pass (no test failure occurred). Set gate.test_cmd in \
+                     .sirius/config.json; `sirius doctor` prints the command detected for \
+                     this repo."
+                .into(),
             ran_tests: false,
             tests_run: 0,
             test_ids: vec![],
@@ -305,10 +364,15 @@ fn run_cmd(
         full.push(' ');
         full.push_str(&shell_quote(id));
     }
-    match runner.run("sh", &["-c", &full]) {
+    match run_in_shell(runner, shell, &full) {
         Ok(out) => GateVerdict {
             passed: out.success(),
             structural: false,
+            reason_code: if out.success() {
+                reason_code::PASS
+            } else {
+                reason_code::TESTS_FAILED
+            },
             plan: plan_label.to_string(),
             reason,
             ran_tests: true,
@@ -319,6 +383,10 @@ fn run_cmd(
         Err(e) => GateVerdict {
             passed: false,
             structural: false,
+            // SF-15: the SHELL did not start, so nothing about the code was
+            // tested. `e` already names the shell (see shell::run_in_shell) —
+            // the old bare "program not found" read as a missing test binary.
+            reason_code: reason_code::SHELL_SPAWN_FAILED,
             plan: plan_label.to_string(),
             reason,
             ran_tests: false,
@@ -326,7 +394,7 @@ fn run_cmd(
             // The command failed to spawn: no tests ran, so per the field's
             // contract (ids the gate *ran*) this is empty, not the selection.
             test_ids: vec![],
-            detail: e.to_string(),
+            detail: e,
         },
     }
 }
@@ -342,7 +410,7 @@ pub fn evaluate(
 ) -> GateVerdict {
     let sel = select(hv, changed_files);
     let plan = decide_plan(&sel, changed_files, gate.fallback);
-    execute_plan(runner, gate.test_cmd.as_deref(), plan)
+    execute_plan(runner, &resolve_shell(), gate.test_cmd.as_deref(), plan)
 }
 
 /// Gate under maximal doubt — the changed-file set itself is UNKNOWN (e.g. git
@@ -352,13 +420,23 @@ pub fn evaluate(
 /// fail-closed replacement.
 pub fn evaluate_doubt(runner: &dyn Runner, gate: &GateConfig, reason: &str) -> GateVerdict {
     let plan = fallback_plan(gate.fallback, reason.to_string());
-    execute_plan(runner, gate.test_cmd.as_deref(), plan)
+    execute_plan(runner, &resolve_shell(), gate.test_cmd.as_deref(), plan)
 }
 
 // ── CLI orchestration ────────────────────────────────────────────────────────
 
 /// Run the gate for an issue: resolve changed files (git range), evaluate, then
 /// advance on pass / comment on fail. `range` defaults to working-tree vs HEAD.
+///
+/// SF-11 exit-code note: an UNCONFIGURED gate and a genuinely failing gate both
+/// still surface as `sirius gate` exit 3. That is deliberate. Exit 3 is
+/// published as "gate blocked" in CONTRACTS §2 and in the sirius worker Skill,
+/// and the worker loop keys its release-without-advancing path on it; minting a
+/// fourth code would silently reclassify the unconfigured case as an unhandled
+/// failure in every consumer that only knows 0/1/2/3. The distinction is
+/// carried instead by [`GateOutcome::reason_code`] (stable) and
+/// [`GateOutcome::structural`] — machine-readable, additive, and impossible to
+/// misread as "the tests failed".
 #[allow(clippy::too_many_arguments)]
 pub fn run_gate(
     amt: &Amt,
@@ -399,7 +477,8 @@ pub fn run_gate(
                 "gate_tier",
                 &serde_json::json!({
                     "issue": issue, "tier": tier, "result": "pass", "plan": v.plan,
-                    "reason": v.reason, "tests_run": v.tests_run, "advanced_to": target_status
+                    "reason": v.reason, "reason_code": v.reason_code,
+                    "tests_run": v.tests_run, "advanced_to": target_status
                 }),
             )
             .ok();
@@ -412,12 +491,19 @@ pub fn run_gate(
             test_ids: v.test_ids,
             comment_filed: v.plan == "pass-with-warning",
             plan: v.plan,
+            reason_code: v.reason_code,
+            reason: v.reason,
+            structural: v.structural,
             ran_tests: v.ran_tests,
         })
     } else {
+        // Name the CODE in the comment too: a reader of the issue thread must
+        // be able to tell "the suite went red" from "this workspace was never
+        // wired to run a suite" without decoding the plan label.
         let body = format!(
-            "sirius gate FAILED (tier {tier}, plan {}): {}. {}",
+            "sirius gate FAILED (tier {tier}, plan {}, reason {}): {}. {}",
             v.plan,
+            v.reason_code,
             v.reason,
             first_line(&v.detail)
         );
@@ -428,7 +514,8 @@ pub fn run_gate(
                 "gate_tier",
                 &serde_json::json!({
                     "issue": issue, "tier": tier, "result": "fail", "plan": v.plan,
-                    "reason": v.reason, "tests_run": v.tests_run
+                    "reason": v.reason, "reason_code": v.reason_code,
+                    "structural": v.structural, "tests_run": v.tests_run
                 }),
             )
             .ok();
@@ -441,6 +528,9 @@ pub fn run_gate(
             test_ids: v.test_ids,
             comment_filed,
             plan: v.plan,
+            reason_code: v.reason_code,
+            reason: v.reason,
+            structural: v.structural,
             ran_tests: v.ran_tests,
         })
     }
@@ -480,6 +570,14 @@ fn shell_quote(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::shell::{MockResponse, MockRunner};
+
+    /// A FIXED shell for tests. `resolve_shell()` answers differently on a
+    /// Linux box, a Git-Bash box, and a bare-PowerShell box (SF-15); pinning it
+    /// here keeps every gate assertion about the GATE rather than about which
+    /// shell the developer happens to have installed.
+    fn test_shell() -> ShellCmd {
+        ShellCmd::posix_sh()
+    }
 
     fn sel_json(ok: bool, roots: usize, note: &str, runnables: &[&str]) -> Selection {
         let m = MockRunner::new();
@@ -644,19 +742,29 @@ mod tests {
     fn execute_full_suite_passes_when_tests_pass() {
         let m = MockRunner::new();
         m.expect(&["sh", "-c"], 0, "ok");
-        let v = execute_plan(&m, Some("cargo test"), GatePlan::Full("doubt".into()));
+        let v = execute_plan(
+            &m,
+            &test_shell(),
+            Some("cargo test"),
+            GatePlan::Full("doubt".into()),
+        );
         assert!(v.passed);
         assert!(v.ran_tests);
         assert_eq!(v.plan, "full-suite");
         // The full suite command was run, verbatim, with no selected ids.
-        assert_eq!(m.recorded()[0], "sh -c cargo test");
+        assert_eq!(m.recorded()[0], "/bin/sh -c cargo test");
     }
 
     #[test]
     fn execute_full_suite_fails_when_tests_fail() {
         let m = MockRunner::new();
         m.push(MockResponse::new(&["sh", "-c"], 101, "", "test failed"));
-        let v = execute_plan(&m, Some("cargo test"), GatePlan::Full("doubt".into()));
+        let v = execute_plan(
+            &m,
+            &test_shell(),
+            Some("cargo test"),
+            GatePlan::Full("doubt".into()),
+        );
         assert!(!v.passed);
         assert!(v.ran_tests);
     }
@@ -667,23 +775,135 @@ mod tests {
         m.expect(&["sh", "-c"], 0, "ok");
         let v = execute_plan(
             &m,
+            &test_shell(),
             Some("pytest -q"),
             GatePlan::Subset(vec!["tests/test_x.py::test_a".into()], "1".into()),
         );
         assert!(v.passed);
         assert_eq!(v.tests_run, 1);
-        assert_eq!(m.recorded()[0], "sh -c pytest -q tests/test_x.py::test_a");
+        assert_eq!(
+            m.recorded()[0],
+            "/bin/sh -c pytest -q tests/test_x.py::test_a"
+        );
     }
 
     #[test]
     fn execute_without_test_cmd_fails_closed() {
         let m = MockRunner::new();
-        let v = execute_plan(&m, None, GatePlan::Full("doubt".into()));
+        let v = execute_plan(&m, &test_shell(), None, GatePlan::Full("doubt".into()));
         assert!(!v.passed);
         assert!(!v.ran_tests);
         assert_eq!(v.plan, "unconfigured");
         // No command was run.
         assert_eq!(m.call_count(), 0);
+    }
+
+    // SF-11: "this workspace cannot run tests" and "your tests failed" are both
+    // exit 3 on purpose (see run_gate). They must NEVER be the same reason_code,
+    // and the unconfigured one must not read like a test failure.
+    #[test]
+    fn unconfigured_and_failing_gates_carry_different_reason_codes() {
+        let unconfigured = execute_plan(
+            &MockRunner::new(),
+            &test_shell(),
+            None,
+            GatePlan::Full("doubt".into()),
+        );
+        let m = MockRunner::new();
+        m.push(MockResponse::new(&["sh", "-c"], 101, "", "1 failed"));
+        let failed = execute_plan(
+            &m,
+            &test_shell(),
+            Some("cargo test"),
+            GatePlan::Full("doubt".into()),
+        );
+
+        assert!(!unconfigured.passed && !failed.passed, "both are failures");
+        assert_eq!(unconfigured.reason_code, reason_code::UNCONFIGURED_TEST_CMD);
+        assert_eq!(failed.reason_code, reason_code::TESTS_FAILED);
+        assert_ne!(unconfigured.reason_code, failed.reason_code);
+        // Only the unconfigured one is structural (no retry can fix it).
+        assert!(unconfigured.structural);
+        assert!(!failed.structural);
+        // …and it says so in words, with the remedy.
+        assert!(
+            unconfigured.reason.contains("no test failure occurred"),
+            "{}",
+            unconfigured.reason
+        );
+        assert!(
+            unconfigured.reason.contains("gate.test_cmd"),
+            "{}",
+            unconfigured.reason
+        );
+    }
+
+    // The other two policy verdicts get their own codes so a script never has
+    // to infer policy from the human plan label.
+    #[test]
+    fn policy_verdicts_carry_their_own_reason_codes() {
+        let m = MockRunner::new();
+        let blocked = execute_plan(&m, &test_shell(), Some("x"), GatePlan::Block("d".into()));
+        assert_eq!(blocked.reason_code, reason_code::BLOCKED_BY_POLICY);
+        assert!(!blocked.passed && !blocked.structural);
+        let warned = execute_plan(&m, &test_shell(), Some("x"), GatePlan::WarnPass("d".into()));
+        assert_eq!(warned.reason_code, reason_code::PASSED_WITHOUT_TESTS);
+        assert!(warned.passed && !warned.ran_tests);
+    }
+
+    // SF-15: the shell failing to START is not a test failure. The reporter
+    // whose gate died with a bare "program not found" went looking for a
+    // missing test binary; the verdict must say it was the shell, and name it.
+    #[test]
+    fn shell_that_cannot_start_is_not_reported_as_a_test_failure() {
+        struct NoShell;
+        impl Runner for NoShell {
+            fn run(&self, _p: &str, _a: &[&str]) -> std::io::Result<crate::shell::CmdOutput> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "program not found",
+                ))
+            }
+        }
+        let v = execute_plan(
+            &NoShell,
+            &test_shell(),
+            Some("cargo test --workspace && bun run check"),
+            GatePlan::Full("doubt".into()),
+        );
+        assert!(!v.passed);
+        assert!(!v.ran_tests, "nothing ran — the shell never started");
+        assert_eq!(v.reason_code, reason_code::SHELL_SPAWN_FAILED);
+        assert!(
+            v.detail.contains("/bin/sh"),
+            "must name the shell: {}",
+            v.detail
+        );
+        assert!(
+            v.detail.contains("not your test binary"),
+            "must not read as a missing test binary: {}",
+            v.detail
+        );
+    }
+
+    // The compound command from the SF-15 report reaches the shell as ONE
+    // script string — that is what makes `&&` an operator instead of an argv
+    // element the test binary would choke on.
+    #[test]
+    fn compound_test_cmd_is_handed_to_the_shell_as_one_script() {
+        let m = MockRunner::new();
+        m.expect(&["sh", "-c"], 0, "ok");
+        let v = execute_plan(
+            &m,
+            &test_shell(),
+            Some("cargo test --workspace && bun run check"),
+            GatePlan::Full("doubt".into()),
+        );
+        assert!(v.passed);
+        assert_eq!(
+            m.recorded()[0],
+            "/bin/sh -c cargo test --workspace && bun run check"
+        );
     }
 
     fn gate_cfg(cmd: Option<&str>, fb: GateFallback) -> GateConfig {
@@ -806,8 +1026,21 @@ mod tests {
         .unwrap();
         assert!(!o.passed);
         assert_eq!(o.plan, "unconfigured");
+        assert_eq!(o.reason_code, reason_code::UNCONFIGURED_TEST_CMD);
+        assert!(o.structural, "no retry can fix an absent test_cmd");
         assert!(!o.ran_tests);
         assert!(o.advanced_to.is_none());
+        // The issue comment must carry the code, so a human reading the thread
+        // sees "never configured", not "the suite went red".
+        let comment = m
+            .recorded()
+            .into_iter()
+            .find(|c| c.contains("issue comment"))
+            .expect("a fail comment is filed");
+        assert!(
+            comment.contains(reason_code::UNCONFIGURED_TEST_CMD),
+            "{comment}"
+        );
     }
 
     #[test]
