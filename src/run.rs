@@ -1620,10 +1620,13 @@ pub fn run_iteration(
                             Ok(()) => {
                                 crate::gate::write_setup_stamp(runner);
                                 verdict = gate_once();
-                                let after = if verdict.as_ref().is_some_and(|v| v.passed) {
-                                    "the re-gate passed"
-                                } else {
-                                    "still failing, so this is an ordinary gate failure"
+                                let after = match &verdict {
+                                    Some(v) if v.passed => "the re-gate passed",
+                                    // Not judged on the work: kept to resume.
+                                    Some(v) if v.env_fault.is_some() => {
+                                        "still failing on a missing dependency, so the work is kept to resume rather than judged"
+                                    }
+                                    _ => "still failing, so this is an ordinary gate failure",
                                 };
                                 format!(
                                     "Environment fault suspected (`{line}`): re-ran worktree setup `{cmd}` and re-gated without using a work attempt — {after}."
@@ -2721,6 +2724,18 @@ fn preserve_wip(
         if !dirty && !tree_differs(runner, floor)? {
             return Ok(None);
         }
+        // Killed mid-merge (unmerged paths): the snapshot carries conflict
+        // markers. It is committed single-parent and only ever OFFERED
+        // (wip-failed) — merging it back by itself would start the next
+        // attempt from a tree full of markers.
+        let mut kind = kind;
+        if dirty && has_unmerged_paths(runner) {
+            quit_operations(runner);
+            if kind == WipKind::Resume {
+                eprintln!("sirius: {issue}: the worktree was left mid-merge (conflict markers) — its snapshot is kept at wip-failed, not resumed");
+                kind = WipKind::Failed;
+            }
+        }
         // Commit what is uncommitted. If that fails, the agent's COMMITTED
         // work is still pinned below — a stuck index must never cost the
         // commits too (the MSX-80 case this exists for).
@@ -2782,20 +2797,56 @@ pub struct StaleWip {
     pub partial: Option<String>,
 }
 
+/// Does the tree hold unmerged paths — a merge, cherry-pick or revert the
+/// agent was killed in the middle of? `add -A` would commit its conflict
+/// markers.
+fn has_unmerged_paths(runner: &dyn Runner) -> bool {
+    crate::gitrange::run_git(runner, &["diff", "--name-only", "--diff-filter=U"])
+        .map(|o| !o.stdout.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Forget a half-done merge/cherry-pick/revert WITHOUT touching the tree or
+/// the index (`--quit`), so the snapshot commit that follows is an ordinary
+/// single-parent commit — never a "merge" of whatever was being merged.
+fn quit_operations(runner: &dyn Runner) {
+    for op in ["merge", "cherry-pick", "revert"] {
+        let _ = crate::gitrange::run_git(runner, &[op, "--quit"]);
+    }
+}
+
+/// The canonical `--git-common-dir` of the repo `runner` runs in.
+fn common_dir(runner: &dyn Runner) -> Option<std::path::PathBuf> {
+    let o = crate::gitrange::run_git(
+        runner,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .ok()?;
+    std::fs::canonicalize(o.stdout.trim()).ok()
+}
+
 /// SIRF-41 at launch: a worktree left by a killed or crashed `sirius run`
-/// is about to be force-removed. Its work must not go with it (MSX-80): if
-/// the tree is dirty (suite telemetry aside) or its HEAD is reachable from
-/// no ref (the agent's commits on a detached HEAD), everything is committed
-/// — no hooks, no signing ([`commit_all`]) — and pinned: at
-/// `refs/sirius/wip/<issue>` when the issue it was working on is known (the
-/// worker's unfinished ledger iteration — resumed on the next claim, like
-/// any interrupted work), else at `refs/sirius/wip-orphaned/<worker>/<sha12>`.
-/// An existing ref is never overwritten without parking it ([`pin_ref`]).
+/// is about to be removed. Its work must not go with it (MSX-80): if the
+/// tree is dirty (suite telemetry aside) or its HEAD is reachable from no
+/// ref (the agent's commits on a detached HEAD), everything is committed —
+/// no hooks, no signing ([`commit_all`]) — onto a DETACHED HEAD and pinned:
+/// at `refs/sirius/wip/<issue>` when the issue it was working on is known
+/// (the worker's unfinished ledger iteration — resumed on the next claim,
+/// like any interrupted work), else at
+/// `refs/sirius/wip-orphaned/<worker>/<sha12>`. A tree caught mid-merge
+/// (unmerged paths: conflict markers) is snapshotted as a single-parent
+/// commit and pinned at `refs/sirius/wip-failed/<issue>` instead — offered,
+/// never merged back by itself. An unborn HEAD's files are committed
+/// without touching HEAD (no branch is created) and pinned as orphaned: a
+/// root commit cannot be merged back. An existing ref is never overwritten
+/// without parking it ([`pin_ref`]).
 ///
-/// `wt` runs git IN the stale worktree; nothing is done unless that
-/// directory is a worktree of its own (never the enclosing checkout: the
-/// worktrees live inside the repo). `Ok(None)`: nothing to preserve.
+/// `wt` runs git IN the stale worktree, `repo` in the main checkout:
+/// nothing is done unless the directory is a worktree of its own (never the
+/// enclosing checkout — the worktrees live inside the repo) of THIS repo.
+/// `Ok(None)`: nothing to preserve.
 pub fn preserve_stale_worktree(
+    repo: &dyn Runner,
     wt: &dyn Runner,
     wt_path: &std::path::Path,
     worker: &str,
@@ -2806,7 +2857,14 @@ pub fn preserve_stale_worktree(
     let top = canon(std::path::Path::new(top.stdout.trim()));
     if top.is_none() || top != canon(wt_path) {
         return Err(format!(
-            "{} is not a git worktree of its own — nothing could be preserved from it",
+            "{} is not a git worktree of its own",
+            wt_path.display()
+        ));
+    }
+    let common = common_dir(wt);
+    if common.is_none() || common != common_dir(repo) {
+        return Err(format!(
+            "{} is not a worktree of this repository",
             wt_path.display()
         ));
     }
@@ -2819,37 +2877,64 @@ pub fn preserve_stale_worktree(
     if !dirty && !lost {
         return Ok(None);
     }
+    let w = ref_segment(worker);
+    let orphaned = |sha: &str| format!("refs/sirius/wip-orphaned/{w}/{}", short_sha(sha));
+    let label = issue.unwrap_or(worker);
+    let msg = format!("sirius: wip {label} (stale worktree of {worker})");
+    let Some(head) = head else {
+        // Unborn (`switch --orphan`): commit the files without HEAD — a
+        // commit there would create the orphan branch in the shared repo.
+        let _ = crate::gitrange::run_git(wt, &["add", "-A"]);
+        let tree = crate::gitrange::run_git(wt, &["write-tree"])?;
+        let sha = crate::gitrange::run_git(
+            wt,
+            &[
+                "-c",
+                "user.name=sirius",
+                "-c",
+                "user.email=sirius@localhost",
+                "-c",
+                "commit.gpgsign=false",
+                "commit-tree",
+                tree.stdout.trim(),
+                "-m",
+                &msg,
+            ],
+        )?
+        .stdout
+        .trim()
+        .to_string();
+        let target = orphaned(&sha);
+        pin_ref(wt, &w, &target, &sha)?;
+        return Ok(Some(StaleWip {
+            ref_name: target,
+            sha,
+            partial: None,
+        }));
+    };
     // Commit onto a DETACHED HEAD: never advance a branch the agent left
     // checked out (plumbing — works mid-merge, runs no hooks).
-    if let Some(h) = &head {
-        if crate::gitrange::run_git(wt, &["symbolic-ref", "-q", "HEAD"]).is_ok() {
-            crate::gitrange::run_git(wt, &["update-ref", "--no-deref", "HEAD", h])?;
-        }
+    if crate::gitrange::run_git(wt, &["symbolic-ref", "-q", "HEAD"]).is_ok() {
+        crate::gitrange::run_git(wt, &["update-ref", "--no-deref", "HEAD", &head])?;
     }
-    let label = issue.unwrap_or(worker);
+    let conflicted = dirty && has_unmerged_paths(wt);
+    if conflicted {
+        quit_operations(wt);
+    }
     let partial = if dirty {
-        commit_all(
-            wt,
-            &format!("sirius: wip {label} (stale worktree of {worker})"),
-        )
-        .err()
+        commit_all(wt, &msg).err()
     } else {
         None
     };
     let sha = crate::gitrange::head_rev(wt)?;
-    if partial.is_some() && !lost && head.as_deref() == Some(sha.as_str()) {
+    if partial.is_some() && !lost && head == sha {
         // Nothing committed, and HEAD is safe on a ref already.
         return Err(partial.unwrap_or_default());
     }
     let (target, key) = match issue {
+        Some(i) if conflicted => (wip_ref(i, WipKind::Failed), i.to_string()),
         Some(i) => (wip_ref(i, WipKind::Resume), i.to_string()),
-        None => {
-            let w = ref_segment(worker);
-            (
-                format!("refs/sirius/wip-orphaned/{w}/{}", short_sha(&sha)),
-                w,
-            )
-        }
+        None => (orphaned(&sha), w.clone()),
     };
     pin_ref(wt, &key, &target, &sha)?;
     Ok(Some(StaleWip {
@@ -2859,11 +2944,34 @@ pub fn preserve_stale_worktree(
     }))
 }
 
+/// Move a stale worktree that could not be (fully) preserved out of the
+/// way instead of deleting it: `git worktree move` (it stays a registered
+/// worktree, so its HEAD stays a gc root), else a plain rename. `None`:
+/// it could not be moved either.
+fn set_aside(repo: &dyn Runner, wt_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let name = wt_path.file_name()?.to_string_lossy().to_string();
+    let aside = wt_path.with_file_name(format!("{name}.stale-{}", unix_secs()));
+    let (from, to) = (
+        crate::gitrange::git_path(wt_path),
+        crate::gitrange::git_path(&aside),
+    );
+    if crate::gitrange::run_git(repo, &["worktree", "move", &from, &to]).is_ok() {
+        return Some(aside);
+    }
+    std::fs::rename(wt_path, &aside).ok()?;
+    // The admin entry now points at a missing path: drop it, so a fresh
+    // worktree can be added where the stale one was.
+    let _ = repo.run("git", &["worktree", "prune"]);
+    Some(aside)
+}
+
 /// Launch: clear a stale worktree a killed `sirius run` left at `wt_path`,
 /// preserving its work first ([`preserve_stale_worktree`]; the issue comes
-/// from `worker`'s unfinished ledger iteration). What was preserved — or
-/// that preserving FAILED — is said on stderr. `repo` runs git in the main
-/// checkout. A path that does not exist is a no-op.
+/// from `worker`'s unfinished ledger iteration). What was preserved is said
+/// on stderr. A tree whose work could NOT be (fully) preserved is never
+/// deleted: it is set aside next to where it was ([`set_aside`]) and named.
+/// `repo` runs git in the main checkout. A path that does not exist is a
+/// no-op.
 pub fn clear_stale_worktree(
     repo: &dyn Runner,
     wt_path: &std::path::Path,
@@ -2873,32 +2981,46 @@ pub fn clear_stale_worktree(
     if !wt_path.exists() {
         return;
     }
+    let empty = std::fs::read_dir(wt_path).is_ok_and(|mut d| d.next().is_none());
     let wt = crate::shell::RealRunner {
         cwd: Some(wt_path.to_path_buf()),
     };
     let issue = ledger.and_then(|l| l.unfinished_issue(worker).ok().flatten());
-    match preserve_stale_worktree(&wt, wt_path, worker, issue.as_deref()) {
-        Ok(Some(w)) => eprintln!(
-            "sirius: {worker}: the stale worktree {} (a killed run{}) held unsaved work — preserved at {} ({}){}",
-            wt_path.display(),
-            issue
-                .as_deref()
-                .map(|i| format!(", working on {i}"))
-                .unwrap_or_default(),
-            w.ref_name,
-            short_sha(&w.sha),
-            match &w.partial {
-                Some(p) => format!(
-                    " — committed work only: the uncommitted rest could NOT be saved ({p})"
-                ),
-                None => String::new(),
+    let keep = if empty {
+        None
+    } else {
+        match preserve_stale_worktree(repo, &wt, wt_path, worker, issue.as_deref()) {
+            Ok(Some(w)) => {
+                eprintln!(
+                    "sirius: {worker}: the stale worktree {} (a killed run{}) held unsaved work — preserved at {} ({})",
+                    wt_path.display(),
+                    issue
+                        .as_deref()
+                        .map(|i| format!(", working on {i}"))
+                        .unwrap_or_default(),
+                    w.ref_name,
+                    short_sha(&w.sha),
+                );
+                w.partial
+                    .map(|p| format!("its uncommitted rest could NOT be committed ({p})"))
             }
-        ),
-        Ok(None) => {}
-        Err(e) => eprintln!(
-            "sirius: {worker}: WARNING could not preserve the stale worktree {}: {e}",
-            wt_path.display()
-        ),
+            Ok(None) => None,
+            Err(e) => Some(format!("its work could not be preserved ({e})")),
+        }
+    };
+    if let Some(why) = keep {
+        match set_aside(repo, wt_path) {
+            Some(to) => eprintln!(
+                "sirius: {worker}: WARNING the stale worktree {}: {why} — NOT deleted; moved aside to {}",
+                wt_path.display(),
+                to.display()
+            ),
+            None => eprintln!(
+                "sirius: {worker}: WARNING the stale worktree {}: {why} — NOT deleted, and it could not be moved aside; remove or rescue it by hand",
+                wt_path.display()
+            ),
+        }
+        return;
     }
     let wt_str = crate::gitrange::git_path(wt_path);
     let _ = repo.run("git", &["worktree", "remove", "--force", &wt_str]);
@@ -2923,11 +3045,10 @@ struct Resume {
 /// freshly reset worktree, and find judged-and-failed earlier work.
 ///
 /// Preserved work that already CONTAINS the held commit (held work resumed,
-/// then interrupted) supersedes it: merging both would stack the wip merge
-/// above the held one, and `sirius link --changed` follows only the resume
-/// merge at the bottom of the line — the wip commits would never be stamped.
-/// So the held merge is skipped then (and tried as a fallback if the wip
-/// does not merge).
+/// then interrupted) supersedes it: the held merge is skipped then (one
+/// resume merge, not two; tried as a fallback if the wip does not merge).
+/// A wip that does NOT contain the held commit is merged on top of it —
+/// `sirius link --changed` follows every resume merge on the line.
 fn resume_work(amt: &Amt, runner: &dyn Runner, issue: &str, worker: &str, base: &str) -> Resume {
     let mut r = Resume::default();
     let held = held_ref(issue);
@@ -8985,7 +9106,10 @@ mod tests {
         git_at(&w.wt, &["switch", "-q", "-c", "feat"]);
         let feat = commit_file(&w.wt, "f.txt");
         std::fs::write(w.wt.join("u.txt"), "u").unwrap();
-        let got = preserve_stale_worktree(&w.git, &w.wt, "sirius/oak", Some("AMT-31"))
+        let repo = crate::shell::RealRunner {
+            cwd: Some(w.repo.clone()),
+        };
+        let got = preserve_stale_worktree(&repo, &w.git, &w.wt, "sirius/oak", Some("AMT-31"))
             .unwrap()
             .expect("dirty: preserved");
         assert_eq!(repo_ref(&w, "refs/heads/feat"), Some(feat), "untouched");
@@ -9000,8 +9124,144 @@ mod tests {
         let r = crate::shell::RealRunner {
             cwd: Some(plain.clone()),
         };
-        assert!(preserve_stale_worktree(&r, &plain, "sirius/oak", None).is_err());
+        assert!(preserve_stale_worktree(&repo, &r, &plain, "sirius/oak", None).is_err());
         assert_eq!(git_at(&w.repo, &["rev-parse", "HEAD"]), main_head);
+        // A standalone repo (not a worktree of THIS one) at the path: no.
+        let nested = w.dir.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        git_at(&nested, &["init", "-q"]);
+        std::fs::write(nested.join("n.txt"), "n").unwrap();
+        let n = crate::shell::RealRunner {
+            cwd: Some(nested.clone()),
+        };
+        assert!(preserve_stale_worktree(&repo, &n, &nested, "sirius/oak", None).is_err());
+    }
+
+    /// Review: a stale tree whose work could not be preserved is set aside,
+    /// NEVER deleted (here: not a git worktree at all, so nothing can be
+    /// pinned — its files survive).
+    #[test]
+    fn an_unpreservable_stale_tree_is_set_aside_not_deleted() {
+        let w = GitWorld::new("aside");
+        let repo = crate::shell::RealRunner {
+            cwd: Some(w.repo.clone()),
+        };
+        let stale = w.dir.join("worktrees").join("sirius-oak");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("keep.txt"), "k").unwrap();
+        clear_stale_worktree(&repo, &stale, "sirius/oak", None);
+        assert!(!stale.exists(), "the slot is free for the fresh worktree");
+        let moved: Vec<std::path::PathBuf> = std::fs::read_dir(stale.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert!(moved[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("sirius-oak.stale-"));
+        assert!(moved[0].join("keep.txt").exists());
+        // An EMPTY leftover dir is simply removed.
+        std::fs::create_dir_all(&stale).unwrap();
+        clear_stale_worktree(&repo, &stale, "sirius/oak", None);
+        assert!(!stale.exists());
+        assert_eq!(
+            std::fs::read_dir(stale.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+
+    /// Review: a registered stale worktree whose uncommitted rest cannot be
+    /// committed (an unreadable file) is moved aside as a worktree — the
+    /// readable work is not destroyed with it.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_worktree_that_cannot_be_committed_is_moved_aside() {
+        use std::os::unix::fs::PermissionsExt;
+        let w = GitWorld::new("asidewt");
+        let repo = crate::shell::RealRunner {
+            cwd: Some(w.repo.clone()),
+        };
+        std::fs::write(w.wt.join("good.txt"), "g").unwrap();
+        let bad = w.wt.join("bad.txt");
+        std::fs::write(&bad, "b").unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&bad).is_ok() {
+            return; // running as root: permissions do not bite
+        }
+        clear_stale_worktree(&repo, &w.wt, "sirius/oak", None);
+        assert!(!w.wt.exists());
+        let aside: Vec<std::path::PathBuf> = std::fs::read_dir(&w.dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().contains("wt.stale-"))
+            .collect();
+        assert_eq!(aside.len(), 1);
+        assert!(aside[0].join("good.txt").exists());
+        let listed = git_at(&w.repo, &["worktree", "list", "--porcelain"]);
+        assert!(listed.contains("wt.stale-"), "still a worktree: {listed}");
+        let _ = std::fs::set_permissions(
+            aside[0].join("bad.txt"),
+            std::fs::Permissions::from_mode(0o644),
+        );
+    }
+
+    /// Review: a stale tree killed MID-MERGE (conflict markers) is kept as a
+    /// single-parent snapshot at wip-failed — offered, never auto-resumed.
+    #[test]
+    fn a_stale_worktree_caught_mid_merge_is_kept_but_not_auto_resumed() {
+        let w = GitWorld::new("stalemerge");
+        std::fs::write(w.wt.join("base.txt"), "theirs").unwrap();
+        git_at(&w.wt, &["commit", "-q", "-am", "theirs"]);
+        let theirs = git_at(&w.wt, &["rev-parse", "HEAD"]);
+        git_at(&w.wt, &["checkout", "-q", "--detach", &w.base]);
+        std::fs::write(w.wt.join("base.txt"), "ours").unwrap();
+        git_at(&w.wt, &["commit", "-q", "-am", "ours"]);
+        let ours = git_at(&w.wt, &["rev-parse", "HEAD"]);
+        let r = crate::shell::RealRunner {
+            cwd: Some(w.wt.clone()),
+        };
+        assert!(crate::gitrange::run_git(&r, &["merge", "--no-edit", &theirs]).is_err());
+        let led = Ledger::open_in_memory().unwrap();
+        led.upsert_worker("sirius/oak", "working").unwrap();
+        led.start_iteration("sirius/oak", Some("AMT-32")).unwrap();
+        let repo = crate::shell::RealRunner {
+            cwd: Some(w.repo.clone()),
+        };
+        clear_stale_worktree(&repo, &w.wt, "sirius/oak", Some(&led));
+        assert!(!w.wt.exists());
+        assert_eq!(repo_ref(&w, "refs/sirius/wip/amt-32"), None);
+        let kept = repo_ref(&w, "refs/sirius/wip-failed/amt-32").expect("kept");
+        assert_eq!(
+            git_at(&w.repo, &["rev-list", "--parents", "-n", "1", &kept]),
+            format!("{kept} {ours}"),
+            "single parent"
+        );
+    }
+
+    /// Review: an unborn (orphan) HEAD's files are pinned as orphaned work
+    /// without creating the orphan branch in the shared repo.
+    #[test]
+    fn a_stale_unborn_worktree_is_pinned_without_creating_a_branch() {
+        let w = GitWorld::new("staleorphan");
+        git_at(&w.wt, &["switch", "-q", "--orphan", "lonely"]);
+        std::fs::write(w.wt.join("o.txt"), "o").unwrap();
+        let repo = crate::shell::RealRunner {
+            cwd: Some(w.repo.clone()),
+        };
+        let led = Ledger::open_in_memory().unwrap();
+        led.upsert_worker("sirius/oak", "working").unwrap();
+        led.start_iteration("sirius/oak", Some("AMT-33")).unwrap();
+        clear_stale_worktree(&repo, &w.wt, "sirius/oak", Some(&led));
+        assert!(!w.wt.exists());
+        assert_eq!(repo_ref(&w, "refs/heads/lonely"), None);
+        assert_eq!(repo_ref(&w, "refs/sirius/wip/amt-33"), None);
+        let refs = sirius_refs(&w);
+        assert_eq!(refs.len(), 1, "{refs:?}");
+        assert!(refs[0].starts_with("refs/sirius/wip-orphaned/sirius-oak/"));
+        let sha = repo_ref(&w, &refs[0]).unwrap();
+        assert!(tree_files(&w.repo, &sha).contains(&"o.txt".to_string()));
     }
 
     /// Finding 2, end to end: held work and a wip that does not contain it
@@ -9229,5 +9489,30 @@ mod tests {
         assert_eq!(gate["setup_rerun"], true, "{evs:?}");
         assert_eq!(w.ref_at("refs/sirius/wip-failed/amt-45"), None);
         assert!(w.ref_at("refs/sirius/wip/amt-45").is_some());
+    }
+
+    /// Review: an agent killed mid-merge — its snapshot (conflict markers)
+    /// is kept at wip-failed as a single-parent commit, never at wip.
+    #[test]
+    fn preserve_wip_of_a_tree_left_mid_merge_is_offered_not_resumed() {
+        let w = GitWorld::new("wipmerge");
+        let base = w.base.clone();
+        std::fs::write(w.wt.join("base.txt"), "theirs").unwrap();
+        git_at(&w.wt, &["commit", "-q", "-am", "theirs"]);
+        let theirs = git_at(&w.wt, &["rev-parse", "HEAD"]);
+        git_at(&w.wt, &["checkout", "-q", "--detach", &base]);
+        std::fs::write(w.wt.join("base.txt"), "ours").unwrap();
+        git_at(&w.wt, &["commit", "-q", "-am", "ours"]);
+        let ours = git_at(&w.wt, &["rev-parse", "HEAD"]);
+        assert!(crate::gitrange::run_git(&w.git, &["merge", "--no-edit", &theirs]).is_err());
+        let got = preserve_wip(&w.git, "AMT-34", &base, &base, WipKind::Resume)
+            .unwrap()
+            .expect("pinned");
+        assert_eq!(got.ref_name, "refs/sirius/wip-failed/amt-34");
+        assert_eq!(w.ref_at("refs/sirius/wip/amt-34"), None);
+        assert_eq!(
+            git_at(&w.repo, &["rev-list", "--parents", "-n", "1", &got.sha]),
+            format!("{} {ours}", got.sha)
+        );
     }
 }

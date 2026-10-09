@@ -317,10 +317,14 @@ sirius run --workers N --agent-cmd "<cmd>" [--from todo] [--review-cmd "<cmd>"]
    #   wip-failed contains them). A fix round's discarded attempt is parked at wip-superseded
    #   before the revert. Every ref sirius removes is compare-and-deleted against the sha it
    #   read: newer work a lost-lease worker pinned meanwhile is never deleted.
+   #   A tree left MID-MERGE (unmerged paths) is snapshotted single-parent and pinned at
+   #   wip-failed, never wip (its conflict markers must not be auto-resumed).
    #   At launch, a stale worktree a killed run left behind is preserved before it is
    #   removed (dirty, or HEAD reachable from no ref): pinned at refs/sirius/wip/<issue>
-   #   when the worker's last ledger iteration never finished, else at
-   #   refs/sirius/wip-orphaned/<worker-sanitized>/<sha12>; stderr says what was kept.
+   #   when the worker's last ledger iteration never finished, else (or for an unborn
+   #   HEAD) at refs/sirius/wip-orphaned/<worker-sanitized>/<sha12>; stderr says what was
+   #   kept. A stale tree that cannot be (fully) preserved is NOT deleted: it is moved
+   #   aside to .sirius/worktrees/<worker>.stale-<unix-secs> and named on stderr.
    #   Refs (issue key = 4th segment, so `sirius link --changed` counts them as the issue's own):
    #   refs/sirius/wip/<issue>        interrupted work — merged back on the next claim
    #                                  (SIRIUS_RESUMED_FROM / SIRIUS_RESUME_REF), removed once stamped
