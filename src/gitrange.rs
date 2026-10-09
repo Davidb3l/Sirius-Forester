@@ -61,8 +61,52 @@ fn stdout_lines(out: &crate::shell::CmdOutput) -> Vec<String> {
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
-        .map(|l| l.to_string())
+        .map(unquote_path)
         .collect()
+}
+
+/// Undo git's `core.quotePath` C-style quoting of a path (`"caf\303\251.rs"`
+/// → `café.rs`): git quotes any path with a non-ASCII byte, a quote, a
+/// backslash, or a control character. Without this a receipt would stamp the
+/// quoted string, which names no file. Shas and ref names never start with
+/// `"`, so every other line passes through untouched.
+fn unquote_path(l: &str) -> String {
+    let Some(inner) = l
+        .strip_prefix('"')
+        .and_then(|r| r.strip_suffix('"'))
+        .filter(|_| l.len() >= 2)
+    else {
+        return l.to_string();
+    };
+    let b = inner.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\\' || i + 1 == b.len() {
+            out.push(b[i]);
+            i += 1;
+            continue;
+        }
+        let c = b[i + 1];
+        let oct = |x: u8| (b'0'..=b'7').contains(&x);
+        if oct(c) && i + 3 < b.len() && oct(b[i + 2]) && oct(b[i + 3]) {
+            out.push(((c - b'0') << 6) | ((b[i + 2] - b'0') << 3) | (b[i + 3] - b'0'));
+            i += 4;
+            continue;
+        }
+        out.push(match c {
+            b'n' => b'\n',
+            b't' => b'\t',
+            b'r' => b'\r',
+            b'a' => 0x07,
+            b'b' => 0x08,
+            b'f' => 0x0c,
+            b'v' => 0x0b,
+            other => other, // `\\` and `\"`
+        });
+        i += 2;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// List files changed in a git range (default: working tree vs HEAD).
@@ -265,8 +309,13 @@ fn fleet_line_files(runner: &dyn Runner, f: FleetBase<'_>) -> Result<Vec<String>
     if let Some(r) = f.resumed_from.map(str::trim).filter(|r| !r.is_empty()) {
         // Only a real commit: a bad value must not fail the whole link.
         let spec = format!("{r}^{{commit}}");
-        if run_git(runner, &["rev-parse", "--verify", "--quiet", &spec]).is_ok() {
-            own_tips.push(r.to_string());
+        // Push the RESOLVED sha, never the raw input: `^HEAD` passes the
+        // check, and after `--not` would turn this issue's line foreign.
+        if let Ok(o) = run_git(runner, &["rev-parse", "--verify", "--quiet", &spec]) {
+            let sha = o.stdout.trim();
+            if !sha.is_empty() && !sha.starts_with('^') {
+                own_tips.push(sha.to_string());
+            }
         }
     }
     let foreign = if other_refs.is_empty() {
@@ -287,6 +336,8 @@ fn fleet_line_files(runner: &dyn Runner, f: FleetBase<'_>) -> Result<Vec<String>
             // NUL opens each commit's record: a path can never contain it
             // (`@types/x.d.ts` would pass for an `@<sha>` header).
             "--format=%x00%H",
+            // A user's `log.showSignature` would add lines read as paths.
+            "--no-show-signature",
             &range,
         ];
         log_args.extend(landed.iter().map(String::as_str));
@@ -677,7 +728,7 @@ mod tests {
         let calls = m.recorded();
         assert!(
             calls.iter().any(|c| c
-                == "git log --first-parent --no-merges --name-only --format=%x00%H base1..HEAD"),
+                == "git log --first-parent --no-merges --name-only --format=%x00%H --no-show-signature base1..HEAD"),
             "{calls:?}"
         );
         assert!(!calls.iter().any(|c| c.contains("HEAD~1")), "{calls:?}");
@@ -879,6 +930,15 @@ mod tests {
             ChangedSymbols::default()
         );
         assert!(!m2.recorded().iter().any(|c| c.starts_with("hayven")));
+    }
+
+    #[test]
+    fn quoted_paths_are_unquoted() {
+        assert_eq!(unquote_path(r#""caf\303\251.rs""#), "café.rs");
+        assert_eq!(unquote_path(r#""a\"b\\c\td""#), "a\"b\\c\td");
+        assert_eq!(unquote_path("src/plain.rs"), "src/plain.rs");
+        assert_eq!(unquote_path("\""), "\"");
+        assert_eq!(unquote_path("0123abcd"), "0123abcd");
     }
 
     // ---- fleet line walk, against real git --------------------------------
