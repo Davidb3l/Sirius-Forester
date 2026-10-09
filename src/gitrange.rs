@@ -284,13 +284,15 @@ const MAX_RESUME_MERGES: usize = 16;
 /// `$SIRIUS_PRIOR_WORK` mid-line. EVERY first-parent merge on the line is
 /// therefore checked, and followed (its second parent's own line walked the
 /// same way) when sirius recorded that parent as this issue's work
-/// ([`is_resume_parent`]: named by `$SIRIUS_RESUMED_FROM`, the tip of one of
-/// this issue's own refs — `sirius/<issue>`, `refs/sirius/<kind>/<issue>[/…]`
-/// — or inside one and in no other issue's ref) — ancestry, so neither a
-/// commit-message hook nor a human's branch on the held sha can hide it. A
-/// worker's own merge of the base or of a sibling is not followed, even
-/// when a hold of this issue contains that merge. Followed lines still lose
-/// landed and foreign commits.
+/// ([`is_resume_parent`]: named by `$SIRIUS_RESUMED_FROM`; the tip of one of
+/// this issue's own refs — `sirius/<issue>`, `refs/sirius/<kind>/<issue>[/…]`,
+/// including the `resumed/<issue>/…` pin every resume merge leaves; or
+/// inside an own ref, in no other issue's ref, not landed, and — with no
+/// base branch known — on no human branch). That is ancestry and recorded
+/// refs, so neither a commit-message hook nor a human's branch on the held
+/// sha can hide it. A worker's own merge of the base or of a sibling is not
+/// followed, even when a hold of this issue contains that merge. Followed
+/// lines still lose landed and foreign commits.
 fn fleet_line_files(runner: &dyn Runner, f: FleetBase<'_>) -> Result<Vec<String>, String> {
     let landed: Vec<String> = match f.base_ref.map(str::trim).filter(|r| !r.is_empty()) {
         Some(r) => match run_git(
@@ -310,10 +312,6 @@ fn fleet_line_files(runner: &dyn Runner, f: FleetBase<'_>) -> Result<Vec<String>
         None => Vec::new(),
     };
     let (own_refs, other_refs) = issue_refs(runner, f.issue)?;
-    let key = f
-        .issue
-        .map(|i| i.trim().to_lowercase())
-        .filter(|i| !i.is_empty());
     // What this iteration resumed is this issue's work by definition, held
     // by whatever ref: never foreign.
     let mut own_tips = own_refs.clone();
@@ -381,16 +379,8 @@ fn fleet_line_files(runner: &dyn Runner, f: FleetBase<'_>) -> Result<Vec<String>
             &range,
         ];
         line_args.extend(landed.iter().map(String::as_str));
-        // Merges before this line's first ordinary commit are where sirius
-        // put its resume merges (`resume_work` runs before the agent);
-        // anything later is the agent's (or a fix round's) own merge.
-        let mut leading = true;
         for l in stdout_lines(&run_git(runner, &line_args)?) {
-            let parents: Vec<&str> = l.split_whitespace().skip(2).collect();
-            if parents.is_empty() {
-                leading = false;
-            }
-            for second in parents {
+            for second in l.split_whitespace().skip(2) {
                 if seen.contains(second) {
                     continue;
                 }
@@ -403,13 +393,7 @@ fn fleet_line_files(runner: &dyn Runner, f: FleetBase<'_>) -> Result<Vec<String>
                     }
                     continue;
                 }
-                let at = Placement {
-                    named,
-                    leading,
-                    issue_key: key.as_deref(),
-                    landed_tip,
-                };
-                if is_resume_parent(runner, second, &at, &own_set, &other_set)? {
+                if is_resume_parent(runner, second, named, &own_set, &other_set, landed_tip)? {
                     seen.insert(second.to_string());
                     followed += 1;
                     queue.push_back(second.to_string());
@@ -420,52 +404,35 @@ fn fleet_line_files(runner: &dyn Runner, f: FleetBase<'_>) -> Result<Vec<String>
     Ok(files)
 }
 
-/// Where a merge parent was found, for [`is_resume_parent`].
-struct Placement<'a> {
-    /// `$SIRIUS_RESUMED_FROM`.
-    named: Option<&'a str>,
-    /// The merge sits in the run of merges at the bottom of its line — where
-    /// `resume_work` puts the resume merges, before the agent runs.
-    leading: bool,
-    /// The issue key, lowercase.
-    issue_key: Option<&'a str>,
-    /// The base branch's tip (`$SIRIUS_BASE_REF`), when known.
-    landed_tip: Option<&'a str>,
-}
-
 /// Is `parent` (a non-first parent of a merge on this issue's line) work
 /// this issue resumed? It is when it is:
 /// 1. the commit `$SIRIUS_RESUMED_FROM` names, or
-/// 2. the TIP of one of this issue's own refs (held, wip, wip-failed — what
-///    `resume_work` merges, or `$SIRIUS_PRIOR_WORK` an agent merged);
-///
-/// never when it is already on the base branch; otherwise when it is inside
-/// one of this issue's own refs and
-/// 3. inside no other issue's ref, or
-/// 4. the merge is a LEADING (resume-position) merge and the parent is in
-///    this issue's resumable line — `refs/sirius/held|wip/<issue>` or the
-///    `sirius/<issue>` branch. Own refs only move forward without parking
-///    the old tip, so an older hold (H1 under H2) is no tip any more, and a
-///    sibling that built on it puts it in another issue's ref too.
+/// 2. the TIP of one of this issue's own refs — held, wip, wip-failed (what
+///    an agent merges as `$SIRIUS_PRIOR_WORK`), and every commit sirius ever
+///    resumed for the issue (`refs/sirius/resumed/<issue>/<sha12>`, pinned
+///    at each resume merge: an older hold under a newer one stays a tip even
+///    after the held ref moved on and a sibling built on it), or
+/// 3. not already on the base branch, inside one of this issue's own refs
+///    and inside NO other issue's ref (an older hold no sibling touched).
 ///
 /// Containment alone is not enough: an own ref (a hold, a parked attempt)
-/// can contain an agent's mid-line merge of a SIBLING's branch, whose
-/// parent it then also contains — following those would stamp other work
-/// as ours. With no known base branch, a parent on any non-sirius branch
-/// (the human's `main`) is not followed by rules 3–4 either: a prior
-/// attempt's merge of the base would otherwise make main's commits ours.
-/// One `for-each-ref --contains` per candidate answers all of it.
+/// can contain an agent's merge of a SIBLING's branch — mid-line or as its
+/// very first act, indistinguishable by shape from a resume merge — whose
+/// parent it then also contains; following those would stamp other work as
+/// ours. That is why sirius RECORDS what it resumed (rule 2). With no known
+/// base branch, a parent on any non-sirius branch (the human's `main`) is
+/// not followed by rule 3 either: a prior attempt's merge of the base would
+/// otherwise make main's commits ours. One `for-each-ref --contains` per
+/// candidate answers all of it.
 fn is_resume_parent(
     runner: &dyn Runner,
     parent: &str,
-    at: &Placement<'_>,
+    named: Option<&str>,
     own: &std::collections::HashSet<&str>,
     other: &std::collections::HashSet<&str>,
+    landed_tip: Option<&str>,
 ) -> Result<bool, String> {
-    if at
-        .named
-        .is_some_and(|r| parent.starts_with(r) || r.starts_with(parent))
-    {
+    if named.is_some_and(|r| parent.starts_with(r) || r.starts_with(parent)) {
         return Ok(true);
     }
     if own.is_empty() {
@@ -482,15 +449,7 @@ fn is_resume_parent(
             "refs/sirius/",
         ],
     )?;
-    let resumable = at.issue_key.map(|k| {
-        [
-            format!("refs/sirius/held/{k}"),
-            format!("refs/sirius/wip/{k}"),
-            format!("refs/heads/sirius/{k}"),
-        ]
-    });
-    let (mut own_tip, mut in_own, mut in_resumable, mut in_other, mut on_branch) =
-        (false, false, false, false, false);
+    let (mut own_tip, mut in_own, mut in_other, mut on_branch) = (false, false, false, false);
     for l in stdout_lines(&out) {
         let Some((sha, r)) = l.split_once(' ') else {
             continue;
@@ -498,9 +457,6 @@ fn is_resume_parent(
         if own.contains(r) {
             in_own = true;
             own_tip |= sha == parent;
-            in_resumable |= resumable
-                .as_ref()
-                .is_some_and(|rs| rs.iter().any(|x| x.eq_ignore_ascii_case(r)));
         } else if other.contains(r) {
             in_other = true;
         } else if r.starts_with("refs/heads/") && !r.starts_with("refs/heads/sirius/") {
@@ -510,19 +466,13 @@ fn is_resume_parent(
     if own_tip {
         return Ok(true);
     }
-    if !in_own {
+    if !in_own || in_other {
         return Ok(false);
     }
-    match at.landed_tip {
-        Some(t) => {
-            if run_git(runner, &["merge-base", "--is-ancestor", parent, t]).is_ok() {
-                return Ok(false);
-            }
-        }
-        None if on_branch => return Ok(false),
-        None => {}
-    }
-    Ok(!in_other || (at.leading && in_resumable))
+    Ok(match landed_tip {
+        Some(t) => run_git(runner, &["merge-base", "--is-ancestor", parent, t]).is_err(),
+        None => !on_branch,
+    })
 }
 
 /// Work a stale worktree held for no known issue (`sirius run` at launch):
@@ -1473,7 +1423,8 @@ mod tests {
 
     /// An older hold under a newer one (held H1 → H2 that merged H1; own refs
     /// advance without parking the old tip) is still ours although a
-    /// sibling built on H1 — its merge sits at the resume position.
+    /// sibling built on H1: every resume merge pins what it merged at
+    /// `refs/sirius/resumed/<issue>/<sha12>`, so H1 stays an own TIP.
     #[test]
     fn fleet_line_follows_an_older_hold_a_sibling_also_built_on() {
         let r = Repo::new("olderhold");
@@ -1485,6 +1436,11 @@ mod tests {
         let b2 = r.file("landed2.txt");
         r.git(&["switch", "-q", "--detach", &b2]);
         r.git(&["merge", "-q", "--no-edit", &h1]); // iteration 2 resumes H1
+        r.git(&[
+            "update-ref",
+            &format!("refs/sirius/resumed/amt-1/{}", &h1[..12]),
+            &h1,
+        ]);
         let h2 = r.file("it2.txt");
         r.git(&["update-ref", "refs/sirius/held/amt-1", &h2]);
         r.git(&["branch", "-f", "sirius/amt-1", &h2]);
@@ -1544,6 +1500,60 @@ mod tests {
         r.git(&["merge", "-q", "--no-edit", &p1]);
         r.file("mine2.txt");
         assert_eq!(r.line(&b1, None), vec!["mine.txt", "mine2.txt", "p1.txt"]);
+        r.drop();
+    }
+
+    /// An agent whose FIRST act was merging a sibling (the line's bottom,
+    /// where a resume merge would sit) does not make the sibling's commits
+    /// ours once that attempt is held — whether resumed (A) or opened again
+    /// the same way next attempt (B).
+    #[test]
+    fn fleet_line_does_not_follow_a_sibling_merged_as_the_first_act() {
+        let r = Repo::new("firstsib");
+        let b1 = r.file("base.txt");
+        r.git(&["switch", "-q", "--detach", &b1]);
+        let sib = r.file("sib.txt");
+        r.git(&["branch", "sirius/amt-2", &sib]);
+        r.git(&["switch", "-q", "--detach", &b1]);
+        r.git(&["merge", "-q", "--no-ff", "--no-edit", "sirius/amt-2"]);
+        let held = r.file("mine1.txt");
+        r.git(&["update-ref", "refs/sirius/held/amt-1", &held]);
+        r.git(&["switch", "-q", "main"]);
+        let b2 = r.file("landed.txt");
+        r.git(&["switch", "-q", "--detach", &b2]);
+        r.git(&["merge", "-q", "--no-edit", &held]);
+        r.git(&[
+            "update-ref",
+            &format!("refs/sirius/resumed/amt-1/{}", &held[..12]),
+            &held,
+        ]);
+        r.file("mine2.txt");
+        assert_eq!(r.line(&b2, Some(&held)), vec!["mine1.txt", "mine2.txt"]);
+        // B: a prior attempt opened that way is pinned; this one does too.
+        r.git(&["update-ref", "-d", "refs/sirius/held/amt-1"]);
+        r.git(&["update-ref", "refs/sirius/wip/amt-1", &held]);
+        r.git(&["switch", "-q", "--detach", &b1]);
+        r.git(&["merge", "-q", "--no-ff", "--no-edit", "sirius/amt-2"]);
+        r.file("mine.txt");
+        assert_eq!(r.line(&b1, None), vec!["mine.txt"]);
+        r.drop();
+    }
+
+    /// An orphaned pin (it names a worker, not an issue) fast-forwarded into
+    /// the line is not "another issue's" work: `foreign_commits` excludes the
+    /// `wip-orphaned` namespace from its globs.
+    #[test]
+    fn fleet_line_keeps_an_orphaned_pin_built_upon() {
+        let r = Repo::new("orphanff");
+        let b1 = r.file("base.txt");
+        r.git(&["switch", "-q", "--detach", &b1]);
+        let sib = r.file("sib.txt");
+        r.git(&["branch", "sirius/amt-2", &sib]);
+        r.git(&["switch", "-q", "--detach", &b1]);
+        let o = r.file("o.txt");
+        r.git(&["update-ref", "refs/sirius/wip-orphaned/sirius-oak/x", &o]);
+        r.file("mine.txt");
+        assert_eq!(r.line(&b1, None), vec!["mine.txt", "o.txt"]);
         r.drop();
     }
 }

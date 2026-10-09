@@ -750,8 +750,19 @@ pub fn run_iteration(
     if let Some(base) = isolate_base {
         // A merge/rebase/am the previous agent left half-done must not
         // survive the reset (its state lives in the worktree's git dir,
-        // which `reset --hard` and `clean` never touch).
-        quit_operations(runner);
+        // which `reset --hard` and `clean` never touch). The previous
+        // issue is not known here: a rebase's un-replayed commits are
+        // parked per worker.
+        quit_operations(runner, &|sha| {
+            let r = format!(
+                "refs/sirius/wip-orphaned/{}/{}",
+                ref_segment(worker),
+                short_sha(sha)
+            );
+            if crate::gitrange::run_git(runner, &["update-ref", &r, sha]).is_ok() {
+                eprintln!("sirius: {worker}: a rebase left half-done in this worktree — its original commits are parked at {r}");
+            }
+        });
         // An agent that installed its own dependencies left them behind in
         // node_modules/.venv (ignored — the reset keeps them) while the
         // reset puts the base's lockfile back: dirty the setup stamp, so the
@@ -846,10 +857,11 @@ pub fn run_iteration(
                 log_path: Some(setup_log_path(&f.sirius_dir, worker)),
             };
             let sh = crate::shell::resolve_shell();
+            let installed_from = crate::gate::setup_fingerprint(runner);
             match crate::gate::run_setup(runner, &sh, cmd, &opts, &mut || {
                 let _ = amt.heartbeat(&issue, worker);
             }) {
-                Ok(()) => crate::gate::write_setup_stamp(runner),
+                Ok(()) => crate::gate::write_setup_stamp(runner, &installed_from),
                 // Not fatal: the agent can install what it needs, and a gate
                 // that fails on a missing dependency still re-runs setup once.
                 Err(e) => eprintln!("sirius: {worker} {issue}: {e}"),
@@ -1632,11 +1644,12 @@ pub fn run_iteration(
                                 setup_log_path(&f.sirius_dir, worker)
                             }),
                         };
+                        let installed_from = crate::gate::setup_fingerprint(runner);
                         match crate::gate::run_setup(runner, &sh, cmd, &opts, &mut || {
                             let _ = renew_checked();
                         }) {
                             Ok(()) => {
-                                crate::gate::write_setup_stamp(runner);
+                                crate::gate::write_setup_stamp(runner, &installed_from);
                                 setup_repaired = true;
                                 verdict = gate_once();
                                 let after = match &verdict {
@@ -2402,6 +2415,23 @@ fn resume_held(amt: &Amt, runner: &dyn Runner, issue: &str, worker: &str) -> Opt
     }
 }
 
+/// Record that `sha` was RESUMED for `issue`:
+/// `refs/sirius/resumed/<issue>/<sha12>`. `sirius link --changed` follows a
+/// merge whose parent is an own ref's TIP; the held/wip refs move on (to a
+/// descendant, without parking), so without this record an older hold
+/// merged under a newer one would be indistinguishable from a sibling an
+/// agent merged first thing (`gitrange::is_resume_parent`). The name holds
+/// the sha, so re-pinning is idempotent; the refs are kept (they are this
+/// issue's own work, and cost nothing).
+fn pin_resumed(runner: &dyn Runner, issue: &str, sha: &str) {
+    let r = format!(
+        "refs/sirius/resumed/{}/{}",
+        issue.to_lowercase(),
+        short_sha(sha)
+    );
+    let _ = crate::gitrange::run_git(runner, &["update-ref", &r, sha]);
+}
+
 /// How one resume attempt ended ([`resume_ref`]).
 #[derive(Debug, PartialEq)]
 enum ResumeOutcome {
@@ -2445,6 +2475,7 @@ fn resume_ref(
         return ResumeOutcome::Landed; // already on the base — nothing to resume
     }
     if crate::gitrange::run_git(runner, &["merge", "--no-edit", sha]).is_ok() {
+        pin_resumed(runner, issue, sha);
         let _ = amt.comment_as(
             issue,
             &format!("sirius: resuming the work {label} at {live} ({sha})"),
@@ -2749,6 +2780,16 @@ fn preserve_wip(
     kind: WipKind,
 ) -> WipResult {
     let r = (|| -> WipResult {
+        // Killed mid-merge (unmerged paths): the snapshot carries conflict
+        // markers — see below. Detect that BEFORE quitting, then quit
+        // whatever is in progress (a rebase's un-replayed commits parked).
+        let unmerged = has_unmerged_paths(runner);
+        quit_operations(runner, &|sha| {
+            let parked = park_superseded(runner, issue, sha);
+            eprintln!(
+                "sirius: {issue}: a half-done rebase's original commits are parked at {parked}"
+            );
+        });
         let dirty = worktree_dirty(runner)?;
         if !dirty && !tree_differs(runner, floor)? {
             return Ok(None);
@@ -2758,12 +2799,9 @@ fn preserve_wip(
         // (wip-failed) — merging it back by itself would start the next
         // attempt from a tree full of markers.
         let mut kind = kind;
-        if dirty && has_unmerged_paths(runner) {
-            quit_operations(runner);
-            if kind == WipKind::Resume {
-                eprintln!("sirius: {issue}: the worktree was left mid-merge (conflict markers) — its snapshot is kept at wip-failed, not resumed");
-                kind = WipKind::Failed;
-            }
+        if dirty && unmerged && kind == WipKind::Resume {
+            eprintln!("sirius: {issue}: the worktree was left mid-merge (conflict markers) — its snapshot is kept at wip-failed, not resumed");
+            kind = WipKind::Failed;
         }
         // Commit what is uncommitted. If that fails, the agent's COMMITTED
         // work is still pinned below — a stuck index must never cost the
@@ -2842,7 +2880,12 @@ fn has_unmerged_paths(runner: &dyn Runner) -> bool {
 /// agent's `git rebase --abort` would jump HEAD back to the PREVIOUS issue's
 /// pre-rebase commit and orphan the new work (SIRF-59). One `rev-parse`
 /// finds what is in progress; only that is quit.
-fn quit_operations(runner: &dyn Runner) {
+///
+/// A rebase's original commits that were not replayed yet are referenced
+/// only by its state (`rebase-*/orig-head`): when HEAD and no ref contain
+/// that commit, `park` gets it BEFORE the quit — never left to the reflog of
+/// a worktree that will be removed.
+fn quit_operations(runner: &dyn Runner, park: &dyn Fn(&str)) {
     const STATE: [(&str, &[&str]); 6] = [
         ("MERGE_HEAD", &["merge"]),
         ("CHERRY_PICK_HEAD", &["cherry-pick"]),
@@ -2855,20 +2898,53 @@ fn quit_operations(runner: &dyn Runner) {
     for (name, _) in STATE {
         args.extend(["--git-path", name]);
     }
-    let found: Vec<bool> = match crate::gitrange::run_git(runner, &args) {
-        Ok(o) => {
-            let paths: Vec<&str> = o.stdout.lines().collect();
-            (0..STATE.len())
-                .map(|i| {
-                    paths
-                        .get(i)
-                        .is_some_and(|p| std::path::Path::new(p.trim()).exists())
-                })
-                .collect()
-        }
-        // Cannot tell: quit everything (each is a no-op when idle).
-        Err(_) => vec![true; STATE.len()],
+    let probe = crate::gitrange::run_git(runner, &args).map(|o| o.stdout);
+    let paths: Vec<std::path::PathBuf> = match &probe {
+        Ok(out) => out
+            .lines()
+            .map(|l| std::path::PathBuf::from(l.trim()))
+            .collect(),
+        Err(_) => Vec::new(),
     };
+    // Nothing printed at all: nothing to look at (a runner that is not
+    // git). Anything else that is not one absolute path per state (an old
+    // git that echoes the unknown option, or prints relative paths): we
+    // cannot tell — quit everything (each is a no-op when idle).
+    let unsure = match &probe {
+        Ok(out) if out.trim().is_empty() => false,
+        Ok(_) => paths.len() != STATE.len() || paths.iter().any(|p| !p.is_absolute()),
+        Err(_) => true,
+    };
+    let found: Vec<bool> = if unsure {
+        vec![true; STATE.len()]
+    } else {
+        (0..STATE.len())
+            .map(|i| paths.get(i).is_some_and(|p| p.exists()))
+            .collect()
+    };
+    // The pre-rebase commit: the state's `orig-head`, else (unsure) ORIG_HEAD.
+    let mut origs: Vec<String> = Vec::new();
+    if unsure {
+        if let Ok(o) = crate::gitrange::run_git(
+            runner,
+            &["rev-parse", "--verify", "--quiet", "ORIG_HEAD^{commit}"],
+        ) {
+            origs.push(o.stdout.trim().to_string());
+        }
+    } else {
+        for i in [4, 5] {
+            if found[i] {
+                if let Ok(t) = std::fs::read_to_string(paths[i].join("orig-head")) {
+                    origs.push(t.trim().to_string());
+                }
+            }
+        }
+    }
+    for o in origs.iter().filter(|o| !o.is_empty()) {
+        if !is_ancestor(runner, o, "HEAD") && !reachable_from_a_ref(runner, o).unwrap_or(false) {
+            park(o);
+        }
+    }
     let mut done: Vec<&str> = Vec::new();
     for ((_, ops), hit) in STATE.iter().zip(found) {
         for op in ops.iter().filter(|_| hit) {
@@ -2944,7 +3020,23 @@ pub fn preserve_stale_worktree(
             wt_path.display()
         ));
     }
+    // Whatever was in progress (a rebase too) is quit first — a rebase's
+    // un-replayed commits are parked, even when the tree is otherwise clean.
+    let unmerged = has_unmerged_paths(wt);
+    let w = ref_segment(worker);
+    quit_operations(wt, &|sha| {
+        let parked = match issue {
+            Some(i) => park_superseded(wt, i, sha),
+            None => {
+                let r = format!("refs/sirius/wip-orphaned/{w}/{}", short_sha(sha));
+                let _ = crate::gitrange::run_git(wt, &["update-ref", &r, sha]);
+                r
+            }
+        };
+        eprintln!("sirius: {worker}: a half-done rebase's original commits are parked at {parked}");
+    });
     let dirty = worktree_dirty(wt)?;
+    let conflicted = dirty && unmerged;
     let head = crate::gitrange::head_rev(wt).ok();
     let lost = match &head {
         Some(h) => !reachable_from_a_ref(wt, h)?,
@@ -2953,7 +3045,6 @@ pub fn preserve_stale_worktree(
     if !dirty && !lost {
         return Ok(None);
     }
-    let w = ref_segment(worker);
     let orphaned = |sha: &str| format!("refs/sirius/wip-orphaned/{w}/{}", short_sha(sha));
     let label = issue.unwrap_or(worker);
     let msg = format!("sirius: wip {label} (stale worktree of {worker})");
@@ -2993,9 +3084,6 @@ pub fn preserve_stale_worktree(
     if crate::gitrange::run_git(wt, &["symbolic-ref", "-q", "HEAD"]).is_ok() {
         crate::gitrange::run_git(wt, &["update-ref", "--no-deref", "HEAD", &head])?;
     }
-    let conflicted = dirty && has_unmerged_paths(wt);
-    // Whatever was in progress (a rebase too) is quit before the snapshot.
-    quit_operations(wt);
     let partial = if dirty {
         commit_all(wt, &msg).err()
     } else {
@@ -3035,8 +3123,14 @@ fn set_aside(
     let wt = crate::shell::RealRunner {
         cwd: Some(wt_path.to_path_buf()),
     };
-    // Only inside a worktree of this repo (never the enclosing checkout).
-    let ours = common_dir(&wt).is_some() && common_dir(&wt) == common_dir(repo);
+    // Only inside a LINKED worktree of this repo — never the enclosing
+    // checkout, nor a slot whose own git dir is the main one (`worktree
+    // repair` would then write into the main `.git`).
+    let common = common_dir(&wt);
+    let own = crate::gitrange::run_git(&wt, &["rev-parse", "--absolute-git-dir"])
+        .ok()
+        .and_then(|o| std::fs::canonicalize(o.stdout.trim()).ok());
+    let ours = common.is_some() && common == common_dir(repo) && own.is_some() && own != common;
     let mut head_safe = !ours;
     if let Some(h) = ours.then(|| crate::gitrange::head_rev(&wt).ok()).flatten() {
         head_safe = reachable_from_a_ref(&wt, &h).unwrap_or(false) || {
@@ -3200,6 +3294,8 @@ fn resume_work(amt: &Amt, runner: &dyn Runner, issue: &str, worker: &str, base: 
             ResumeOutcome::Merged(sha) => {
                 r.drop_on_stamp.push((wip.clone(), sha.clone()));
                 if let (true, Some(h)) = (held_in_wip, &held_sha) {
+                    // Resumed inside the wip: recorded as resumed too.
+                    pin_resumed(runner, issue, h);
                     r.drop_on_stamp.push((held.clone(), h.clone()));
                 }
                 r.resumed = Some(sha);
@@ -9412,6 +9508,23 @@ mod tests {
             link_files(&w, &main, &wip, "AMT-42"),
             vec!["h.txt", "mine.txt", "w.txt"]
         );
+        // What was resumed is RECORDED: a sibling that built on the held
+        // commit (in another issue's ref now) does not make it foreign or
+        // unfollowed once the held ref is retired.
+        for sha in [&held, &wip] {
+            assert_eq!(
+                repo_ref(
+                    &w,
+                    &format!("refs/sirius/resumed/amt-42/{}", short_sha(sha))
+                ),
+                Some(sha.clone())
+            );
+        }
+        git_at(&w.repo, &["branch", "sirius/amt-43", &held]);
+        assert_eq!(
+            link_files(&w, &main, &wip, "AMT-42"),
+            vec!["h.txt", "mine.txt", "w.txt"]
+        );
     }
 
     /// Real git for every `git` call; the FIRST call starting with
@@ -9671,13 +9784,17 @@ mod tests {
         );
     }
 
-    /// Item 2 (SIRF-59): an agent killed mid-REBASE must not leave the
-    /// rebase state to the next issue — whose `git rebase --abort` would
-    /// jump HEAD back to the previous issue's pre-rebase commit.
+    /// Item 2 (SIRF-59): an agent that leaves a REBASE half-done (here it
+    /// even completes: nothing is preserved, so only the next reset sees
+    /// it) must not hand the rebase state to the next issue — whose
+    /// `git rebase --abort` would jump HEAD back to the previous issue's
+    /// pre-rebase commit. The rebase's un-replayed original is parked.
     #[test]
-    fn a_rebase_left_by_a_killed_agent_does_not_survive_the_reset() {
+    fn a_rebase_left_half_done_does_not_survive_the_reset() {
         let w = GitWorld::new("rebase");
         let base = w.base.clone();
+        let orig = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let o2 = orig.clone();
         w.agent(move |wt| {
             let r = crate::shell::RealRunner {
                 cwd: Some(wt.to_path_buf()),
@@ -9686,11 +9803,13 @@ mod tests {
             // tree — nothing about it looks unfinished to a snapshot.
             let c = commit_file(wt, "c.txt");
             git_at(wt, &["checkout", "-q", "--detach", &base]);
-            commit_file(wt, "a.txt");
+            *o2.lock().unwrap() = commit_file(wt, "a.txt");
             assert!(crate::gitrange::run_git(&r, &["rebase", "--exec", "false", &c]).is_err());
         });
-        w.mock.arm_agent_timeout(0);
-        w.iterate("AMT-60", &cfg());
+        w.mock
+            .expect(&["sh", "-c", "run-suite"], 0, "test result: ok");
+        let (o, _evs) = w.iterate("AMT-60", &cfg());
+        assert_eq!(o, IterationOutcome::Completed);
         let main = git_at(&w.repo, &["rev-parse", "main"]);
         let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let s = seen.clone();
@@ -9712,6 +9831,46 @@ mod tests {
             git_at(&w.repo, &["rev-parse", &format!("{stamped}~1")]),
             main
         );
+        let a = orig.lock().unwrap().clone();
+        assert_eq!(
+            repo_ref(
+                &w,
+                &format!("refs/sirius/wip-orphaned/sirius-oak/{}", short_sha(&a))
+            ),
+            Some(a)
+        );
+    }
+
+    /// Review: an agent killed mid-rebase on a CONFLICT — the commits not
+    /// yet replayed (here A2) are referenced only by the rebase state; the
+    /// preserve parks them before quitting it.
+    #[test]
+    fn preserve_wip_parks_a_half_done_rebases_unreplayed_commits() {
+        let w = GitWorld::new("rebaseconf");
+        let base = w.base.clone();
+        std::fs::write(w.wt.join("base.txt"), "c").unwrap();
+        git_at(&w.wt, &["commit", "-q", "-am", "c"]);
+        let c = git_at(&w.wt, &["rev-parse", "HEAD"]);
+        git_at(&w.wt, &["checkout", "-q", "--detach", &base]);
+        std::fs::write(w.wt.join("base.txt"), "a1").unwrap();
+        git_at(&w.wt, &["commit", "-q", "-am", "a1"]);
+        let a2 = commit_file(&w.wt, "b.txt");
+        assert!(crate::gitrange::run_git(&w.git, &["rebase", &c]).is_err());
+        let got = preserve_wip(&w.git, "AMT-64", &base, &base, WipKind::Resume)
+            .unwrap()
+            .expect("pinned");
+        assert_eq!(got.ref_name, "refs/sirius/wip-failed/amt-64");
+        assert_eq!(
+            w.ref_at(&format!(
+                "refs/sirius/wip-superseded/amt-64/{}",
+                short_sha(&a2)
+            )),
+            Some(a2)
+        );
+        assert!(
+            crate::gitrange::run_git(&w.git, &["rebase", "--abort"]).is_err(),
+            "quit"
+        );
     }
 
     /// Item 3, end to end: an agent that changed the lockfile (its own
@@ -9721,7 +9880,7 @@ mod tests {
         let w = GitWorld::new("ownnstall");
         let main = commit_file(&w.repo, "bun.lock");
         git_at(&w.wt, &["checkout", "-q", "--detach", &main]);
-        crate::gate::write_setup_stamp(&w.git); // what launch did
+        crate::gate::write_setup_stamp(&w.git, &crate::gate::setup_fingerprint(&w.git)); // what launch did
         let mut c = cfg();
         c.worktree.setup_cmd = Some("do-setup".into());
         let setups = |w: &GitWorld| {
@@ -9808,6 +9967,36 @@ mod tests {
             "refs/heads/main"
         );
         assert_eq!(git_at(&w.repo, &["rev-parse", "HEAD"]), main_head);
+        // Through the launch path: set aside, and nothing written into the
+        // main `.git` (no `worktree repair` of the main checkout).
+        clear_stale_worktree(&repo, &slot, "sirius/oak", None);
+        assert!(!slot.exists());
+        assert!(!w.repo.join(".git").join("gitdir").exists());
+        assert_eq!(
+            git_at(&w.repo, &["symbolic-ref", "HEAD"]),
+            "refs/heads/main"
+        );
+    }
+
+    /// Review: an old git that echoes `--path-format=absolute` back (or
+    /// prints relative paths) cannot be read — every operation is quit
+    /// rather than none.
+    #[test]
+    fn quit_operations_quits_everything_when_the_probe_is_unreadable() {
+        let m = MockRunner::new();
+        m.expect(
+            &["git", "rev-parse", "--path-format=absolute"],
+            0,
+            "--path-format=absolute\n.git/MERGE_HEAD\n.git/CHERRY_PICK_HEAD\n.git/REVERT_HEAD\n.git/sequencer\n.git/rebase-merge\n.git/rebase-apply\n",
+        );
+        quit_operations(&m, &|_| {});
+        let rec = m.recorded();
+        for op in ["merge", "cherry-pick", "revert", "rebase", "am"] {
+            assert!(
+                rec.iter().any(|c| c == &format!("git {op} --quit")),
+                "{op}: {rec:?}"
+            );
+        }
     }
 
     /// Item 7: one setup log name for launch and iterations, file-safe.

@@ -791,47 +791,67 @@ pub fn setup_stamp_path(runner: &dyn Runner) -> Option<std::path::PathBuf> {
         .map(|d| std::path::PathBuf::from(d).join("sirius-setup-stamp"))
 }
 
-/// Record that setup just ran against the working tree's lockfiles.
-pub fn write_setup_stamp(runner: &dyn Runner) {
+/// Separates the two fingerprints in a stamp.
+const STAMP_SPLIT: &str = "\n--- after setup ---\n";
+
+/// Record that setup just ran: `installed_from` is [`setup_fingerprint`]
+/// taken BEFORE it ran (what it installed from), and the fingerprint now
+/// is what it left behind — a setup command that rewrites the lockfile
+/// (a non-frozen `npm install`) must not read as "the agent changed it", nor
+/// make every later reset look stale.
+pub fn write_setup_stamp(runner: &dyn Runner, installed_from: &str) {
     if let Some(p) = setup_stamp_path(runner) {
-        let _ = std::fs::write(p, setup_fingerprint(runner));
+        let after = setup_fingerprint(runner);
+        let _ = std::fs::write(p, format!("{installed_from}{STAMP_SPLIT}{after}"));
     }
+}
+
+/// (installed from, left behind). A stamp of one value (older sirius) is
+/// both.
+fn read_stamp(p: &std::path::Path) -> Option<(String, String)> {
+    let t = std::fs::read_to_string(p).ok()?;
+    Some(match t.split_once(STAMP_SPLIT) {
+        Some((a, b)) => (a.trim().to_string(), b.trim().to_string()),
+        None => (t.trim().to_string(), t.trim().to_string()),
+    })
 }
 
 /// What a dirtied stamp holds: equal to no fingerprint, so the next
 /// [`setup_is_stale`] check is stale.
 const STAMP_DIRTY: &str = "dirty: the lockfiles changed in the worktree after setup";
 
-/// Called BEFORE an iteration's reset: when the working tree's lockfiles no
-/// longer match the stamp — an agent ran `bun add` / `npm install`, so the
-/// installed dependencies follow ITS lockfile — the stamp is dirtied. The
-/// reset puts the base's lockfile back but not the dependencies, so the
-/// next issue must set up again. `true` when it dirtied the stamp.
+/// Called BEFORE an iteration's reset: when the working tree's lockfiles
+/// match neither what setup installed from nor what it left behind — an
+/// agent ran `bun add` / `npm install`, so the installed dependencies follow
+/// ITS lockfile — the stamp is dirtied. The reset puts the base's lockfile
+/// back but not the dependencies, so the next issue must set up again.
+/// `true` when it dirtied the stamp.
 pub fn mark_setup_dirty_if_changed(runner: &dyn Runner) -> bool {
     let Some(p) = setup_stamp_path(runner) else {
         return false;
     };
-    match std::fs::read_to_string(&p) {
-        Ok(stamped) if stamped.trim() != setup_fingerprint(runner) => {
-            std::fs::write(&p, STAMP_DIRTY).is_ok()
+    match read_stamp(&p) {
+        Some((from, after)) => {
+            let now = setup_fingerprint(runner);
+            now != from && now != after && std::fs::write(&p, STAMP_DIRTY).is_ok()
         }
-        _ => false,
+        None => false,
     }
 }
 
 /// True when the working tree's lockfiles (after an iteration's reset: the
-/// base's) differ from those setup last ran on — a fresh base (SIRF-42)
-/// that bumped a dependency, or an earlier agent that installed its own
-/// ([`mark_setup_dirty_if_changed`]). `false` when no stamp can be read
-/// (nothing to compare against: the env-fault re-gate still covers a
+/// base's) differ from those setup last installed from — a fresh base
+/// (SIRF-42) that bumped a dependency, or an earlier agent that installed
+/// its own ([`mark_setup_dirty_if_changed`]). `false` when no stamp can be
+/// read (nothing to compare against: the env-fault re-gate still covers a
 /// missing module).
 pub fn setup_is_stale(runner: &dyn Runner) -> bool {
     let Some(p) = setup_stamp_path(runner) else {
         return false;
     };
-    match std::fs::read_to_string(&p) {
-        Ok(stamped) => stamped.trim() != setup_fingerprint(runner),
-        Err(_) => false,
+    match read_stamp(&p) {
+        Some((from, _)) => from != setup_fingerprint(runner),
+        None => false,
     }
 }
 
@@ -1723,7 +1743,7 @@ mod tests {
         git(&["add", "-A"]);
         git(&["commit", "-q", "-m", "a"]);
         assert!(!setup_is_stale(&r), "no stamp yet: nothing to compare");
-        write_setup_stamp(&r);
+        write_setup_stamp(&r, &setup_fingerprint(&r));
         assert!(!setup_is_stale(&r));
         std::fs::write(dir.join("README"), "x").unwrap();
         git(&["add", "-A"]);
@@ -1756,7 +1776,7 @@ mod tests {
         std::fs::write(dir.join("bun.lock"), "react@18").unwrap();
         git(&["add", "-A"]);
         git(&["commit", "-q", "-m", "a"]);
-        write_setup_stamp(&r);
+        write_setup_stamp(&r, &setup_fingerprint(&r));
         assert!(
             !mark_setup_dirty_if_changed(&r),
             "unchanged: nothing to mark"
@@ -1768,8 +1788,47 @@ mod tests {
         assert!(setup_is_stale(&r), "set up again for the next issue");
         // The env-fault re-run installs from the working tree: stamp that.
         std::fs::write(dir.join("bun.lock"), "react@18 zod@3").unwrap();
-        write_setup_stamp(&r);
+        write_setup_stamp(&r, &setup_fingerprint(&r));
         assert!(!setup_is_stale(&r));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review: a setup command that REWRITES the lockfile (a non-frozen
+    /// install) is not "stale" after every reset, nor "the agent's install".
+    #[test]
+    fn a_setup_that_rewrites_the_lockfile_is_not_stale_forever() {
+        let dir = std::env::temp_dir().join(format!("sirius-stamp3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = crate::shell::RealRunner {
+            cwd: Some(dir.clone()),
+        };
+        let git = |args: &[&str]| {
+            let mut full = vec!["-c", "user.name=t", "-c", "user.email=t@t"];
+            full.extend(args);
+            crate::gitrange::run_git(&r, &full).unwrap();
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("package-lock.json"), "L0").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "a"]);
+        let before = setup_fingerprint(&r);
+        std::fs::write(dir.join("package-lock.json"), "L1").unwrap(); // setup rewrote it
+        write_setup_stamp(&r, &before);
+        assert!(!mark_setup_dirty_if_changed(&r), "setup's own rewrite");
+        git(&["reset", "-q", "--hard", "HEAD"]);
+        assert!(
+            !setup_is_stale(&r),
+            "the base's lockfile is what it installed from"
+        );
+        assert!(
+            !mark_setup_dirty_if_changed(&r),
+            "back at the base: unchanged"
+        );
+        std::fs::write(dir.join("package-lock.json"), "L2").unwrap(); // the agent's install
+        assert!(mark_setup_dirty_if_changed(&r));
+        git(&["reset", "-q", "--hard", "HEAD"]);
+        assert!(setup_is_stale(&r));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

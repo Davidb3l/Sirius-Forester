@@ -334,6 +334,8 @@ sirius run --workers N --agent-cmd "<cmd>" [--from todo] [--review-cmd "<cmd>"]
    #                                  never auto-merged; parked at completion if unused
    #   refs/sirius/wip-superseded/<issue>/<sha12>  an older pin newer work does not contain
    #   refs/sirius/wip-conflicted/<issue>          preserved work that no longer merges (fresh start)
+   #   refs/sirius/resumed/<issue>/<sha12>         every commit a resume merge merged (kept: how
+   #                                               `link --changed` knows an older hold is this issue's)
    # SIRF-49: an agent (or fix agent) that leaves a named branch checked out in its worktree:
    #   pinned at refs/sirius/keep/<issue>/<branch-lowercased-sanitized>, HEAD detached in place,
    #   the branch untouched; stderr warning +

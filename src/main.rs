@@ -1226,10 +1226,11 @@ fn cmd_run(
                 heartbeat_interval: std::time::Duration::from_secs(60),
                 log_path: Some(log),
             };
+            let installed_from = gate::setup_fingerprint(&wt_runner);
             match gate::run_setup(&wt_runner, &sh, cmd, &opts, &mut || {}) {
                 Ok(()) => {
                     // What later iterations compare against (SIRF-50).
-                    gate::write_setup_stamp(&wt_runner);
+                    gate::write_setup_stamp(&wt_runner, &installed_from);
                     true
                 }
                 Err(e) => {
