@@ -17,7 +17,7 @@ linking every change to the decision behind it.**
 Website & docs: **[siriusforester.com](https://siriusforester.com)** ·
 [Getting started](https://siriusforester.com/docs/getting-started/)
 
-Status: **early alpha (v0.1.6).** The `sirius` binary and all nine commands below
+Status: **early alpha (v0.1.7).** The `sirius` binary and all nine commands below
 are implemented and covered by an offline test suite (`cargo test`); CI runs on
 macOS/Linux/Windows. Prebuilt binaries are published for five platforms on the
 [Releases](https://github.com/Davidb3l/Sirius-Forester/releases) page, each with
@@ -140,7 +140,7 @@ To check a download by hand, pin both the signer identity and the OIDC issuer
 (an unpinned verify only proves *somebody* signed it):
 
 ```bash
-VERSION=0.1.6; PLATFORM=macos-arm64
+VERSION=0.1.7; PLATFORM=macos-arm64
 STEM="sirius-forester-$VERSION-$PLATFORM"
 cosign verify-blob \
   --bundle "$STEM.tar.gz.sigstore.json" \
@@ -156,7 +156,7 @@ cosign verify-blob \
 **Manual (macOS / Linux).** Download, verify, install:
 
 ```bash
-VERSION=0.1.6
+VERSION=0.1.7
 PLATFORM=macos-arm64             # or macos-x64, linux-x64-glibc, linux-arm64
 BASE="https://github.com/Davidb3l/Sirius-Forester/releases/download/v$VERSION"
 STEM="sirius-forester-$VERSION-$PLATFORM"
@@ -173,7 +173,7 @@ and its `.sha256` from the releases page, check the hash, then extract it and
 put the binary, which is named **`sirius.exe`**, anywhere on your `%PATH%`:
 
 ```powershell
-$Version  = "0.1.6"
+$Version  = "0.1.7"
 $Stem     = "sirius-forester-$Version-windows-x64"
 $Base     = "https://github.com/Davidb3l/Sirius-Forester/releases/download/v$Version"
 

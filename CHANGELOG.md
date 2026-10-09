@@ -5,7 +5,9 @@ release moves them under its version (see AGENTS.md → "Releases are batched").
 
 ## Unreleased
 
-### Plugin — bump its version at release (the plugin cache is keyed on version, so an unbumped change reaches no installed user — SF-10)
+## 0.1.7 — 2026-10-09
+
+### Plugin 0.2.6 (terminal and the Claude app alike)
 - Windows: native PowerShell installers `install-sirius.ps1` and `install-sothis.ps1`; `/sirius:install-binary` and `/sirius:install-suite` now reach them (their allow-lists were `.sh`-only).
 - `install-sirius.sh` and `install-sothis.sh` run from Git Bash / MSYS / Cygwin — they refused `MINGW64_NT-*` although the Windows tarballs have always shipped. On Windows they print the exact PowerShell line to put the install dir on PATH.
 - A failed `claude plugin install` now prints its real error, and on an SSH clone failure the HTTPS `GIT_CONFIG_*` workaround, instead of a bare "YOU ARE NOT DONE".
