@@ -112,9 +112,9 @@ pub enum Command {
     },
     /// Run the loop with N workers.
     Run {
-        /// How many parallel workers. Wins over `worker_concurrency` in
-        /// .sirius/config.json, which is the count when this flag is absent
-        /// (SIRF-50: the config used to silently CAP the flag).
+        /// How many parallel workers (default 1). `worker_concurrency` in
+        /// .sirius/config.json neither sets nor caps it (SIRF-50: it used to
+        /// cap this flag silently).
         #[arg(long)]
         workers: Option<u32>,
         /// Shell command each worker runs per claimed issue (e.g. `claude -p

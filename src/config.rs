@@ -444,7 +444,14 @@ pub struct WorktreeConfig {
     /// time (see [`detect_setup_cmd`]); `""` disables setup entirely.
     #[serde(default)]
     pub setup_cmd: Option<String>,
+    /// Wall clock for one setup run; null ⇒ [`DEFAULT_SETUP_TIMEOUT_SECS`].
+    /// A stalled registry kills the install instead of hanging the worker.
+    #[serde(default)]
+    pub setup_timeout_secs: Option<u64>,
 }
+
+/// SIRF-50: default wall clock for one worktree setup run (30 min).
+pub const DEFAULT_SETUP_TIMEOUT_SECS: u64 = 1800;
 
 /// Where the effective worktree setup command came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -456,6 +463,14 @@ pub enum SetupSource {
 }
 
 impl WorktreeConfig {
+    /// The effective setup wall clock.
+    pub fn setup_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.setup_timeout_secs
+                .unwrap_or(DEFAULT_SETUP_TIMEOUT_SECS),
+        )
+    }
+
     /// The setup command to run, and where it came from. `None` when setup is
     /// disabled (`""`) or the key is unset and nothing is detectable at `root`.
     pub fn resolve(&self, root: &Path) -> Option<(String, SetupSource)> {
@@ -700,8 +715,20 @@ impl Config {
                 ));
             }
         }
-        // SIRF-41: a zero limit would kill every agent on its first tick.
+        // SIRF-41: a zero limit would kill every agent on its first tick —
+        // the legacy key included (it is still the hard cap when set).
         let zero = |v: Option<u64>| v == Some(0);
+        if zero(self.agent_timeout_secs) {
+            return Err(
+                "agent_timeout_secs must be > 0 (or remove it; timeouts.hard_secs is the knob now)"
+                    .into(),
+            );
+        }
+        if zero(self.worktree.setup_timeout_secs) {
+            return Err(
+                "worktree.setup_timeout_secs must be > 0 (omit or null for the default)".into(),
+            );
+        }
         if zero(self.timeouts.idle_secs) || zero(self.timeouts.hard_secs) {
             return Err("timeouts.idle_secs / timeouts.hard_secs must be > 0 (omit or null for the default)".into());
         }
@@ -1068,6 +1095,7 @@ mod tests {
         // Set ⇒ verbatim, even when a lockfile would suggest otherwise.
         let set = WorktreeConfig {
             setup_cmd: Some("make deps".into()),
+            ..Default::default()
         };
         assert_eq!(
             set.resolve(&d),
@@ -1077,6 +1105,7 @@ mod tests {
         for blank in ["", "  "] {
             let off = WorktreeConfig {
                 setup_cmd: Some(blank.into()),
+                ..Default::default()
             };
             assert_eq!(off.resolve(&d), None);
         }

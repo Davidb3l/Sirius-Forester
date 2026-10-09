@@ -801,6 +801,42 @@ pub fn run_iteration(
         None => Resume::default(),
     };
     let resumed: Option<String> = resume.resumed.clone();
+    // SIRF-50 × SIRF-42: setup ran when the worktree was created, but each
+    // iteration now resets to the base branch's CURRENT tip — a predecessor
+    // that bumped a lockfile leaves this worktree's node_modules/.venv stale
+    // (version errors, not "module not found", so the env-fault re-gate never
+    // fires). Re-run setup whenever the lockfiles differ from those it last
+    // installed from, keeping the issue lease alive while it runs.
+    if let (Some(f), Some(cmd)) = (
+        fleet,
+        config
+            .worktree
+            .setup_cmd
+            .as_deref()
+            .filter(|c| !c.trim().is_empty()),
+    ) {
+        if crate::gate::setup_is_stale(runner) {
+            eprintln!("sirius: {worker} {issue}: the base changed a lockfile — re-running worktree setup `{cmd}`");
+            let opts = crate::gate::SetupOpts {
+                timeout: config.worktree.setup_timeout(),
+                heartbeat_interval: Duration::from_secs(config.heartbeat_interval_secs()),
+                log_path: Some(
+                    f.sirius_dir
+                        .join("logs")
+                        .join(format!("setup-{}.log", safe_name(worker))),
+                ),
+            };
+            let sh = crate::shell::resolve_shell();
+            match crate::gate::run_setup(runner, &sh, cmd, &opts, &mut || {
+                let _ = amt.heartbeat(&issue, worker);
+            }) {
+                Ok(()) => crate::gate::write_setup_stamp(runner),
+                // Not fatal: the agent can install what it needs, and a gate
+                // that fails on a missing dependency still re-runs setup once.
+                Err(e) => eprintln!("sirius: {worker} {issue}: {e}"),
+            }
+        }
+    }
     // What this iteration starts from: the base plus anything resumed. Work
     // is "new" (worth preserving) only past this point — resumed work is
     // still referenced by the ref it came from.
@@ -1562,8 +1598,18 @@ pub fn run_iteration(
                             return WorkGate::Exit(lease_lost(out, &reason, "env-fault re-gate"));
                         }
                         let sh = crate::shell::resolve_shell();
-                        match crate::gate::run_setup(runner, &sh, cmd) {
+                        let opts = crate::gate::SetupOpts {
+                            timeout: config.worktree.setup_timeout(),
+                            heartbeat_interval: Duration::from_secs(config.heartbeat_interval_secs()),
+                            log_path: fleet.map(|f| {
+                                f.sirius_dir.join("logs").join(format!("setup-{}.log", safe_name(worker)))
+                            }),
+                        };
+                        match crate::gate::run_setup(runner, &sh, cmd, &opts, &mut || {
+                            let _ = renew_checked();
+                        }) {
                             Ok(()) => {
+                                crate::gate::write_setup_stamp(runner);
                                 verdict = gate_once();
                                 let after = if verdict.as_ref().is_some_and(|v| v.passed) {
                                     "the re-gate passed"
@@ -7596,6 +7642,7 @@ mod tests {
             retry_budget,
             worktree: crate::config::WorktreeConfig {
                 setup_cmd: Some(setup.into()),
+                ..Default::default()
             },
             ..cfg()
         }
@@ -7772,8 +7819,13 @@ mod tests {
             "{}",
             comments[1]
         );
-        // Attempt 2's agent was handed attempt 1's failing tail.
-        let envs = m.agent_envs();
+        // Attempt 2's agent was handed attempt 1's failing tail. (Setup runs
+        // supervised too, with no agent env — only agent runs count here.)
+        let envs: Vec<_> = m
+            .agent_envs()
+            .into_iter()
+            .filter(|e| env_of(e, "SIRIUS_ISSUE").is_some())
+            .collect();
         assert_eq!(env_of(&envs[0], "SIRIUS_LAST_GATE_TAIL"), None);
         let tail = env_of(&envs[1], "SIRIUS_LAST_GATE_TAIL").expect("tail handed over");
         assert!(tail.contains("Cannot find module \"react\""), "{tail}");

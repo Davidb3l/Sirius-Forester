@@ -411,10 +411,14 @@ other stdout formats.
     "timeout_secs": 1800
   },
   "worktree": {                            // SIRF-50 — fleet worktree preparation
-    "setup_cmd": null                      // run once per fresh worktree, before any agent; null ⇒ detected
+    "setup_cmd": null,                     // run once per fresh worktree, before any agent; null ⇒ detected
                                            //   from the root lockfile (bun.lock/bun.lockb, pnpm-lock.yaml,
                                            //   yarn.lock, package-lock.json, uv.lock); "" ⇒ no setup.
                                            //   `sirius init` pre-fills the detected command.
+                                           //   Re-run by an iteration whose base changed a lockfile
+                                           //   (stamp in the worktree's git dir). Supervised: leases
+                                           //   are renewed while it waits for a sibling's setup or runs.
+    "setup_timeout_secs": null             // null = 1800: kill a hung install (setup failure)
   },
   "timeouts": {                            // SIRF-41 — work/fix agents only (reviewer: review.timeout_secs,
                                            //   integration: integration.timeout_secs — plain wall clocks)

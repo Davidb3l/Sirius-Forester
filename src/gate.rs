@@ -482,6 +482,19 @@ pub fn error_tail(v: &GateVerdict) -> String {
 }
 
 fn tail_of(output: &str) -> String {
+    // Control characters (a NUL above all) cannot go into an environment
+    // variable — SIRIUS_LAST_GATE_TAIL would make every retry fail to spawn —
+    // and garble a comment. Keep tabs; lines are split below.
+    let output: String = output
+        .chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
     let lines: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
     let start = lines.len().saturating_sub(ERROR_TAIL_LINES);
     let tail = lines[start..].join("\n");
@@ -635,21 +648,143 @@ fn names_a_path(line: &str, pattern: &str) -> bool {
 /// Run a worktree setup command (`worktree.setup_cmd`, SIRF-50) through
 /// `shell`, with the runner's cwd (the worker's worktree). `Err` names the
 /// command and carries its exit code and output tail.
-pub fn run_setup(runner: &dyn Runner, shell: &ShellCmd, cmd: &str) -> Result<(), String> {
+pub fn run_setup(
+    runner: &dyn Runner,
+    shell: &ShellCmd,
+    cmd: &str,
+    opts: &SetupOpts,
+    heartbeat: &mut dyn FnMut(),
+) -> Result<(), String> {
+    use crate::shell::{AgentOutcome, AgentRunOpts, CmdOutput};
+    use std::time::{Duration, Instant};
     // Package managers contend on their shared caches: launch-time setup is
-    // serial, and a mid-run env-fault re-run must not overlap a sibling's.
+    // serial, and a mid-run re-run must not overlap a sibling's. WAITING for
+    // a sibling keeps our leases alive — a sibling's slow install must not
+    // let this worker's issue lapse to another claimant.
     static SETUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _serial = SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    match run_in_shell(runner, shell, cmd) {
-        Ok(out) if out.success() => Ok(()),
-        Ok(out) => {
-            let tail = tail_of(&last_lines(&out.stdout, &out.stderr, ERROR_TAIL_LINES));
+    let mut last_beat = Instant::now();
+    let _serial = loop {
+        match SETUP_LOCK.try_lock() {
+            Ok(g) => break g,
+            Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if last_beat.elapsed() >= opts.heartbeat_interval {
+                    heartbeat();
+                    last_beat = Instant::now();
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    };
+    // Supervised, with a wall clock: a stalled registry must not hang the
+    // worker (or, at launch, the whole fleet) forever.
+    let run_opts = AgentRunOpts {
+        timeout: opts.timeout,
+        heartbeat_interval: opts.heartbeat_interval,
+        log_path: opts.log_path.clone(),
+        env: Vec::new(),
+    };
+    let tail = |out: &CmdOutput| {
+        let from_log = opts
+            .log_path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
+        let (o, e) = if out.stdout.is_empty() && out.stderr.is_empty() {
+            (from_log.as_str(), "")
+        } else {
+            (out.stdout.as_str(), out.stderr.as_str())
+        };
+        tail_of(&last_lines(o, e, ERROR_TAIL_LINES))
+    };
+    match runner.run_agent(
+        &shell.program,
+        &[shell.flag.as_str(), cmd],
+        &run_opts,
+        heartbeat,
+    ) {
+        Ok(AgentOutcome::Exited(out)) if out.success() => Ok(()),
+        Ok(AgentOutcome::Exited(out)) => {
             let code = out
                 .code
                 .map_or_else(|| "on a signal".to_string(), |c| format!("with code {c}"));
-            Err(format!("worktree setup `{cmd}` exited {code}:\n{tail}"))
+            Err(format!(
+                "worktree setup `{cmd}` exited {code}:\n{}",
+                tail(&out)
+            ))
         }
-        Err(e) => Err(format!("worktree setup `{cmd}` could not start: {e}")),
+        Ok(AgentOutcome::TimedOut { output, .. }) => Err(format!(
+            "worktree setup `{cmd}` timed out after {}s (killed; worktree.setup_timeout_secs):\n{}",
+            opts.timeout.as_secs(),
+            tail(&output)
+        )),
+        Err(e) => Err(format!(
+            "worktree setup `{cmd}` could not start (shell `{}`): {e}",
+            shell.describe()
+        )),
+    }
+}
+
+/// How [`run_setup`] runs: its wall clock, how often to renew leases while
+/// it waits or runs, and where its output goes (the failure tail is read
+/// back from there — a supervised run streams to the log, not to memory).
+#[derive(Debug, Clone)]
+pub struct SetupOpts {
+    pub timeout: std::time::Duration,
+    pub heartbeat_interval: std::time::Duration,
+    pub log_path: Option<std::path::PathBuf>,
+}
+
+/// The lockfiles whose content a worktree's installed dependencies follow:
+/// when an iteration's base changes any of them, setup runs again (SIRF-50).
+pub const SETUP_LOCKFILES: [&str; 6] = [
+    "bun.lock",
+    "bun.lockb",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "package-lock.json",
+    "uv.lock",
+];
+
+/// The blob ids of the lockfiles at `HEAD` — what a setup run installs from.
+/// Empty when none is tracked (or this is not a git worktree).
+pub fn setup_fingerprint(runner: &dyn Runner) -> String {
+    let mut args = vec!["ls-tree", "HEAD", "--"];
+    args.extend(SETUP_LOCKFILES);
+    crate::gitrange::run_git(runner, &args)
+        .map(|o| o.stdout.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Where a worktree records the fingerprint its dependencies were installed
+/// from: inside its own git dir, so it is never a file the agent's work could
+/// commit. `None` when the git dir cannot be resolved.
+pub fn setup_stamp_path(runner: &dyn Runner) -> Option<std::path::PathBuf> {
+    crate::gitrange::run_git(runner, &["rev-parse", "--absolute-git-dir"])
+        .ok()
+        .map(|o| o.stdout.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .map(|d| std::path::PathBuf::from(d).join("sirius-setup-stamp"))
+}
+
+/// Record that setup just ran against the current lockfiles.
+pub fn write_setup_stamp(runner: &dyn Runner) {
+    if let Some(p) = setup_stamp_path(runner) {
+        let _ = std::fs::write(p, setup_fingerprint(runner));
+    }
+}
+
+/// True when the lockfiles at HEAD differ from those setup last ran on — a
+/// fresh base (SIRF-42) that bumped a dependency. `false` when no stamp can be
+/// read or written (nothing to compare against: the env-fault re-gate still
+/// covers a missing module).
+pub fn setup_is_stale(runner: &dyn Runner) -> bool {
+    let Some(p) = setup_stamp_path(runner) else {
+        return false;
+    };
+    match std::fs::read_to_string(&p) {
+        Ok(stamped) => stamped.trim() != setup_fingerprint(runner),
+        Err(_) => false,
     }
 }
 
@@ -1513,11 +1648,85 @@ mod tests {
         );
     }
 
+    fn setup_opts() -> SetupOpts {
+        SetupOpts {
+            timeout: std::time::Duration::from_secs(60),
+            heartbeat_interval: std::time::Duration::from_secs(60),
+            log_path: None,
+        }
+    }
+
+    /// SIRF-50 × SIRF-42: the stamp tracks the lockfiles setup installed
+    /// from; a base that changes one makes the worktree stale (real git).
+    #[test]
+    fn setup_goes_stale_when_the_base_changes_a_lockfile() {
+        let dir = std::env::temp_dir().join(format!("sirius-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = crate::shell::RealRunner {
+            cwd: Some(dir.clone()),
+        };
+        let git = |args: &[&str]| {
+            let mut full = vec!["-c", "user.name=t", "-c", "user.email=t@t"];
+            full.extend(args);
+            crate::gitrange::run_git(&r, &full).unwrap();
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("bun.lock"), "react@18").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "a"]);
+        assert!(!setup_is_stale(&r), "no stamp yet: nothing to compare");
+        write_setup_stamp(&r);
+        assert!(!setup_is_stale(&r));
+        std::fs::write(dir.join("README"), "x").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "unrelated"]);
+        assert!(!setup_is_stale(&r), "a non-lockfile change is not stale");
+        std::fs::write(dir.join("bun.lock"), "react@19").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "bump"]);
+        assert!(setup_is_stale(&r), "a lockfile bump is stale");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stalled install is killed at the setup wall clock, not waited on.
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_setup_times_out() {
+        let r = crate::shell::RealRunner::default();
+        let opts = SetupOpts {
+            timeout: std::time::Duration::from_secs(1),
+            heartbeat_interval: std::time::Duration::from_secs(60),
+            log_path: None,
+        };
+        let t0 = std::time::Instant::now();
+        let e = run_setup(&r, &ShellCmd::posix_sh(), "sleep 30", &opts, &mut || {}).unwrap_err();
+        assert!(e.contains("timed out after 1s"), "{e}");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_nul_in_the_output_never_reaches_the_tail() {
+        let t = tail_of("ok\nbad\0byte\x07here\n\tindented");
+        assert!(!t.contains('\0') && !t.contains('\x07'), "{t:?}");
+        assert!(
+            t.contains("bad byte here") && t.contains("\tindented"),
+            "{t:?}"
+        );
+    }
+
     #[test]
     fn run_setup_names_the_command_and_its_output_on_failure() {
         let m = MockRunner::new();
         m.expect(&["sh", "-c", "bun install --frozen-lockfile"], 0, "ok");
-        assert!(run_setup(&m, &test_shell(), "bun install --frozen-lockfile").is_ok());
+        assert!(run_setup(
+            &m,
+            &test_shell(),
+            "bun install --frozen-lockfile",
+            &setup_opts(),
+            &mut || {}
+        )
+        .is_ok());
         let m = MockRunner::new();
         m.push(MockResponse::new(
             &["sh", "-c"],
@@ -1525,7 +1734,14 @@ mod tests {
             "",
             "error: lockfile had changes, but lockfile is frozen",
         ));
-        let e = run_setup(&m, &test_shell(), "bun install --frozen-lockfile").unwrap_err();
+        let e = run_setup(
+            &m,
+            &test_shell(),
+            "bun install --frozen-lockfile",
+            &setup_opts(),
+            &mut || {},
+        )
+        .unwrap_err();
         assert!(
             e.contains("`bun install --frozen-lockfile` exited with code 1"),
             "{e}"

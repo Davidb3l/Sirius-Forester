@@ -1196,8 +1196,9 @@ fn cmd_run(
     // contend on their shared caches), before any agent starts. Detection
     // reads the first worktree: it IS the base commit's tree, so an untracked
     // lockfile in the main checkout cannot pick a command the worktrees can't
-    // run. No per-iteration re-run is needed: the iteration's reset is
-    // `git clean -fd` (no -x), which keeps ignored dirs like node_modules.
+    // run. The iteration's reset is `git clean -fd` (no -x), which keeps
+    // ignored dirs like node_modules; an iteration re-runs setup only when
+    // its (fresh, SIRF-42) base changed a lockfile — see the stamp in run.rs.
     let setup = assignments
         .first()
         .and_then(|(_, wt)| cfg.worktree.resolve(wt));
@@ -1213,8 +1214,19 @@ fn cmd_run(
             let wt_runner = RealRunner {
                 cwd: Some(wt_path.clone()),
             };
-            match gate::run_setup(&wt_runner, &sh, cmd) {
-                Ok(()) => true,
+            let logs = ws.sirius_dir().join("logs");
+            let _ = std::fs::create_dir_all(&logs);
+            let opts = gate::SetupOpts {
+                timeout: cfg.worktree.setup_timeout(),
+                heartbeat_interval: std::time::Duration::from_secs(60),
+                log_path: Some(logs.join(format!("setup-{name}.log"))),
+            };
+            match gate::run_setup(&wt_runner, &sh, cmd, &opts, &mut || {}) {
+                Ok(()) => {
+                    // What later iterations compare against (SIRF-50).
+                    gate::write_setup_stamp(&wt_runner);
+                    true
+                }
                 Err(e) => {
                     // That worker does not start — like a worktree that could
                     // not be created, but without sinking its siblings.
