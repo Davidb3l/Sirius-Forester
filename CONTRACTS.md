@@ -262,8 +262,9 @@ sirius run --workers N --agent-cmd "<cmd>" [--from todo] [--review-cmd "<cmd>"]
    # SIRF-50: after creating each worktree, worktree.setup_cmd (unset ⇒ detected from the
    # lockfile, "" ⇒ none) runs in it through the gate's shell, serially, before any agent.
    # A worker whose setup fails does not start: {"event":"fleet","phase":"setup_failed",
-   # "worker","cmd","error"} right after the start event; if EVERY setup fails, only those
-   # lines are printed and run exits 1.
+   # "worker","cmd","error"} right after the start event, and the run exits 1 at the end
+   # (the other workers still run); if EVERY setup fails, only those lines are printed and
+   # run exits 1 at once.
    # SIRF-27: {"event":"fleet","phase":"fallback","worker","issue","reason","models":{"default","review"}} once,
    #   when a fleet stop on the primary tier switches the WHOLE fleet to models.fallback; the
    #   failed phase is retried in place on the fallback tier (review: a "fell_back" review event)
@@ -289,7 +290,10 @@ sirius run --workers N --agent-cmd "<cmd>" [--from todo] [--review-cmd "<cmd>"]
    #   ERR_MODULE_NOT_FOUND, "ModuleNotFoundError: No module named", E0463, the test
    #   runner itself "not found", or exit 127 + "not found") in a fleet worktree with a
    #   setup command re-runs setup and re-gates ONCE per work/fix pass, WITHOUT using a
-   #   retry_budget attempt; still failing ⇒ an ordinary failure. One gate event per attempt.
+   #   retry_budget attempt; still failing ⇒ an ordinary failure. One gate event per attempt:
+   #   "env_fault" = the FIRST gate of that attempt looked like an env fault; result,
+   #   reason_code and error_tail describe the final (re-)gate. The lease is renewed before
+   #   setup re-runs (refused ⇒ the iteration aborts, as a lost lease does elsewhere).
    # review (SIRF-23, only with review.cmd): {"phase":"review","round":N,"result":"clean|blocking|error|tampered|skipped","confirmed":K,"notes":M}
    # fix:  {"phase":"fix","round":N,"agent_ok":bool,...}  (then a re-gate, as today)
    # release gains "review":"review: 2 rounds, 4 bugs fixed, 1 rebuttal accepted" when a review ran

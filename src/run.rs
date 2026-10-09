@@ -1439,6 +1439,12 @@ pub fn run_iteration(
                         eprintln!(
                             "sirius: {worker} {issue}: gate output looks like a missing dependency ({line}) — re-running worktree setup `{cmd}` and re-gating (no work attempt used)"
                         );
+                        // Setup + a second full gate can outlast the lease
+                        // (no agent supervision renews it here): renew now,
+                        // and abort if the lease is no longer ours.
+                        if let Err(reason) = renew_checked() {
+                            return WorkGate::Exit(lease_lost(out, &reason, "env-fault re-gate"));
+                        }
                         let sh = crate::shell::resolve_shell();
                         match crate::gate::run_setup(runner, &sh, cmd) {
                             Ok(()) => {
@@ -6874,6 +6880,60 @@ mod tests {
         assert_eq!(env_of(&envs[0], "SIRIUS_LAST_GATE_TAIL"), None);
         let tail = env_of(&envs[1], "SIRIUS_LAST_GATE_TAIL").expect("tail handed over");
         assert!(tail.contains("Cannot find module \"react\""), "{tail}");
+    }
+
+    // Setup + a second full gate can outlast the lease, so the lease is
+    // renewed first — and a REFUSED renewal aborts before setup runs.
+    #[test]
+    fn env_fault_regate_renews_the_lease_and_aborts_when_it_is_lost() {
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-64");
+        program_fleet_prep(&m);
+        // Pre-spawn heartbeat: ours. Re-gate renewal: refused.
+        m.expect(
+            &["amt", "--json", "claim", "--issue"],
+            0,
+            r#"{"claimed":true}"#,
+        );
+        m.expect(
+            &["amt", "--json", "claim", "--issue"],
+            0,
+            r#"{"claimed":false,"reason":"lease held by sirius/rowan"}"#,
+        );
+        m.expect(&["sh", "-c"], 0, ""); // agent
+        m.expect(
+            &["git", "diff", "--name-only", "base999"],
+            0,
+            "src/ui.tsx\n",
+        );
+        m.push(MockResponse::new(&["sh", "-c"], 1, "", MISSING_DEP));
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &setup_cfg(1, SETUP),
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
+            None,
+            Some(&test_fleet("base999")),
+        );
+        match o {
+            IterationOutcome::Error(e) => assert!(e.contains("lease"), "{e}"),
+            other => panic!("a lost lease must abort, got {other:?}"),
+        }
+        assert_eq!(
+            agent_runs(&m),
+            1,
+            "the abort came AFTER the work, at the re-gate"
+        );
+        assert_eq!(setup_runs(&m), 0, "setup never ran on a lost lease");
     }
 
     // No setup command (disabled) ⇒ an env fault is flagged but nothing is

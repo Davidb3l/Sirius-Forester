@@ -1265,7 +1265,9 @@ fn cmd_run(
     ));
 
     let iterations = std::sync::atomic::AtomicU32::new(0);
-    let any_failed = std::sync::atomic::AtomicBool::new(false);
+    // A worker that never started (its worktree setup failed) is a failure
+    // the exit code must carry — exit 0 would hide it from a wrapper.
+    let any_failed = std::sync::atomic::AtomicBool::new(!setup_failed.is_empty());
     // SF-14: did ANY worker find work? `iterations` cannot say — it only
     // counts when --max-iterations is set.
     let claimed_any = std::sync::atomic::AtomicBool::new(false);

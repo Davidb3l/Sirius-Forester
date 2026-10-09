@@ -488,17 +488,22 @@ fn tail_of(output: &str) -> String {
     if tail.len() <= ERROR_TAIL_MAX_BYTES {
         return tail;
     }
-    let mut cut = tail.len() - ERROR_TAIL_MAX_BYTES;
+    // The marker counts toward the cap, so the whole tail stays ≤ the cap.
+    const MARK: &str = "…";
+    let mut cut = tail.len() - (ERROR_TAIL_MAX_BYTES - MARK.len());
     while !tail.is_char_boundary(cut) {
         cut += 1;
     }
-    // Prefer starting on a whole line, unless that would leave nothing.
-    if let Some(nl) = tail[cut..].find('\n') {
-        if cut + nl + 1 < tail.len() {
-            cut += nl + 1;
+    // Prefer starting on a whole line (unless the cut already does, or that
+    // would leave nothing).
+    if tail.as_bytes()[cut - 1] != b'\n' {
+        if let Some(nl) = tail[cut..].find('\n') {
+            if cut + nl + 1 < tail.len() {
+                cut += nl + 1;
+            }
         }
     }
-    format!("…{}", &tail[cut..])
+    format!("{MARK}{}", &tail[cut..])
 }
 
 /// `text` in a Markdown code fence that its own backticks cannot close.
@@ -595,9 +600,13 @@ pub fn env_fault_line(
         if !not_found {
             continue;
         }
+        // Anchored: `prog` must be a whole word (line start, or after a
+        // space, `:` or `/`) — `go` must not match "asset logo: not found".
         let runner_missing = runner_prog.as_deref().is_some_and(|prog| {
-            l.ends_with(&format!("{prog}: command not found"))
-                || l.ends_with(&format!("{prog}: not found"))
+            [": command not found", ": not found"].iter().any(|suffix| {
+                l.strip_suffix(&format!("{prog}{suffix}"))
+                    .is_some_and(|before| before.is_empty() || before.ends_with([' ', ':', '/']))
+            })
         });
         if runner_missing || code == Some(127) {
             return Some(l.to_string());
@@ -617,13 +626,20 @@ fn names_a_path(line: &str, pattern: &str) -> bool {
     };
     let rest = line[at + pattern.len()..].trim_start();
     let rest = rest.trim_start_matches(['\'', '"', '`']);
-    rest.starts_with('.') || rest.starts_with('/')
+    let b = rest.as_bytes();
+    let drive =
+        b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/');
+    rest.starts_with('.') || rest.starts_with('/') || drive
 }
 
 /// Run a worktree setup command (`worktree.setup_cmd`, SIRF-50) through
 /// `shell`, with the runner's cwd (the worker's worktree). `Err` names the
 /// command and carries its exit code and output tail.
 pub fn run_setup(runner: &dyn Runner, shell: &ShellCmd, cmd: &str) -> Result<(), String> {
+    // Package managers contend on their shared caches: launch-time setup is
+    // serial, and a mid-run env-fault re-run must not overlap a sibling's.
+    static SETUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serial = SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     match run_in_shell(runner, shell, cmd) {
         Ok(out) if out.success() => Ok(()),
         Ok(out) => {
@@ -1371,11 +1387,7 @@ mod tests {
             .map(|i| format!("{i}:{}", "é".repeat(200)))
             .collect();
         let tail = error_tail(&verdict_with_detail(&long.join("\n")));
-        assert!(
-            tail.len() <= ERROR_TAIL_MAX_BYTES + '…'.len_utf8(),
-            "{}",
-            tail.len()
-        );
+        assert!(tail.len() <= ERROR_TAIL_MAX_BYTES, "{}", tail.len());
         assert!(tail.starts_with('…'));
         assert!(tail.ends_with(&long[14]));
         let first = tail.trim_start_matches('…').lines().next().unwrap();
@@ -1423,6 +1435,14 @@ mod tests {
             env_fault_line("user: not found", "", Some(1), "npm test"),
             None
         );
+        // The runner name is matched as a whole word: `go` is not "logo".
+        assert_eq!(
+            env_fault_line("asset logo: not found", "", Some(1), "go test ./..."),
+            None
+        );
+        assert!(env_fault_line("sh: go: not found", "", Some(1), "go test ./...").is_some());
+        // A Windows absolute path is a path, not a package.
+        assert_eq!(f(r"Error: Cannot find module 'C:\w\gone.js'"), None);
     }
 
     // run_cmd scans the FULL output (not just the kept 20-line detail) and
