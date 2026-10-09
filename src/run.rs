@@ -2953,9 +2953,30 @@ pub fn preserve_stale_worktree(
 
 /// Move a stale worktree that could not be (fully) preserved out of the
 /// way instead of deleting it: `git worktree move` (it stays a registered
-/// worktree, so its HEAD stays a gc root), else a plain rename. `None`:
-/// it could not be moved either.
-fn set_aside(repo: &dyn Runner, wt_path: &std::path::Path) -> Option<std::path::PathBuf> {
+/// worktree, so its HEAD stays a gc root), else a plain rename followed by
+/// `git worktree repair` (re-pointing the admin entry at the new path — a
+/// `prune` there would unregister it and leave its commits gc-able). As a
+/// last resort a detached HEAD no ref reaches is pinned at
+/// `refs/sirius/wip-orphaned/<worker>/<sha12>` before anything moves. `None`:
+/// it could not be moved.
+fn set_aside(
+    repo: &dyn Runner,
+    wt_path: &std::path::Path,
+    worker: &str,
+) -> Option<std::path::PathBuf> {
+    let wt = crate::shell::RealRunner {
+        cwd: Some(wt_path.to_path_buf()),
+    };
+    // Only inside a worktree of this repo (never the enclosing checkout).
+    let ours = common_dir(&wt).is_some() && common_dir(&wt) == common_dir(repo);
+    let mut head_safe = !ours;
+    if let Some(h) = ours.then(|| crate::gitrange::head_rev(&wt).ok()).flatten() {
+        head_safe = reachable_from_a_ref(&wt, &h).unwrap_or(false) || {
+            let w = ref_segment(worker);
+            let r = format!("refs/sirius/wip-orphaned/{w}/{}", short_sha(&h));
+            pin_ref(&wt, &w, &r, &h).is_ok()
+        };
+    }
     let name = wt_path.file_name()?.to_string_lossy().to_string();
     let aside = wt_path.with_file_name(format!("{name}.stale-{}", unix_secs()));
     let (from, to) = (
@@ -2966,9 +2987,12 @@ fn set_aside(repo: &dyn Runner, wt_path: &std::path::Path) -> Option<std::path::
         return Some(aside);
     }
     std::fs::rename(wt_path, &aside).ok()?;
-    // The admin entry now points at a missing path: drop it, so a fresh
-    // worktree can be added where the stale one was.
-    let _ = repo.run("git", &["worktree", "prune"]);
+    if ours && crate::gitrange::run_git(repo, &["worktree", "repair", &to]).is_err() && head_safe {
+        // Repair failed: the admin entry points at a missing path and would
+        // block a fresh worktree here. Its HEAD is on a ref, so dropping
+        // the registration loses nothing.
+        let _ = repo.run("git", &["worktree", "prune"]);
+    }
     Some(aside)
 }
 
@@ -3016,7 +3040,7 @@ pub fn clear_stale_worktree(
         }
     };
     if let Some(why) = keep {
-        match set_aside(repo, wt_path) {
+        match set_aside(repo, wt_path, worker) {
             Some(to) => eprintln!(
                 "sirius: {worker}: WARNING the stale worktree {}: {why} — NOT deleted; moved aside to {}",
                 wt_path.display(),
@@ -9523,6 +9547,41 @@ mod tests {
         assert_eq!(
             git_at(&w.repo, &["rev-list", "--parents", "-n", "1", &got.sha]),
             format!("{} {ours}", got.sha)
+        );
+    }
+
+    /// Review: when `git worktree move` refuses (here: a locked worktree;
+    /// in the field a submodule or a Windows file lock), the renamed tree is
+    /// REPAIRED, not pruned — it stays a registered worktree, and its
+    /// unreachable HEAD is pinned before the move.
+    #[test]
+    fn set_aside_fallback_keeps_the_tree_registered_and_its_head_reachable() {
+        let w = GitWorld::new("asiderepair");
+        let repo = crate::shell::RealRunner {
+            cwd: Some(w.repo.clone()),
+        };
+        let lost = commit_file(&w.wt, "lost.txt");
+        git_at(
+            &w.repo,
+            &["worktree", "lock", &crate::gitrange::git_path(&w.wt)],
+        );
+        let aside = set_aside(&repo, &w.wt, "sirius/oak").expect("moved");
+        assert!(!w.wt.exists() && aside.join("lost.txt").exists());
+        assert_eq!(
+            git_at(&aside, &["rev-parse", "HEAD"]),
+            lost,
+            "still a worktree"
+        );
+        assert!(git_at(&w.repo, &["worktree", "list", "--porcelain"])
+            .contains(&aside.file_name().unwrap().to_string_lossy().to_string()));
+        assert!(!git_at(
+            &w.repo,
+            &["for-each-ref", "--contains", &lost, "--format=%(refname)"]
+        )
+        .is_empty());
+        git_at(
+            &w.repo,
+            &["worktree", "unlock", &crate::gitrange::git_path(&aside)],
         );
     }
 }
