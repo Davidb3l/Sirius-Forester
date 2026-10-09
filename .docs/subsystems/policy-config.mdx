@@ -7,8 +7,8 @@ relatedFiles: ["src/config.rs", "src/shell.rs", "src/doctor.rs"]
 anchors: []
 evidence: []
 refs: []
-verifiedCommit: "c38e8f247abfea0e0869ef1ce1722628990274f2"
-verifiedAt: "2026-10-08T23:09:30.166Z"
+verifiedCommit: "bb69e4246d340fa05fec08746290cb0a4b6bef22"
+verifiedAt: "2026-10-09T00:18:23.953Z"
 driftSuspectSince: ""
 driftSuspectReason: ""
 createdAt: 1785915503544
@@ -68,7 +68,7 @@ Nothing detectable ⇒ `test_cmd` stays `null` (still a valid shape — every pr
 | `integration.timeout_secs` | `1800` | hard cap on one integration run (the whole process tree is killed) |
 | `lease_ttl_secs` | `900` | amt/hayven lease TTL |
 
-**Which shell runs `gate.test_cmd`** (`shell::resolve_shell`, SF-15 — the same rule runs `sirius run --agent-cmd`): `$SIRIUS_SHELL` if set, verbatim (a `cmd`/`command` program stem gets `/C`, anything else `-c`); otherwise `/bin/sh -c` on unix; on Windows the first `sh.exe`/`sh` on `PATH` (absolute path, `-c`), else `%ComSpec%` (`cmd.exe`) with `/C`. `bash` is never auto-probed on Windows (`System32\bash.exe` is the WSL launcher). `review.cmd` and `integration.cmd` still spawn literal `sh -c`. `sirius doctor`'s `gate_configured` line names the shell it resolved.
+**Which shell runs `gate.test_cmd`** (`shell::resolve_shell`, SF-15 — the same rule runs `sirius run --agent-cmd`): `$SIRIUS_SHELL` if set, verbatim (a `cmd`/`command` program stem gets `/C`, anything else `-c`); otherwise `/bin/sh -c` on unix; on Windows the first `sh.exe`/`sh` on `PATH` (absolute path, `-c`), else `%ComSpec%` (`cmd.exe`) with `/C`. `bash` is never auto-probed on Windows (`System32\bash.exe` is the WSL launcher). `review.cmd` and `integration.cmd` still spawn literal `sh -c`. When `gate.test_cmd` is set, `sirius doctor`'s passing `gate_configured` line names the shell it resolved.
 
 `backoff_delay_ms(attempt)` is `base << attempt`, clamped to `max_ms`: 500, 1000, 2000, 4000, 8000, then flat.
 

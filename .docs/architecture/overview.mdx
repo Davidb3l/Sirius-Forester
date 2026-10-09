@@ -7,8 +7,8 @@ relatedFiles: ["src/main.rs", "src/cli.rs", "src/workspace.rs", "src/doctor.rs",
 anchors: []
 evidence: []
 refs: []
-verifiedCommit: "c38e8f247abfea0e0869ef1ce1722628990274f2"
-verifiedAt: "2026-10-08T23:09:30.128Z"
+verifiedCommit: "bb69e4246d340fa05fec08746290cb0a4b6bef22"
+verifiedAt: "2026-10-09T00:18:23.907Z"
 driftSuspectSince: ""
 driftSuspectReason: ""
 createdAt: 1785915503544
@@ -80,7 +80,7 @@ sirius integrate       build the integration frontier, run integration.cmd on it
 sirius run             the loop, --workers N --agent-cmd "<cmd>" --model <id> [--review-cmd "<cmd>"] [--review-model <id>]
 ```
 
-Exit codes follow the suite convention: `0` ok, `1` operational failure, `2` usage error, `3` soft-block; `sirius run` adds `4` = the fleet paused (usage limit, or integration red under `on_fail: block`). `sirius run` also exits `2` up front when `--agent-cmd`'s program is not on `PATH` (a command too dynamic to read statically skips this preflight). An unconfigured gate is still exit `3`; `sirius gate --json` carries `reason_code` / `structural` to tell it apart from a real failure. `sirius doctor --json` is the discovery handshake and deliberately **exits 0 even when unhealthy** — a peer that exits non-zero is read as ABSENT, so an unhealthy-but-present tool must report its health in the envelope body, not the exit code (`doctor_exit_code` in `src/main.rs`).
+Exit codes follow the suite convention: `0` ok, `1` operational failure, `2` usage error, `3` soft-block; `sirius run` adds `4` = the fleet paused on a fleet-wide stop (`models::fleet_stop`: a usage/plan limit, a model the agent CLI cannot run, or a logged-out agent CLI — or integration red under `on_fail: block`). `sirius run` also exits `2` up front when `--agent-cmd`'s program is not on `PATH` (a command too dynamic to read statically skips this preflight). An unconfigured gate is still exit `3`; `sirius gate --json` carries `reason_code` / `structural` to tell it apart from a real failure. `sirius doctor --json` is the discovery handshake and deliberately **exits 0 even when unhealthy** — a peer that exits non-zero is read as ABSENT, so an unhealthy-but-present tool must report its health in the envelope body, not the exit code (`doctor_exit_code` in `src/main.rs`).
 
 ## Workspace discovery
 

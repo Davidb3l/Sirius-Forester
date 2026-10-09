@@ -20,8 +20,8 @@
       "anchors": [],
       "evidence": [],
       "refs": [],
-      "verifiedCommit": "c38e8f247abfea0e0869ef1ce1722628990274f2",
-      "verifiedAt": "2026-10-08T23:09:30.128Z",
+      "verifiedCommit": "bb69e4246d340fa05fec08746290cb0a4b6bef22",
+      "verifiedAt": "2026-10-09T00:18:23.907Z",
       "driftSuspectSince": "",
       "driftSuspectReason": "",
       "createdAt": 1785915503544,
@@ -130,8 +130,8 @@
       ],
       "evidence": [],
       "refs": [],
-      "verifiedCommit": "c38e8f247abfea0e0869ef1ce1722628990274f2",
-      "verifiedAt": "2026-10-08T23:09:30.154Z",
+      "verifiedCommit": "bb69e4246d340fa05fec08746290cb0a4b6bef22",
+      "verifiedAt": "2026-10-09T00:18:23.924Z",
       "driftSuspectSince": "",
       "driftSuspectReason": "",
       "createdAt": 1785915503544,
@@ -155,8 +155,8 @@
       "anchors": [],
       "evidence": [],
       "refs": [],
-      "verifiedCommit": "c38e8f247abfea0e0869ef1ce1722628990274f2",
-      "verifiedAt": "2026-10-08T23:09:30.166Z",
+      "verifiedCommit": "bb69e4246d340fa05fec08746290cb0a4b6bef22",
+      "verifiedAt": "2026-10-09T00:18:23.953Z",
       "driftSuspectSince": "",
       "driftSuspectReason": "",
       "createdAt": 1785915503544,
@@ -175,11 +175,20 @@
       "relatedFiles": [
         "src/bridge.rs"
       ],
-      "anchors": [],
+      "anchors": [
+        {
+          "file": "src/gitrange.rs",
+          "symbol": "changed_symbols"
+        },
+        {
+          "file": "src/gitrange.rs",
+          "symbol": "fleet_line_files"
+        }
+      ],
       "evidence": [],
       "refs": [],
-      "verifiedCommit": "16047cf79d90a7d05f94a45fa31a4344d9a5fa13",
-      "verifiedAt": "2026-10-03T08:18:49.126Z",
+      "verifiedCommit": "bb69e4246d340fa05fec08746290cb0a4b6bef22",
+      "verifiedAt": "2026-10-09T00:18:23.939Z",
       "driftSuspectSince": "",
       "driftSuspectReason": "",
       "createdAt": 1785915503544,
@@ -247,5 +256,5 @@
       "createdBy": "claude-code"
     }
   ],
-  "lastUpdated": 1791500970167
+  "lastUpdated": 1791505103954
 }
