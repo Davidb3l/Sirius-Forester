@@ -48,14 +48,47 @@ pub struct AgentRunOpts {
     pub env: Vec<(String, String)>,
 }
 
+/// Which limit killed an agent (SIRF-41 #3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutKind {
+    /// No progress — no output, no worktree change — for the idle window.
+    Idle,
+    /// The wall-clock cap (`AgentRunOpts::timeout`) — the only kind a run
+    /// without a [`ProgressWatch`] (reviewer, integration, canary) can hit.
+    Hard,
+}
+
+impl TimeoutKind {
+    /// The NDJSON spelling (`timeout_kind` on work/fix events).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TimeoutKind::Idle => "idle",
+            TimeoutKind::Hard => "hard",
+        }
+    }
+
+    /// The human sentence for a release comment, naming the limit that fired.
+    pub fn describe(self, idle_secs: u64, hard_secs: u64) -> String {
+        match self {
+            TimeoutKind::Idle => {
+                format!("agent idle for {idle_secs}s — no output, no file changes")
+            }
+            TimeoutKind::Hard => format!("hit the hard cap of {hard_secs}s"),
+        }
+    }
+}
+
 /// The result of supervising an agent command (SIRF-7).
 #[derive(Debug, Clone)]
 pub enum AgentOutcome {
     /// The child exited on its own; carries its captured output.
     Exited(CmdOutput),
-    /// The `timeout` elapsed and the child was killed. `output` holds whatever
-    /// was captured before the kill.
-    TimedOut { output: CmdOutput },
+    /// A limit fired and the child was killed. `output` holds whatever was
+    /// captured before the kill; `kind` says which limit (SIRF-41).
+    TimedOut {
+        output: CmdOutput,
+        kind: TimeoutKind,
+    },
 }
 
 impl AgentOutcome {
@@ -68,13 +101,52 @@ impl AgentOutcome {
     pub fn output(&self) -> &CmdOutput {
         match self {
             AgentOutcome::Exited(o) => o,
-            AgentOutcome::TimedOut { output } => output,
+            AgentOutcome::TimedOut { output, .. } => output,
         }
     }
 
     pub fn timed_out(&self) -> bool {
         matches!(self, AgentOutcome::TimedOut { .. })
     }
+
+    /// Which limit killed the child; `None` when it exited on its own.
+    pub fn timeout_kind(&self) -> Option<TimeoutKind> {
+        match self {
+            AgentOutcome::TimedOut { kind, .. } => Some(*kind),
+            AgentOutcome::Exited(_) => None,
+        }
+    }
+}
+
+/// A cheap snapshot of the agent's worktree, for progress detection
+/// (SIRF-41 #3). Two snapshots that differ mean the agent DID something; a
+/// differing `head` means it committed (which also drives the #4 grace).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeProbe {
+    /// `HEAD`'s sha (empty on an unborn branch).
+    pub head: String,
+    /// Hash of the porcelain status plus the size+mtime of every listed path,
+    /// so an edit to an ALREADY-dirty file still registers.
+    pub tree: u64,
+}
+
+/// Progress-aware supervision for a WORK/FIX agent (SIRF-41 #3/#4), passed to
+/// [`Runner::run_agent_watched`]. The agent is killed only when it has shown
+/// no progress for `idle` — progress = its log grew, or `probe` returned a
+/// different snapshot — or when `AgentRunOpts::timeout` (the hard cap) runs out.
+pub struct ProgressWatch<'a> {
+    /// Kill after this long with no output and no worktree change.
+    pub idle: Duration,
+    /// How often `probe` runs (it shells out to git, so ~30s in production).
+    /// One extra probe always runs right before a kill, so a change made since
+    /// the last poll is never missed.
+    pub probe_every: Duration,
+    /// SIRF-41 #4: when a kill is due and `HEAD` moved within this window,
+    /// the kill is deferred ONCE by this long — an agent that just committed
+    /// is finishing, not stuck.
+    pub grace: Duration,
+    /// Snapshot the worktree; `None` = could not tell (never counts as progress).
+    pub probe: &'a mut dyn FnMut() -> Option<WorktreeProbe>,
 }
 
 /// Abstraction over "run this program with these args and give me the output".
@@ -98,6 +170,25 @@ pub trait Runner: Send + Sync {
         _heartbeat: &mut dyn FnMut(),
     ) -> std::io::Result<AgentOutcome> {
         self.run(program, args).map(AgentOutcome::Exited)
+    }
+
+    /// [`Runner::run_agent`] with PROGRESS-AWARE supervision (SIRF-41 #3/#4):
+    /// `opts.timeout` becomes the hard cap, and the child is also killed once
+    /// it has made no progress for `watch.idle`. Used for WORK/FIX agents; the
+    /// reviewer, integration and canary runs keep the plain wall clock.
+    ///
+    /// Default impl ignores the watch and delegates to `run_agent`, so a
+    /// runner (or a test wrapper) that only overrides `run_agent` still works.
+    fn run_agent_watched(
+        &self,
+        program: &str,
+        args: &[&str],
+        opts: &AgentRunOpts,
+        watch: &mut ProgressWatch<'_>,
+        heartbeat: &mut dyn FnMut(),
+    ) -> std::io::Result<AgentOutcome> {
+        let _ = watch;
+        self.run_agent(program, args, opts, heartbeat)
     }
 }
 
@@ -176,6 +267,88 @@ impl Runner for RealRunner {
         opts: &AgentRunOpts,
         heartbeat: &mut dyn FnMut(),
     ) -> std::io::Result<AgentOutcome> {
+        self.supervise(program, args, opts, None, heartbeat)
+    }
+
+    /// SIRF-41: the same supervision, plus the idle watchdog and the
+    /// finish grace — see [`RealRunner::supervise`].
+    fn run_agent_watched(
+        &self,
+        program: &str,
+        args: &[&str],
+        opts: &AgentRunOpts,
+        watch: &mut ProgressWatch<'_>,
+        heartbeat: &mut dyn FnMut(),
+    ) -> std::io::Result<AgentOutcome> {
+        self.supervise(program, args, opts, Some(watch), heartbeat)
+    }
+}
+
+/// What the supervisor has seen of an agent's progress (SIRF-41 #3/#4).
+struct Progress {
+    /// The last worktree snapshot (the baseline until the first change).
+    snapshot: Option<WorktreeProbe>,
+    /// When progress (log growth or a worktree change) was last seen.
+    last_progress: Instant,
+    /// When a `HEAD` move was last seen — drives the finish grace.
+    last_commit: Option<Instant>,
+    last_probe: Instant,
+    log_len: u64,
+}
+
+impl Progress {
+    /// Take a fresh worktree snapshot; a difference from the last one is
+    /// progress, and a different `HEAD` is a commit.
+    fn observe(&mut self, w: &mut ProgressWatch<'_>, now: Instant) {
+        self.last_probe = now;
+        let Some(snap) = (w.probe)() else { return };
+        if let Some(prev) = &self.snapshot {
+            if prev.head != snap.head {
+                self.last_commit = Some(now);
+            }
+            if *prev != snap {
+                self.last_progress = now;
+            }
+        }
+        self.snapshot = Some(snap);
+    }
+
+    /// Output is progress: the streamed log growing is the cheapest signal
+    /// there is (one `stat`), so it is checked every tick.
+    fn poll_log(&mut self, path: Option<&Path>, now: Instant) {
+        let len = path
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len());
+        if let Some(len) = len {
+            if len != self.log_len {
+                self.log_len = len;
+                self.last_progress = now;
+            }
+        }
+    }
+}
+
+impl RealRunner {
+    /// Real agent supervision (SIRF-7, SIRF-41). Without a `watch` this is the
+    /// plain wall clock: kill at `opts.timeout`. With one:
+    ///
+    /// * **idle** — kill once nothing has happened for `watch.idle`: the log
+    ///   did not grow (checked every tick) and the worktree snapshot did not
+    ///   change (probed every `watch.probe_every`, and once more right before
+    ///   any kill, so a change since the last poll is never missed);
+    /// * **hard** — `opts.timeout` still caps the run, progress or not;
+    /// * **grace** — when either kill is due and `HEAD` moved within
+    ///   `watch.grace`, the kill is deferred ONCE by `watch.grace`: an agent
+    ///   that committed seconds ago is finishing, not stuck (the MSX-80 case:
+    ///   committed at 16:51:46, killed at 16:51:54).
+    fn supervise(
+        &self,
+        program: &str,
+        args: &[&str],
+        opts: &AgentRunOpts,
+        mut watch: Option<&mut ProgressWatch<'_>>,
+        heartbeat: &mut dyn FnMut(),
+    ) -> std::io::Result<AgentOutcome> {
         use std::process::Stdio;
 
         // Combined stdout+stderr → the log file (two dup'd handles share one
@@ -201,53 +374,204 @@ impl Runner for RealRunner {
         if let Some(d) = &self.cwd {
             cmd.current_dir(d);
         }
+        // The baseline snapshot is taken BEFORE the spawn, so even a commit
+        // the agent makes in its first second differs from it.
+        let baseline = watch.as_mut().and_then(|w| (w.probe)());
         let mut child = cmd.spawn()?;
 
-        // Poll on a tick short enough to stay responsive to the timeout, but
-        // never longer than the heartbeat interval.
-        let tick = opts
-            .heartbeat_interval
-            .min(Duration::from_millis(500))
-            .max(Duration::from_millis(10));
+        // Poll on a tick short enough to stay responsive to the timeout (and
+        // the probe cadence), but never longer than the heartbeat interval.
+        let mut tick = opts.heartbeat_interval.min(Duration::from_millis(500));
+        if let Some(w) = watch.as_ref() {
+            tick = tick.min(w.probe_every);
+        }
+        let tick = tick.max(Duration::from_millis(10));
         let start = Instant::now();
         let mut last_beat = Instant::now();
+        let mut seen = Progress {
+            snapshot: baseline,
+            last_progress: start,
+            last_commit: None,
+            last_probe: start,
+            log_len: 0,
+        };
+        // SIRF-41 #4: `Some(until)` once the one-time finish grace is granted.
+        let mut reprieve: Option<Instant> = None;
 
         loop {
-            match child.try_wait()? {
-                Some(status) => {
-                    append_exit_trailer(opts.log_path.as_deref(), status.code());
-                    return Ok(AgentOutcome::Exited(CmdOutput {
-                        code: status.code(),
-                        stdout: String::new(),
-                        stderr: String::new(),
-                    }));
-                }
-                None => {
-                    if start.elapsed() >= opts.timeout {
-                        // Hung or over-budget: kill the whole tree (an
-                        // integration cmd's servers, an agent's subprocesses
-                        // would otherwise outlive it), reap, report a timeout.
-                        kill_descendants(child.id());
-                        let _ = child.kill();
-                        let code = child.wait().ok().and_then(|s| s.code());
-                        append_exit_trailer(opts.log_path.as_deref(), code);
-                        return Ok(AgentOutcome::TimedOut {
-                            output: CmdOutput {
-                                code,
-                                stdout: String::new(),
-                                stderr: String::new(),
-                            },
-                        });
-                    }
-                    if last_beat.elapsed() >= opts.heartbeat_interval {
-                        heartbeat();
-                        last_beat = Instant::now();
-                    }
-                    std::thread::sleep(tick);
+            if let Some(status) = child.try_wait()? {
+                append_exit_trailer(opts.log_path.as_deref(), status.code());
+                return Ok(AgentOutcome::Exited(CmdOutput {
+                    code: status.code(),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }));
+            }
+            let now = Instant::now();
+            if let Some(w) = watch.as_mut() {
+                seen.poll_log(opts.log_path.as_deref(), now);
+                if now.duration_since(seen.last_probe) >= w.probe_every {
+                    seen.observe(w, now);
                 }
             }
+            let hard_due = now.duration_since(start) >= opts.timeout;
+            let idle_due = watch
+                .as_ref()
+                .is_some_and(|w| now.duration_since(seen.last_progress) >= w.idle);
+            let reprieved = reprieve.is_some_and(|until| now < until);
+            if (hard_due || idle_due) && !reprieved {
+                let mut kill = true;
+                if let Some(w) = watch.as_mut() {
+                    // Look once more before killing: a change since the last
+                    // poll is progress, and a fresh commit earns the grace.
+                    seen.observe(w, now);
+                    let still_idle = now.duration_since(seen.last_progress) >= w.idle;
+                    let just_committed = seen
+                        .last_commit
+                        .is_some_and(|c| now.duration_since(c) <= w.grace);
+                    if !hard_due && !still_idle {
+                        kill = false;
+                    } else if reprieve.is_none() && just_committed && !w.grace.is_zero() {
+                        reprieve = Some(now + w.grace);
+                        kill = false;
+                    }
+                }
+                if kill {
+                    let kind = if hard_due {
+                        TimeoutKind::Hard
+                    } else {
+                        TimeoutKind::Idle
+                    };
+                    // Hung or over-budget: kill the whole tree (an
+                    // integration cmd's servers, an agent's subprocesses
+                    // would otherwise outlive it), reap, report a timeout.
+                    kill_descendants(child.id());
+                    let _ = child.kill();
+                    let code = child.wait().ok().and_then(|s| s.code());
+                    append_kill_note(opts.log_path.as_deref(), kind);
+                    append_exit_trailer(opts.log_path.as_deref(), code);
+                    return Ok(AgentOutcome::TimedOut {
+                        output: CmdOutput {
+                            code,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                        },
+                        kind,
+                    });
+                }
+            }
+            if last_beat.elapsed() >= opts.heartbeat_interval {
+                heartbeat();
+                last_beat = Instant::now();
+            }
+            std::thread::sleep(tick);
         }
     }
+}
+
+/// SIRF-41 #3: snapshot the worktree the runner's commands run in — `HEAD`
+/// plus a hash of `git status --porcelain -uall` and the size+mtime of every
+/// path it lists (so re-editing an already-dirty file still counts). Three
+/// cheap git calls; [`RealRunner::supervise`] runs it every ~30s. Ignored
+/// paths (`target/`, `node_modules/`) are invisible to it by design — a build
+/// writing there is not the agent changing the work.
+///
+/// `--no-optional-locks`: a background `git status` must never take
+/// `.git/index.lock` — the agent's own `git add` would then fail with
+/// "index.lock exists". `None` when this is not a git worktree.
+pub fn worktree_probe(runner: &dyn Runner) -> Option<WorktreeProbe> {
+    use std::hash::{Hash, Hasher};
+    let ok = |args: &[&str]| {
+        runner
+            .run("git", args)
+            .ok()
+            .filter(CmdOutput::success)
+            .map(|o| o.stdout)
+    };
+    let root = PathBuf::from(ok(&["rev-parse", "--show-toplevel"])?.trim());
+    let head = ok(&["rev-parse", "-q", "--verify", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let status = ok(&[
+        "--no-optional-locks",
+        "-c",
+        "status.relativePaths=false",
+        "status",
+        "--porcelain",
+        "-z",
+        "-uall",
+    ])?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    status.hash(&mut h);
+    let mut entries = status.split('\0').filter(|t| !t.is_empty());
+    let mut stats = 0usize;
+    while let Some(entry) = entries.next() {
+        let (Some(xy), Some(path)) = (entry.get(..2), entry.get(3..)) else {
+            continue;
+        };
+        if xy.contains(['R', 'C']) {
+            let _ = entries.next(); // a rename's/copy's ORIGINAL path
+        }
+        // Bounded: a pathological status (thousands of untracked files)
+        // still hashes its listing; only the per-file stats stop.
+        if stats >= 5000 {
+            continue;
+        }
+        stats += 1;
+        match std::fs::metadata(root.join(path)) {
+            Ok(m) => {
+                m.len().hash(&mut h);
+                m.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos())
+                    .hash(&mut h);
+            }
+            Err(_) => "missing".hash(&mut h),
+        }
+    }
+    Some(WorktreeProbe {
+        head,
+        tree: h.finish(),
+    })
+}
+
+/// SIRF-52: the env var that bounds how long headless `claude -p` waits for
+/// its background tasks (helper agents) before killing them. Its built-in
+/// default is 600s, which silently killed a worker's helpers mid-ticket.
+/// Sirius exports `0` (= wait indefinitely) to every agent and reviewer:
+/// Sirius owns the real timeout (idle watchdog + hard cap), so a second,
+/// shorter, invisible one only destroys work.
+pub const BG_WAIT_CEILING_ENV: &str = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS";
+
+/// SIRF-52: did the agent's CLI kill its background tasks on the way out?
+/// `claude -p` prints "Background tasks still running after 600s;
+/// terminating. …" and then exits — often with 0, so the run LOOKS like a
+/// success with the main deliverable missing. Judged on the last non-blank
+/// lines only (Sirius's own trailer excluded), so an agent that merely
+/// quotes the message mid-run does not trip it.
+pub fn bg_tasks_killed(log: &str) -> bool {
+    log.lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with("[sirius]"))
+        .take(20)
+        .any(|l| l.contains("Background tasks still running") && l.contains("terminating"))
+}
+
+/// [`bg_tasks_killed`] over the last 64 KB of an agent log file. A missing
+/// or unreadable log is "no" — never a reason to fail a run.
+pub fn bg_tasks_killed_in(path: Option<&Path>) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Some(mut f) = path.and_then(|p| std::fs::File::open(p).ok()) else {
+        return false;
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let _ = f.seek(SeekFrom::Start(len.saturating_sub(64 * 1024)));
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    bg_tasks_killed(&String::from_utf8_lossy(&buf))
 }
 
 /// SIGKILL every descendant of `pid` (children first found, whole tree).
@@ -319,6 +643,20 @@ fn append_exit_trailer(path: Option<&std::path::Path>, code: Option<i32>) {
             code.map(|c| c.to_string())
                 .unwrap_or_else(|| "killed".into())
         );
+    }
+}
+
+/// Say in the log WHY the agent was killed (SIRF-41), so a reader of the log
+/// alone can tell a hang from a long-but-busy run. Best-effort.
+fn append_kill_note(path: Option<&std::path::Path>, kind: TimeoutKind) {
+    let Some(path) = path else { return };
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
+        let why = match kind {
+            TimeoutKind::Idle => "idle timeout: no output and no worktree change",
+            TimeoutKind::Hard => "hard cap reached",
+        };
+        let _ = writeln!(f, "\n[sirius] agent killed ({why})");
     }
 }
 
@@ -676,6 +1014,15 @@ pub struct MockRunner {
     /// real runner streams there) — how a test plays a reviewer that prints
     /// its findings instead of writing `$SIRIUS_REVIEW_OUT`.
     phase_stdout: Mutex<std::collections::HashMap<String, VecDeque<String>>>,
+    /// SIRF-41: (hard cap, idle window, grace) of every `run_agent_watched`
+    /// call, in order — how a test asserts the per-label limits arrived.
+    watches: Mutex<Vec<(Duration, Duration, Duration)>>,
+    /// SIRF-41: how many times the next `run_agent_watched` call invokes the
+    /// caller's progress probe (0 = never, the default: a probe shells out
+    /// to git, which would perturb tests that count recorded calls).
+    probe_calls: Mutex<u32>,
+    /// Everything the probe returned when it was invoked.
+    probes: Mutex<Vec<Option<WorktreeProbe>>>,
 }
 
 #[cfg(test)]
@@ -683,8 +1030,9 @@ pub struct MockRunner {
 struct AgentSim {
     /// How many times to fire the heartbeat callback before returning.
     beats: u32,
-    /// True ⇒ report [`AgentOutcome::TimedOut`]; false ⇒ a normal exit.
-    timeout: bool,
+    /// `Some(kind)` ⇒ report [`AgentOutcome::TimedOut`] with that kind;
+    /// `None` ⇒ a normal exit.
+    timeout: Option<TimeoutKind>,
 }
 
 #[cfg(test)]
@@ -724,9 +1072,36 @@ impl MockRunner {
     pub fn arm_agent_timeout(&self, beats: u32) -> &Self {
         *self.agent_sim.lock().unwrap() = Some(AgentSim {
             beats,
-            timeout: true,
+            timeout: Some(TimeoutKind::Hard),
         });
         self
+    }
+
+    /// SIRF-41: like [`MockRunner::arm_agent_timeout`], but the kill is the
+    /// IDLE watchdog's (no output, no worktree change).
+    pub fn arm_agent_idle_timeout(&self, beats: u32) -> &Self {
+        *self.agent_sim.lock().unwrap() = Some(AgentSim {
+            beats,
+            timeout: Some(TimeoutKind::Idle),
+        });
+        self
+    }
+
+    /// SIRF-41: make the next `run_agent_watched` call invoke the caller's
+    /// progress probe `n` times (results via [`MockRunner::probes`]).
+    pub fn arm_probe_calls(&self, n: u32) -> &Self {
+        *self.probe_calls.lock().unwrap() = n;
+        self
+    }
+
+    /// SIRF-41: (hard cap, idle, grace) of every watched agent run so far.
+    pub fn watches(&self) -> Vec<(Duration, Duration, Duration)> {
+        self.watches.lock().unwrap().clone()
+    }
+
+    /// SIRF-41: every snapshot the progress probe returned.
+    pub fn probes(&self) -> Vec<Option<WorktreeProbe>> {
+        self.probes.lock().unwrap().clone()
     }
 
     /// SIRF-23: when the next `run_agent` call in `phase` happens, write
@@ -770,7 +1145,7 @@ impl MockRunner {
     pub fn arm_agent_heartbeats(&self, beats: u32) -> &Self {
         *self.agent_sim.lock().unwrap() = Some(AgentSim {
             beats,
-            timeout: false,
+            timeout: None,
         });
         self
     }
@@ -834,7 +1209,10 @@ impl Runner for MockRunner {
                 timeouts.remove(i);
                 drop(timeouts);
                 let out = self.run(program, args)?;
-                return Ok(AgentOutcome::TimedOut { output: out });
+                return Ok(AgentOutcome::TimedOut {
+                    output: out,
+                    kind: TimeoutKind::Hard,
+                });
             }
         }
         if let Some(phase) = &phase {
@@ -871,14 +1249,35 @@ impl Runner for MockRunner {
                 for _ in 0..s.beats {
                     heartbeat();
                 }
-                if s.timeout {
-                    Ok(AgentOutcome::TimedOut { output: out })
-                } else {
-                    Ok(AgentOutcome::Exited(out))
+                match s.timeout {
+                    Some(kind) => Ok(AgentOutcome::TimedOut { output: out, kind }),
+                    None => Ok(AgentOutcome::Exited(out)),
                 }
             }
             None => Ok(AgentOutcome::Exited(out)),
         }
+    }
+
+    /// SIRF-41: record the limits, play any armed probe calls, then behave
+    /// exactly like `run_agent` (no clocks, no sleeps).
+    fn run_agent_watched(
+        &self,
+        program: &str,
+        args: &[&str],
+        opts: &AgentRunOpts,
+        watch: &mut ProgressWatch<'_>,
+        heartbeat: &mut dyn FnMut(),
+    ) -> std::io::Result<AgentOutcome> {
+        self.watches
+            .lock()
+            .unwrap()
+            .push((opts.timeout, watch.idle, watch.grace));
+        let n = std::mem::take(&mut *self.probe_calls.lock().unwrap());
+        for _ in 0..n {
+            let snap = (watch.probe)();
+            self.probes.lock().unwrap().push(snap);
+        }
+        self.run_agent(program, args, opts, heartbeat)
     }
 }
 
@@ -1305,6 +1704,424 @@ mod tests {
             "streamed log should hold the output"
         );
         let _ = std::fs::remove_file(&log);
+    }
+
+    // ---- progress-aware supervision (SIRF-41) -------------------------------
+
+    fn opts_for(hard_ms: u64, log: Option<PathBuf>) -> AgentRunOpts {
+        AgentRunOpts {
+            timeout: Duration::from_millis(hard_ms),
+            heartbeat_interval: Duration::from_millis(50),
+            log_path: log,
+            env: vec![],
+        }
+    }
+
+    /// A probe that never sees a change — isolates the log-growth signal.
+    fn still() -> Option<WorktreeProbe> {
+        Some(WorktreeProbe {
+            head: "h".into(),
+            tree: 0,
+        })
+    }
+
+    /// A throwaway git repo with one commit; commits made in it never sign or
+    /// run hooks, whatever the developer's global git config says.
+    #[cfg(unix)]
+    fn temp_repo(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("sirius-watch-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .current_dir(&d)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--no-verify",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+        d
+    }
+
+    /// The commit a stub agent makes, as a shell fragment.
+    #[cfg(unix)]
+    const COMMIT: &str = "git -c user.name=t -c user.email=t@t -c commit.gpgsign=false \
+                          commit -q --no-verify --allow-empty -m done";
+
+    // The ticket's first "done when": an agent that keeps working past the
+    // old wall clock is NOT killed — until the hard cap, which still holds.
+    #[test]
+    #[cfg(unix)]
+    fn a_child_that_keeps_printing_survives_idle_and_dies_only_at_the_hard_cap() {
+        let log = std::env::temp_dir().join(format!("sirius-chatty-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&log);
+        let r = RealRunner::default();
+        let mut probe = still;
+        let mut watch = ProgressWatch {
+            idle: Duration::from_millis(400),
+            probe_every: Duration::from_millis(100),
+            grace: Duration::from_millis(500),
+            probe: &mut probe,
+        };
+        let start = Instant::now();
+        let out = r
+            .run_agent_watched(
+                "sh",
+                &["-c", "while :; do echo tick; sleep 0.05; done"],
+                &opts_for(1500, Some(log.clone())),
+                &mut watch,
+                &mut || {},
+            )
+            .unwrap();
+        let took = start.elapsed();
+        assert_eq!(out.timeout_kind(), Some(TimeoutKind::Hard), "{out:?}");
+        assert!(
+            took >= Duration::from_millis(1450),
+            "killed early: {took:?}"
+        );
+        assert!(took < Duration::from_secs(10), "{took:?}");
+        let written = std::fs::read_to_string(&log).unwrap();
+        assert!(written.contains("hard cap reached"), "{written}");
+        let _ = std::fs::remove_file(&log);
+    }
+
+    // The other half: a silent agent that changes nothing is killed at the
+    // idle window, long before the hard cap.
+    #[test]
+    #[cfg(unix)]
+    fn a_silent_child_is_killed_at_the_idle_window() {
+        let log = std::env::temp_dir().join(format!("sirius-silent-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&log);
+        let r = RealRunner::default();
+        let mut probe = still;
+        let mut watch = ProgressWatch {
+            idle: Duration::from_millis(300),
+            probe_every: Duration::from_millis(100),
+            grace: Duration::from_millis(500),
+            probe: &mut probe,
+        };
+        let start = Instant::now();
+        let out = r
+            .run_agent_watched(
+                "sh",
+                &["-c", "sleep 30"],
+                &opts_for(20_000, Some(log.clone())),
+                &mut watch,
+                &mut || {},
+            )
+            .unwrap();
+        let took = start.elapsed();
+        assert_eq!(out.timeout_kind(), Some(TimeoutKind::Idle), "{out:?}");
+        assert!(took >= Duration::from_millis(300), "{took:?}");
+        assert!(
+            took < Duration::from_secs(5),
+            "not killed at idle: {took:?}"
+        );
+        assert!(std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("idle timeout"));
+        let _ = std::fs::remove_file(&log);
+    }
+
+    // Progress without a word of output: the worktree keeps changing, so the
+    // REAL probe (git status + stat) must keep the idle watchdog off.
+    #[test]
+    #[cfg(unix)]
+    fn a_silent_child_that_keeps_editing_files_is_not_idle() {
+        let repo = temp_repo("edits");
+        let r = RealRunner {
+            cwd: Some(repo.clone()),
+        };
+        let probe_runner = r.clone();
+        let mut probe = || worktree_probe(&probe_runner);
+        let mut watch = ProgressWatch {
+            idle: Duration::from_millis(600),
+            probe_every: Duration::from_millis(100),
+            grace: Duration::from_millis(100),
+            probe: &mut probe,
+        };
+        let start = Instant::now();
+        let out = r
+            .run_agent_watched(
+                "sh",
+                &[
+                    "-c",
+                    "i=0; while :; do i=$((i+1)); echo $i > scratch.txt; sleep 0.1; done",
+                ],
+                &opts_for(2000, None),
+                &mut watch,
+                &mut || {},
+            )
+            .unwrap();
+        let took = start.elapsed();
+        assert_eq!(out.timeout_kind(), Some(TimeoutKind::Hard), "{out:?}");
+        assert!(
+            took >= Duration::from_millis(1950),
+            "killed early: {took:?}"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    // SIRF-41 #4, the MSX-80 shape: the agent commits shortly before the cap
+    // and is finishing up. It gets the grace and exits on its own.
+    #[test]
+    #[cfg(unix)]
+    fn a_child_that_commits_near_the_deadline_gets_the_grace() {
+        let repo = temp_repo("grace");
+        let r = RealRunner {
+            cwd: Some(repo.clone()),
+        };
+        let probe_runner = r.clone();
+        let mut probe = || worktree_probe(&probe_runner);
+        let mut watch = ProgressWatch {
+            idle: Duration::from_secs(20),
+            probe_every: Duration::from_millis(100),
+            grace: Duration::from_millis(2000),
+            probe: &mut probe,
+        };
+        let script = format!("sleep 0.3; {COMMIT}; sleep 1.5; exit 0");
+        let start = Instant::now();
+        let out = r
+            .run_agent_watched(
+                "sh",
+                &["-c", &script],
+                &opts_for(1500, None),
+                &mut watch,
+                &mut || {},
+            )
+            .unwrap();
+        let took = start.elapsed();
+        assert!(out.success(), "the grace was not granted: {out:?}");
+        assert!(took >= Duration::from_millis(1500), "{took:?}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    // The grace is granted ONCE: an agent that commits and then hangs is
+    // still killed — one grace after the cap, as a hard-cap kill.
+    #[test]
+    #[cfg(unix)]
+    fn the_finish_grace_is_granted_only_once() {
+        let repo = temp_repo("grace-once");
+        let r = RealRunner {
+            cwd: Some(repo.clone()),
+        };
+        let probe_runner = r.clone();
+        let mut probe = || worktree_probe(&probe_runner);
+        let mut watch = ProgressWatch {
+            idle: Duration::from_secs(20),
+            probe_every: Duration::from_millis(100),
+            grace: Duration::from_millis(800),
+            probe: &mut probe,
+        };
+        let script = format!("sleep 0.3; {COMMIT}; sleep 30");
+        let start = Instant::now();
+        let out = r
+            .run_agent_watched(
+                "sh",
+                &["-c", &script],
+                &opts_for(1000, None),
+                &mut watch,
+                &mut || {},
+            )
+            .unwrap();
+        let took = start.elapsed();
+        assert_eq!(out.timeout_kind(), Some(TimeoutKind::Hard), "{out:?}");
+        assert!(took >= Duration::from_millis(1750), "no grace: {took:?}");
+        assert!(took < Duration::from_secs(10), "{took:?}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    // A commit long before the deadline is not "finishing": no grace.
+    #[test]
+    #[cfg(unix)]
+    fn an_old_commit_earns_no_grace() {
+        let repo = temp_repo("grace-old");
+        let r = RealRunner {
+            cwd: Some(repo.clone()),
+        };
+        let probe_runner = r.clone();
+        let mut probe = || worktree_probe(&probe_runner);
+        let mut watch = ProgressWatch {
+            idle: Duration::from_secs(20),
+            probe_every: Duration::from_millis(100),
+            grace: Duration::from_millis(1000),
+            probe: &mut probe,
+        };
+        let script = format!("{COMMIT}; sleep 30");
+        let start = Instant::now();
+        let out = r
+            .run_agent_watched(
+                "sh",
+                &["-c", &script],
+                &opts_for(2500, None),
+                &mut watch,
+                &mut || {},
+            )
+            .unwrap();
+        let took = start.elapsed();
+        assert_eq!(out.timeout_kind(), Some(TimeoutKind::Hard), "{out:?}");
+        assert!(
+            took < Duration::from_millis(2500 + 900),
+            "an old commit got the grace: {took:?}"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    // The probe must see an edit to an ALREADY-dirty file (porcelain alone
+    // says ` M a.txt` both times) and a commit (HEAD moves).
+    #[test]
+    #[cfg(unix)]
+    fn worktree_probe_sees_re_edits_and_commits() {
+        let repo = temp_repo("probe");
+        let r = RealRunner {
+            cwd: Some(repo.clone()),
+        };
+        std::fs::write(repo.join("a.txt"), "1\n").unwrap();
+        let p1 = worktree_probe(&r).unwrap();
+        std::fs::write(repo.join("a.txt"), "22\n").unwrap();
+        let p2 = worktree_probe(&r).unwrap();
+        assert_ne!(p1.tree, p2.tree, "a re-edit must register");
+        assert_eq!(p1.head, p2.head);
+        assert_eq!(worktree_probe(&r).unwrap(), p2, "stable when idle");
+        let ok = Command::new("sh")
+            .current_dir(&repo)
+            .args(["-c", COMMIT])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        assert_ne!(worktree_probe(&r).unwrap().head, p2.head);
+        // Not a repo: no snapshot (and never counts as progress).
+        let bare = std::env::temp_dir().join(format!("sirius-norepo-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&bare);
+        let none = RealRunner {
+            cwd: Some(bare.clone()),
+        };
+        assert_eq!(worktree_probe(&none), None);
+        let _ = std::fs::remove_dir_all(&bare);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    // Reviewer/integration/canary runs pass no watch: their wall clock is
+    // reported as a HARD kill.
+    #[test]
+    #[cfg(unix)]
+    fn an_unwatched_timeout_is_a_hard_kill() {
+        let r = RealRunner::default();
+        let out = r
+            .run_agent("sh", &["-c", "sleep 30"], &opts_for(200, None), &mut || {})
+            .unwrap();
+        assert_eq!(out.timeout_kind(), Some(TimeoutKind::Hard));
+    }
+
+    #[test]
+    fn mock_watched_run_records_limits_and_plays_the_probe() {
+        let m = MockRunner::new();
+        m.arm_probe_calls(2).arm_agent_idle_timeout(1);
+        let mut calls = 0;
+        let mut probe = || {
+            calls += 1;
+            still()
+        };
+        let mut watch = ProgressWatch {
+            idle: Duration::from_secs(900),
+            probe_every: Duration::from_secs(30),
+            grace: Duration::from_secs(60),
+            probe: &mut probe,
+        };
+        let out = m
+            .run_agent_watched(
+                "sh",
+                &["-c", "x"],
+                &opts_for(5000, None),
+                &mut watch,
+                &mut || {},
+            )
+            .unwrap();
+        assert_eq!(out.timeout_kind(), Some(TimeoutKind::Idle));
+        assert_eq!(calls, 2);
+        assert_eq!(m.probes().len(), 2);
+        assert_eq!(
+            m.watches(),
+            vec![(
+                Duration::from_millis(5000),
+                Duration::from_secs(900),
+                Duration::from_secs(60)
+            )]
+        );
+        // Unarmed: the probe is never called (no stray git calls in tests).
+        let mut probe = || -> Option<WorktreeProbe> { panic!("probed") };
+        let mut watch = ProgressWatch {
+            idle: Duration::from_secs(1),
+            probe_every: Duration::from_secs(1),
+            grace: Duration::from_secs(1),
+            probe: &mut probe,
+        };
+        let out = m
+            .run_agent_watched(
+                "sh",
+                &["-c", "x"],
+                &opts_for(5000, None),
+                &mut watch,
+                &mut || {},
+            )
+            .unwrap();
+        assert!(out.success());
+    }
+
+    #[test]
+    fn timeout_kinds_describe_themselves() {
+        assert_eq!(TimeoutKind::Idle.as_str(), "idle");
+        assert_eq!(TimeoutKind::Hard.as_str(), "hard");
+        assert_eq!(
+            TimeoutKind::Idle.describe(1800, 10800),
+            "agent idle for 1800s — no output, no file changes"
+        );
+        assert_eq!(
+            TimeoutKind::Hard.describe(1800, 10800),
+            "hit the hard cap of 10800s"
+        );
+    }
+
+    // ---- SIRF-52: helper agents killed by the CLI's background-wait ceiling --
+
+    #[test]
+    fn bg_task_kill_is_detected_at_the_end_of_the_log_only() {
+        let killed = "did the work\nresult: ok\nBackground tasks still running after 600s; terminating. Set CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 to wait indefinitely.\n\n[sirius] agent exit: 0\n";
+        assert!(bg_tasks_killed(killed));
+        // Quoted mid-run, then lots of real work after: not the CLI's exit.
+        let mut quoted = String::from(
+            "reading SIRF-52: Background tasks still running after 600s; terminating.\n",
+        );
+        for i in 0..50 {
+            quoted.push_str(&format!("step {i}\n"));
+        }
+        assert!(!bg_tasks_killed(&quoted));
+        assert!(!bg_tasks_killed("all done\n[sirius] agent exit: 0\n"));
+        // From a file, via its tail; a missing file is simply "no".
+        let p = std::env::temp_dir().join(format!("sirius-bg-{}.log", std::process::id()));
+        std::fs::write(&p, format!("{}{killed}", "x".repeat(100_000))).unwrap();
+        assert!(bg_tasks_killed_in(Some(&p)));
+        let _ = std::fs::remove_file(&p);
+        assert!(!bg_tasks_killed_in(Some(&p)));
+        assert!(!bg_tasks_killed_in(None));
     }
 
     // ---- agent-command preflight (SF-14) -----------------------------------

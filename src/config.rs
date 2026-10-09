@@ -348,15 +348,18 @@ pub struct Config {
     pub claim_mode: ClaimMode,
     #[serde(default)]
     pub gate: GateConfig,
-    /// SIRF-7: hard wall-clock cap on a single agent run, in seconds. On expiry
-    /// the agent process is killed and the iteration fails (release without
-    /// advancing + deadend note). This may safely EXCEED `lease_ttl_secs`: the
-    /// heartbeat renews both leases every `heartbeat_interval_secs`
+    /// SIRF-7, LEGACY since SIRF-41: the old pure wall-clock cap on one agent
+    /// run. Superseded by [`Config::timeouts`]; see [`Config::agent_timeouts`]
+    /// for exactly how it still maps (it is the hard cap when
+    /// `timeouts.hard_secs` is unset — unless it is `1800`, the old default
+    /// `sirius init` wrote into every config, which is ignored). No longer
+    /// written by `sirius init`. Timeouts may safely EXCEED `lease_ttl_secs`:
+    /// the heartbeat renews both leases every `heartbeat_interval_secs`
     /// (= `lease_ttl_secs / 3`) while the agent runs, so the lease never lapses
     /// mid-run however long the cap is. The invariant that actually matters is
     /// `heartbeat_interval_secs < lease_ttl_secs`, not `timeout < lease_ttl`.
-    #[serde(default = "default_agent_timeout_secs")]
-    pub agent_timeout_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_timeout_secs: Option<u64>,
     /// SIRF-7: the amt/hayven lease TTL, in seconds. The heartbeat that renews
     /// both leases fires every `lease_ttl_secs / 3` while the agent runs, so a
     /// lease can never lapse mid-run (amt's lease is 900s by contract).
@@ -373,6 +376,67 @@ pub struct Config {
     /// frontier, and whether a red run stops the fleet.
     #[serde(default)]
     pub integration: IntegrationConfig,
+    /// SIRF-41 #3: progress-aware limits for WORK/FIX agents — an idle
+    /// watchdog, a generous hard cap, and per-label overrides.
+    #[serde(default)]
+    pub timeouts: TimeoutsConfig,
+}
+
+/// SIRF-41: the default idle window — no output and no worktree change for
+/// this long kills a work/fix agent. Equal to the old wall clock on purpose:
+/// no agent is ever killed SOONER than before, and a long silent stretch (a
+/// `claude -p` prints nothing until it finishes; a 20-minute test suite
+/// writes only ignored files) is not mistaken for a hang.
+pub const DEFAULT_IDLE_SECS: u64 = 1800;
+/// SIRF-41: the default hard cap (3h) — the ticket's 2–3h range, top end:
+/// careful UI tickets took 30–60 min, and the idle watchdog (not this cap)
+/// is what catches a hung agent, so the cap can afford to be generous.
+pub const DEFAULT_HARD_SECS: u64 = 10_800;
+/// The value `sirius init` wrote for `agent_timeout_secs` before SIRF-41.
+/// It sits in nearly every existing config, untouched, so it says nothing
+/// about the operator's intent and is ignored (`sirius doctor` says so).
+pub const LEGACY_DEFAULT_AGENT_TIMEOUT_SECS: u64 = 1800;
+/// SIRF-41 #4: a kill due within this long of a commit is deferred once by
+/// this long.
+pub const FINISH_GRACE_SECS: u64 = 60;
+
+/// `.sirius/config.json` → `timeouts` (SIRF-41 #3). `null` = the default.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TimeoutsConfig {
+    /// Kill a work/fix agent after this long with no output and no worktree
+    /// change (no file write, no commit). Default [`DEFAULT_IDLE_SECS`].
+    #[serde(default)]
+    pub idle_secs: Option<u64>,
+    /// Kill it after this long no matter what. Default [`DEFAULT_HARD_SECS`]
+    /// (or a non-default legacy `agent_timeout_secs`).
+    #[serde(default)]
+    pub hard_secs: Option<u64>,
+    /// Per-ticket overrides by Ametrite label; first match wins (the
+    /// `models.routes` rule). A route's unset field keeps the base value.
+    #[serde(default)]
+    pub routes: Vec<TimeoutRoute>,
+}
+
+/// A per-label timeout override (SIRF-41 #3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimeoutRoute {
+    /// Any of these labels (case-insensitive) selects this route.
+    pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_secs: Option<u64>,
+}
+
+/// The limits one work/fix agent runs under, resolved (SIRF-41).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentTimeouts {
+    pub idle_secs: u64,
+    pub hard_secs: u64,
+    /// The knob that set `hard_secs` — doctor names it in its warning.
+    pub hard_from: String,
+    /// The knob that set `idle_secs`.
+    pub idle_from: String,
 }
 
 /// What a red integration run does to the fleet (SIRF-32).
@@ -427,12 +491,6 @@ fn default_retry_budget() -> u32 {
 fn default_worker_concurrency() -> u32 {
     3
 }
-fn default_agent_timeout_secs() -> u64 {
-    // 30 min: generous for a real agent run. It intentionally exceeds the 900s
-    // lease — the heartbeat (not this cap) keeps the lease alive by renewing it
-    // every lease_ttl/3; this cap only bounds a hung/runaway agent. (SIRF-7)
-    1800
-}
 fn default_lease_ttl_secs() -> u64 {
     // amt's claim lease is 900s by contract (see amt.rs claim/heartbeat).
     900
@@ -450,11 +508,12 @@ impl Default for Config {
             worker_concurrency: default_worker_concurrency(),
             claim_mode: ClaimMode::default(),
             gate: GateConfig::default(),
-            agent_timeout_secs: default_agent_timeout_secs(),
+            agent_timeout_secs: None,
             lease_ttl_secs: default_lease_ttl_secs(),
             review: ReviewConfig::default(),
             integration: IntegrationConfig::default(),
             models: crate::models::ModelsConfig::default(),
+            timeouts: TimeoutsConfig::default(),
         }
     }
 }
@@ -464,6 +523,64 @@ impl Config {
     /// runs — `lease_ttl_secs / 3`, floored at 1s so it is never zero.
     pub fn heartbeat_interval_secs(&self) -> u64 {
         (self.lease_ttl_secs / 3).max(1)
+    }
+
+    /// The legacy `agent_timeout_secs`, when it carries a real choice — i.e.
+    /// set, and not the old init-written default (SIRF-41).
+    pub fn legacy_agent_timeout(&self) -> Option<u64> {
+        self.agent_timeout_secs
+            .filter(|&s| s != LEGACY_DEFAULT_AGENT_TIMEOUT_SECS)
+    }
+
+    /// SIRF-41 #3: the limits a work/fix agent for a ticket with `labels`
+    /// runs under. Precedence, per field:
+    ///
+    /// * **hard**: the first matching `timeouts.routes[].hard_secs` >
+    ///   `timeouts.hard_secs` > legacy `agent_timeout_secs` (unless it is the
+    ///   old default 1800) > [`DEFAULT_HARD_SECS`];
+    /// * **idle**: the first matching `timeouts.routes[].idle_secs` >
+    ///   `timeouts.idle_secs` > [`DEFAULT_IDLE_SECS`]. The legacy key never
+    ///   sets idle: it was a wall clock, and an idle window that long would
+    ///   only ever fire alongside it.
+    ///
+    /// "First matching route" is the route `models.routes` would pick: the
+    /// first whose labels intersect the ticket's (case-insensitive) — even
+    /// when it overrides only one of the two fields.
+    pub fn agent_timeouts(&self, labels: &[String]) -> AgentTimeouts {
+        let t = &self.timeouts;
+        let (mut hard_secs, mut hard_from) = match (t.hard_secs, self.legacy_agent_timeout()) {
+            (Some(h), _) => (h, "timeouts.hard_secs".to_string()),
+            (None, Some(l)) => (l, "agent_timeout_secs (legacy)".to_string()),
+            (None, None) => (DEFAULT_HARD_SECS, "default".to_string()),
+        };
+        let (mut idle_secs, mut idle_from) = match t.idle_secs {
+            Some(i) => (i, "timeouts.idle_secs".to_string()),
+            None => (DEFAULT_IDLE_SECS, "default".to_string()),
+        };
+        let route = t.routes.iter().find(|r| {
+            r.labels.iter().any(|want| {
+                labels
+                    .iter()
+                    .any(|have| have.trim().eq_ignore_ascii_case(want.trim()))
+            })
+        });
+        if let Some(r) = route {
+            let name = format!("timeouts.routes[{}]", r.labels.join("|"));
+            if let Some(h) = r.hard_secs {
+                hard_secs = h;
+                hard_from = format!("{name}.hard_secs");
+            }
+            if let Some(i) = r.idle_secs {
+                idle_secs = i;
+                idle_from = format!("{name}.idle_secs");
+            }
+        }
+        AgentTimeouts {
+            idle_secs,
+            hard_secs,
+            hard_from,
+            idle_from,
+        }
     }
 }
 
@@ -494,6 +611,19 @@ impl Config {
                 return Err(format!(
                     "review.sequences key `{}` has no capture group — wrap the key part in ( )",
                     s.key
+                ));
+            }
+        }
+        // SIRF-41: a zero limit would kill every agent on its first tick.
+        let zero = |v: Option<u64>| v == Some(0);
+        if zero(self.timeouts.idle_secs) || zero(self.timeouts.hard_secs) {
+            return Err("timeouts.idle_secs / timeouts.hard_secs must be > 0 (omit or null for the default)".into());
+        }
+        for r in &self.timeouts.routes {
+            if zero(r.idle_secs) || zero(r.hard_secs) {
+                return Err(format!(
+                    "timeouts.routes[{}]: idle_secs / hard_secs must be > 0",
+                    r.labels.join("|")
                 ));
             }
         }
@@ -547,8 +677,12 @@ mod tests {
         // Gate: no test command by default (fail-closed), full-suite fallback.
         assert_eq!(c.gate.test_cmd, None);
         assert_eq!(c.gate.fallback, GateFallback::FullSuite);
-        // SIRF-7: agent timeout well below the lease, heartbeat at lease/3.
-        assert_eq!(c.agent_timeout_secs, 1800);
+        // SIRF-41: no legacy wall clock; the progress-aware defaults apply.
+        assert_eq!(c.agent_timeout_secs, None);
+        assert_eq!(c.timeouts, TimeoutsConfig::default());
+        let t = c.agent_timeouts(&[]);
+        assert_eq!((t.idle_secs, t.hard_secs), (1800, 10_800));
+        // SIRF-7: heartbeat at lease/3.
         assert_eq!(c.lease_ttl_secs, 900);
         assert_eq!(c.heartbeat_interval_secs(), 300);
         // SIRF-23: the review stage is OFF by default (identical to the
@@ -780,6 +914,83 @@ mod tests {
         // …as does a gate object that omits the key entirely.
         let c2: Config = serde_json::from_str(r#"{"gate":{}}"#).unwrap();
         assert_eq!(c2.gate, GateConfig::default());
+    }
+
+    // ---- SIRF-41 timeouts ---------------------------------------------------
+
+    fn timeouts_of(json: &str, labels: &[&str]) -> (u64, u64) {
+        let c: Config = serde_json::from_str(json).unwrap();
+        c.validate().unwrap();
+        let labels: Vec<String> = labels.iter().map(|s| s.to_string()).collect();
+        let t = c.agent_timeouts(&labels);
+        (t.idle_secs, t.hard_secs)
+    }
+
+    #[test]
+    fn legacy_agent_timeout_is_the_hard_cap_unless_it_is_the_old_default() {
+        // Absent everything: the new defaults.
+        assert_eq!(timeouts_of("{}", &[]), (1800, 10_800));
+        // The value every pre-SIRF-41 `sirius init` wrote says nothing about
+        // intent — it is ignored, so existing workspaces get the fix.
+        assert_eq!(
+            timeouts_of(r#"{"agent_timeout_secs":1800}"#, &[]),
+            (1800, 10_800)
+        );
+        // A deliberate legacy value is the hard cap; idle keeps its default.
+        assert_eq!(
+            timeouts_of(r#"{"agent_timeout_secs":7200}"#, &[]),
+            (1800, 7200)
+        );
+        let c: Config = serde_json::from_str(r#"{"agent_timeout_secs":7200}"#).unwrap();
+        assert_eq!(
+            c.agent_timeouts(&[]).hard_from,
+            "agent_timeout_secs (legacy)"
+        );
+        // timeouts.* wins over the legacy key when both are set.
+        assert_eq!(
+            timeouts_of(
+                r#"{"agent_timeout_secs":7200,"timeouts":{"hard_secs":9000,"idle_secs":600}}"#,
+                &[]
+            ),
+            (600, 9000)
+        );
+    }
+
+    #[test]
+    fn timeout_routes_pick_the_first_matching_label_and_override_per_field() {
+        let json = r#"{"timeouts":{"idle_secs":900,"hard_secs":7200,"routes":[
+            {"labels":["UI","frontend"],"hard_secs":14400},
+            {"labels":["ui"],"idle_secs":60,"hard_secs":60},
+            {"labels":["quick"],"idle_secs":300}
+        ]}}"#;
+        // First match wins; an unset route field keeps the base value.
+        assert_eq!(timeouts_of(json, &[" ui "]), (900, 14_400));
+        assert_eq!(timeouts_of(json, &["quick"]), (300, 7200));
+        assert_eq!(timeouts_of(json, &["backend"]), (900, 7200));
+        let c: Config = serde_json::from_str(json).unwrap();
+        let t = c.agent_timeouts(&["frontend".to_string()]);
+        assert_eq!(t.hard_from, "timeouts.routes[UI|frontend].hard_secs");
+        assert_eq!(t.idle_from, "timeouts.idle_secs");
+    }
+
+    #[test]
+    fn zero_timeouts_are_rejected() {
+        for json in [
+            r#"{"timeouts":{"idle_secs":0}}"#,
+            r#"{"timeouts":{"hard_secs":0}}"#,
+            r#"{"timeouts":{"routes":[{"labels":["x"],"hard_secs":0}]}}"#,
+        ] {
+            let c: Config = serde_json::from_str(json).unwrap();
+            assert!(c.validate().is_err(), "{json}");
+        }
+    }
+
+    // `sirius init` writes the knob (nulls = defaults), not the legacy key.
+    #[test]
+    fn init_writes_the_timeouts_section_and_not_the_legacy_key() {
+        let json = serde_json::to_string(&Config::default()).unwrap();
+        assert!(json.contains(r#""timeouts":{"idle_secs":null,"hard_secs":null,"routes":[]}"#));
+        assert!(!json.contains("agent_timeout_secs"), "{json}");
     }
 
     #[test]

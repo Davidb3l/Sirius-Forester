@@ -200,6 +200,10 @@ Heartbeat while you work if the iteration is long: re-claim the same Ametrite
 issue id (renews the 900 s lease) and re-post the same Hayvenhurst claim id (same
 agent + same id = refresh, not collision).
 
+If you started helper agents or background tasks, wait for every one to finish
+before you exit. Work a helper had not finished is lost, and Sirius counts an
+exit with helpers still running as incomplete.
+
 ### 6. Gate — test the finish
 ```bash
 sirius gate AMT-7 --tier safe --target-status in_review
