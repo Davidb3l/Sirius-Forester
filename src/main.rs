@@ -1217,12 +1217,14 @@ fn cmd_run(
             let wt_runner = RealRunner {
                 cwd: Some(wt_path.clone()),
             };
-            let logs = ws.sirius_dir().join("logs");
-            let _ = std::fs::create_dir_all(&logs);
+            let log = run::setup_log_path(&ws.sirius_dir(), name);
+            if let Some(d) = log.parent() {
+                let _ = std::fs::create_dir_all(d);
+            }
             let opts = gate::SetupOpts {
                 timeout: cfg.worktree.setup_timeout(),
                 heartbeat_interval: std::time::Duration::from_secs(60),
-                log_path: Some(logs.join(format!("setup-{name}.log"))),
+                log_path: Some(log),
             };
             match gate::run_setup(&wt_runner, &sh, cmd, &opts, &mut || {}) {
                 Ok(()) => {

@@ -748,6 +748,24 @@ pub fn run_iteration(
     // base — and, unlike `checkout --detach`, it works on an unborn branch
     // and with an unmerged index, so such a leftover cannot wedge the worker.
     if let Some(base) = isolate_base {
+        // A merge/rebase/am the previous agent left half-done must not
+        // survive the reset (its state lives in the worktree's git dir,
+        // which `reset --hard` and `clean` never touch).
+        quit_operations(runner);
+        // An agent that installed its own dependencies left them behind in
+        // node_modules/.venv (ignored — the reset keeps them) while the
+        // reset puts the base's lockfile back: dirty the setup stamp, so the
+        // staleness check below sets up again for this issue (SIRF-50).
+        if fleet.is_some()
+            && config
+                .worktree
+                .setup_cmd
+                .as_deref()
+                .is_some_and(|c| !c.trim().is_empty())
+            && crate::gate::mark_setup_dirty_if_changed(runner)
+        {
+            eprintln!("sirius: {worker} {issue}: the previous agent changed a lockfile in this worktree — its installed dependencies are re-set up");
+        }
         for args in [
             &["update-ref", "--no-deref", "HEAD", base][..],
             &["reset", "--hard", base][..],
@@ -825,11 +843,7 @@ pub fn run_iteration(
             let opts = crate::gate::SetupOpts {
                 timeout: config.worktree.setup_timeout(),
                 heartbeat_interval: Duration::from_secs(config.heartbeat_interval_secs()),
-                log_path: Some(
-                    f.sirius_dir
-                        .join("logs")
-                        .join(format!("setup-{}.log", safe_name(worker))),
-                ),
+                log_path: Some(setup_log_path(&f.sirius_dir, worker)),
             };
             let sh = crate::shell::resolve_shell();
             match crate::gate::run_setup(runner, &sh, cmd, &opts, &mut || {
@@ -1615,7 +1629,7 @@ pub fn run_iteration(
                             timeout: config.worktree.setup_timeout(),
                             heartbeat_interval: Duration::from_secs(config.heartbeat_interval_secs()),
                             log_path: fleet.map(|f| {
-                                f.sirius_dir.join("logs").join(format!("setup-{}.log", safe_name(worker)))
+                                setup_log_path(&f.sirius_dir, worker)
                             }),
                         };
                         match crate::gate::run_setup(runner, &sh, cmd, &opts, &mut || {
@@ -2292,6 +2306,14 @@ fn unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// A worker's setup log: `<.sirius>/logs/setup-<worker, file-safe>.log` —
+/// ONE name for the launch-time run and every iteration's re-run.
+pub fn setup_log_path(sirius_dir: &std::path::Path, worker: &str) -> std::path::PathBuf {
+    sirius_dir
+        .join("logs")
+        .join(format!("setup-{}.log", safe_name(worker)))
+}
+
 fn safe_name(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -2813,12 +2835,48 @@ fn has_unmerged_paths(runner: &dyn Runner) -> bool {
         .unwrap_or(false)
 }
 
-/// Forget a half-done merge/cherry-pick/revert WITHOUT touching the tree or
-/// the index (`--quit`), so the snapshot commit that follows is an ordinary
-/// single-parent commit — never a "merge" of whatever was being merged.
+/// Forget any half-done merge, cherry-pick, revert, rebase or `am` (and the
+/// sequencer) WITHOUT touching HEAD, the tree or the index (`--quit`): a
+/// snapshot commit that follows is an ordinary single-parent commit, and no
+/// leftover state survives into the next issue's iteration — where an
+/// agent's `git rebase --abort` would jump HEAD back to the PREVIOUS issue's
+/// pre-rebase commit and orphan the new work (SIRF-59). One `rev-parse`
+/// finds what is in progress; only that is quit.
 fn quit_operations(runner: &dyn Runner) {
-    for op in ["merge", "cherry-pick", "revert"] {
-        let _ = crate::gitrange::run_git(runner, &[op, "--quit"]);
+    const STATE: [(&str, &[&str]); 6] = [
+        ("MERGE_HEAD", &["merge"]),
+        ("CHERRY_PICK_HEAD", &["cherry-pick"]),
+        ("REVERT_HEAD", &["revert"]),
+        ("sequencer", &["cherry-pick", "revert"]),
+        ("rebase-merge", &["rebase"]),
+        ("rebase-apply", &["rebase", "am"]),
+    ];
+    let mut args = vec!["rev-parse", "--path-format=absolute"];
+    for (name, _) in STATE {
+        args.extend(["--git-path", name]);
+    }
+    let found: Vec<bool> = match crate::gitrange::run_git(runner, &args) {
+        Ok(o) => {
+            let paths: Vec<&str> = o.stdout.lines().collect();
+            (0..STATE.len())
+                .map(|i| {
+                    paths
+                        .get(i)
+                        .is_some_and(|p| std::path::Path::new(p.trim()).exists())
+                })
+                .collect()
+        }
+        // Cannot tell: quit everything (each is a no-op when idle).
+        Err(_) => vec![true; STATE.len()],
+    };
+    let mut done: Vec<&str> = Vec::new();
+    for ((_, ops), hit) in STATE.iter().zip(found) {
+        for op in ops.iter().filter(|_| hit) {
+            if !done.contains(op) {
+                done.push(op);
+                let _ = crate::gitrange::run_git(runner, &[op, "--quit"]);
+            }
+        }
     }
 }
 
@@ -2875,6 +2933,17 @@ pub fn preserve_stale_worktree(
             wt_path.display()
         ));
     }
+    // Its OWN git dir must not be the common one: that is the main
+    // checkout (never detached or committed from here).
+    let own = crate::gitrange::run_git(wt, &["rev-parse", "--absolute-git-dir"])
+        .ok()
+        .and_then(|o| std::fs::canonicalize(o.stdout.trim()).ok());
+    if own.is_none() || own == common {
+        return Err(format!(
+            "{} is the main checkout, not a linked worktree",
+            wt_path.display()
+        ));
+    }
     let dirty = worktree_dirty(wt)?;
     let head = crate::gitrange::head_rev(wt).ok();
     let lost = match &head {
@@ -2925,9 +2994,8 @@ pub fn preserve_stale_worktree(
         crate::gitrange::run_git(wt, &["update-ref", "--no-deref", "HEAD", &head])?;
     }
     let conflicted = dirty && has_unmerged_paths(wt);
-    if conflicted {
-        quit_operations(wt);
-    }
+    // Whatever was in progress (a rebase too) is quit before the snapshot.
+    quit_operations(wt);
     let partial = if dirty {
         commit_all(wt, &msg).err()
     } else {
@@ -2987,6 +3055,9 @@ fn set_aside(
         return Some(aside);
     }
     std::fs::rename(wt_path, &aside).ok()?;
+    eprintln!(
+        "sirius: {worker}: `git worktree move` refused {from} (a submodule, or a locked file) — renamed and re-registered with `git worktree repair` instead; a submodule inside it may keep a RELATIVE core.worktree that no longer resolves; check it before relying on the moved tree"
+    );
     if ours && crate::gitrange::run_git(repo, &["worktree", "repair", &to]).is_err() && head_safe {
         // Repair failed: the admin entry points at a missing path and would
         // block a fresh worktree here. Its HEAD is on a ref, so dropping
@@ -3009,7 +3080,19 @@ pub fn clear_stale_worktree(
     worker: &str,
     ledger: Option<&Ledger>,
 ) {
-    if !wt_path.exists() {
+    let Ok(meta) = std::fs::symlink_metadata(wt_path) else {
+        return; // nothing there
+    };
+    if meta.file_type().is_symlink() {
+        // Never a worktree sirius made: never follow it (it could be the
+        // main checkout). Only the link itself is removed.
+        eprintln!(
+            "sirius: {worker}: WARNING {} is a symlink, not a worktree — removing the link only (its target is untouched)",
+            wt_path.display()
+        );
+        if std::fs::remove_file(wt_path).is_err() {
+            let _ = std::fs::remove_dir(wt_path); // a Windows directory link
+        }
         return;
     }
     let empty = std::fs::read_dir(wt_path).is_ok_and(|mut d| d.next().is_none());
@@ -5047,9 +5130,12 @@ mod tests {
             !calls.iter().any(|c| c.starts_with("git checkout -B")),
             "{calls:?}"
         );
-        // The baseline is the fleet base — no rev-parse before the agent ran.
+        // The baseline is the fleet base — no rev-parse of HEAD before the
+        // agent ran (the in-progress-state probe resolves git paths only).
         assert!(
-            !calls.iter().any(|c| c.starts_with("git rev-parse")),
+            !calls
+                .iter()
+                .any(|c| c.starts_with("git rev-parse") && !c.contains("--git-path")),
             "{calls:?}"
         );
         assert!(
@@ -9583,5 +9669,151 @@ mod tests {
             &w.repo,
             &["worktree", "unlock", &crate::gitrange::git_path(&aside)],
         );
+    }
+
+    /// Item 2 (SIRF-59): an agent killed mid-REBASE must not leave the
+    /// rebase state to the next issue — whose `git rebase --abort` would
+    /// jump HEAD back to the previous issue's pre-rebase commit.
+    #[test]
+    fn a_rebase_left_by_a_killed_agent_does_not_survive_the_reset() {
+        let w = GitWorld::new("rebase");
+        let base = w.base.clone();
+        w.agent(move |wt| {
+            let r = crate::shell::RealRunner {
+                cwd: Some(wt.to_path_buf()),
+            };
+            // A rebase stopped by a failing --exec: no conflicts, a clean
+            // tree — nothing about it looks unfinished to a snapshot.
+            let c = commit_file(wt, "c.txt");
+            git_at(wt, &["checkout", "-q", "--detach", &base]);
+            commit_file(wt, "a.txt");
+            assert!(crate::gitrange::run_git(&r, &["rebase", "--exec", "false", &c]).is_err());
+        });
+        w.mock.arm_agent_timeout(0);
+        w.iterate("AMT-60", &cfg());
+        let main = git_at(&w.repo, &["rev-parse", "main"]);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let s = seen.clone();
+        w.agent(move |wt| {
+            let r = crate::shell::RealRunner {
+                cwd: Some(wt.to_path_buf()),
+            };
+            let _ = crate::gitrange::run_git(&r, &["rebase", "--abort"]);
+            *s.lock().unwrap() = git_at(wt, &["rev-parse", "HEAD"]);
+            commit_file(wt, "good.txt");
+        });
+        w.mock
+            .expect(&["sh", "-c", "run-suite"], 0, "test result: ok");
+        let (o, _evs) = w.iterate("AMT-61", &cfg());
+        assert_eq!(o, IterationOutcome::Completed);
+        assert_eq!(*seen.lock().unwrap(), main, "HEAD stayed on the fresh base");
+        let stamped = w.ref_at("refs/heads/sirius/amt-61").unwrap();
+        assert_eq!(
+            git_at(&w.repo, &["rev-parse", &format!("{stamped}~1")]),
+            main
+        );
+    }
+
+    /// Item 3, end to end: an agent that changed the lockfile (its own
+    /// install) and did not land leaves the NEXT issue to set up again.
+    #[test]
+    fn an_agents_own_install_is_set_up_again_for_the_next_issue() {
+        let w = GitWorld::new("ownnstall");
+        let main = commit_file(&w.repo, "bun.lock");
+        git_at(&w.wt, &["checkout", "-q", "--detach", &main]);
+        crate::gate::write_setup_stamp(&w.git); // what launch did
+        let mut c = cfg();
+        c.worktree.setup_cmd = Some("do-setup".into());
+        let setups = |w: &GitWorld| {
+            w.calls()
+                .iter()
+                .filter(|l| l.starts_with("AGENT") && l.contains("do-setup"))
+                .count()
+        };
+        w.agent(|wt| std::fs::write(wt.join("bun.lock"), "zod@3").unwrap());
+        w.mock
+            .push(MockResponse::new(&["sh", "-c", "true"], 1, "", "no"));
+        w.iterate("AMT-62", &c);
+        assert_eq!(setups(&w), 0, "nothing stale yet");
+        w.agent(|_| {}); // the setup run
+        w.agent(|wt| {
+            assert_eq!(
+                std::fs::read_to_string(wt.join("bun.lock")).unwrap(),
+                "bun.lock"
+            );
+        });
+        w.mock
+            .push(MockResponse::new(&["sh", "-c", "true"], 1, "", "no"));
+        w.iterate("AMT-63", &c);
+        assert_eq!(setups(&w), 1, "{:?}", w.calls());
+    }
+
+    /// Item 5: a symlink at a worker's worktree slot (here: to the main
+    /// checkout) is never preserved, detached or committed through — only
+    /// the link is removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_stale_slot_never_touches_its_target() {
+        let w = GitWorld::new("staleslink");
+        let repo = crate::shell::RealRunner {
+            cwd: Some(w.repo.clone()),
+        };
+        std::fs::write(w.repo.join("untracked.txt"), "u").unwrap();
+        let main_head = git_at(&w.repo, &["rev-parse", "HEAD"]);
+        let slot = w.dir.join("slot");
+        std::os::unix::fs::symlink(&w.repo, &slot).unwrap();
+        clear_stale_worktree(&repo, &slot, "sirius/oak", None);
+        assert!(
+            std::fs::symlink_metadata(&slot).is_err(),
+            "the link is gone"
+        );
+        assert_eq!(
+            git_at(&w.repo, &["symbolic-ref", "HEAD"]),
+            "refs/heads/main"
+        );
+        assert_eq!(git_at(&w.repo, &["rev-parse", "HEAD"]), main_head);
+        assert!(w.repo.join("untracked.txt").exists());
+        assert!(git_at(&w.repo, &["status", "--porcelain"]).contains("untracked.txt"));
+    }
+
+    /// Item 5: a directory whose `.git` points at the MAIN git dir (its own
+    /// git dir is the common dir) is the main checkout in disguise: never
+    /// detached or committed from.
+    #[test]
+    fn a_stale_slot_whose_git_dir_is_the_main_one_is_refused() {
+        let w = GitWorld::new("stalemain");
+        let repo = crate::shell::RealRunner {
+            cwd: Some(w.repo.clone()),
+        };
+        let slot = w.dir.join("slot");
+        std::fs::create_dir_all(&slot).unwrap();
+        let gitdir = std::fs::canonicalize(w.repo.join(".git")).unwrap();
+        std::fs::write(
+            slot.join(".git"),
+            format!("gitdir: {}\n", crate::gitrange::git_path(&gitdir)),
+        )
+        .unwrap();
+        std::fs::write(slot.join("x.txt"), "x").unwrap();
+        let main_head = git_at(&w.repo, &["rev-parse", "HEAD"]);
+        let r = crate::shell::RealRunner {
+            cwd: Some(slot.clone()),
+        };
+        let got = preserve_stale_worktree(&repo, &r, &slot, "sirius/oak", None);
+        assert!(
+            got.as_ref().is_err_and(|e| e.contains("main checkout")),
+            "{got:?}"
+        );
+        assert_eq!(
+            git_at(&w.repo, &["symbolic-ref", "HEAD"]),
+            "refs/heads/main"
+        );
+        assert_eq!(git_at(&w.repo, &["rev-parse", "HEAD"]), main_head);
+    }
+
+    /// Item 7: one setup log name for launch and iterations, file-safe.
+    #[test]
+    fn the_setup_log_is_one_flat_file_per_worker() {
+        let p = setup_log_path(std::path::Path::new("/s"), "sirius/oak");
+        assert_eq!(p, std::path::Path::new("/s/logs/setup-sirius_oak.log"));
     }
 }

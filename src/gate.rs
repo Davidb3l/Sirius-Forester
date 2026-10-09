@@ -688,7 +688,10 @@ pub fn run_setup(
         let from_log = opts
             .log_path
             .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
+            // Lossy: one non-UTF-8 byte in an installer's output must not
+            // drop the whole tail.
+            .and_then(|p| std::fs::read(p).ok())
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
             .unwrap_or_default();
         let (o, e) = if out.stdout.is_empty() && out.stderr.is_empty() {
             (from_log.as_str(), "")
@@ -746,14 +749,35 @@ pub const SETUP_LOCKFILES: [&str; 6] = [
     "uv.lock",
 ];
 
-/// The blob ids of the lockfiles at `HEAD` — what a setup run installs from.
-/// Empty when none is tracked (or this is not a git worktree).
+/// The lockfiles in the WORKING TREE (`<name> <blob id>` per lockfile
+/// present) — what a setup run installs from, whether committed or not (an
+/// env-fault re-run installs from the agent's tree). Empty when none exists
+/// (or this is not a git worktree).
 pub fn setup_fingerprint(runner: &dyn Runner) -> String {
-    let mut args = vec!["ls-tree", "HEAD", "--"];
-    args.extend(SETUP_LOCKFILES);
-    crate::gitrange::run_git(runner, &args)
-        .map(|o| o.stdout.trim().to_string())
-        .unwrap_or_default()
+    let top = match crate::gitrange::run_git(runner, &["rev-parse", "--show-toplevel"]) {
+        Ok(o) if !o.stdout.trim().is_empty() => std::path::PathBuf::from(o.stdout.trim()),
+        _ => return String::new(),
+    };
+    let present: Vec<&str> = SETUP_LOCKFILES
+        .iter()
+        .copied()
+        .filter(|f| top.join(f).is_file())
+        .collect();
+    if present.is_empty() {
+        return String::new();
+    }
+    let mut args = vec!["hash-object", "--"];
+    args.extend(&present);
+    match crate::gitrange::run_git(runner, &args) {
+        Ok(o) => present
+            .iter()
+            .zip(o.stdout.lines())
+            .map(|(f, h)| format!("{f} {}", h.trim()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        // Unreadable: a value no stamp ever equals — stale, set up again.
+        Err(_) => "unreadable".into(),
+    }
 }
 
 /// Where a worktree records the fingerprint its dependencies were installed
@@ -767,17 +791,40 @@ pub fn setup_stamp_path(runner: &dyn Runner) -> Option<std::path::PathBuf> {
         .map(|d| std::path::PathBuf::from(d).join("sirius-setup-stamp"))
 }
 
-/// Record that setup just ran against the current lockfiles.
+/// Record that setup just ran against the working tree's lockfiles.
 pub fn write_setup_stamp(runner: &dyn Runner) {
     if let Some(p) = setup_stamp_path(runner) {
         let _ = std::fs::write(p, setup_fingerprint(runner));
     }
 }
 
-/// True when the lockfiles at HEAD differ from those setup last ran on — a
-/// fresh base (SIRF-42) that bumped a dependency. `false` when no stamp can be
-/// read or written (nothing to compare against: the env-fault re-gate still
-/// covers a missing module).
+/// What a dirtied stamp holds: equal to no fingerprint, so the next
+/// [`setup_is_stale`] check is stale.
+const STAMP_DIRTY: &str = "dirty: the lockfiles changed in the worktree after setup";
+
+/// Called BEFORE an iteration's reset: when the working tree's lockfiles no
+/// longer match the stamp — an agent ran `bun add` / `npm install`, so the
+/// installed dependencies follow ITS lockfile — the stamp is dirtied. The
+/// reset puts the base's lockfile back but not the dependencies, so the
+/// next issue must set up again. `true` when it dirtied the stamp.
+pub fn mark_setup_dirty_if_changed(runner: &dyn Runner) -> bool {
+    let Some(p) = setup_stamp_path(runner) else {
+        return false;
+    };
+    match std::fs::read_to_string(&p) {
+        Ok(stamped) if stamped.trim() != setup_fingerprint(runner) => {
+            std::fs::write(&p, STAMP_DIRTY).is_ok()
+        }
+        _ => false,
+    }
+}
+
+/// True when the working tree's lockfiles (after an iteration's reset: the
+/// base's) differ from those setup last ran on — a fresh base (SIRF-42)
+/// that bumped a dependency, or an earlier agent that installed its own
+/// ([`mark_setup_dirty_if_changed`]). `false` when no stamp can be read
+/// (nothing to compare against: the env-fault re-gate still covers a
+/// missing module).
 pub fn setup_is_stale(runner: &dyn Runner) -> bool {
     let Some(p) = setup_stamp_path(runner) else {
         return false;
@@ -1687,6 +1734,69 @@ mod tests {
         git(&["commit", "-q", "-m", "bump"]);
         assert!(setup_is_stale(&r), "a lockfile bump is stale");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Item 3: an agent that installed its own dependency (lockfile changed
+    /// in the tree, work not landed) leaves the next issue stale after the
+    /// reset puts the base's lockfile back.
+    #[test]
+    fn an_agents_own_install_makes_the_next_iteration_stale() {
+        let dir = std::env::temp_dir().join(format!("sirius-stamp2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = crate::shell::RealRunner {
+            cwd: Some(dir.clone()),
+        };
+        let git = |args: &[&str]| {
+            let mut full = vec!["-c", "user.name=t", "-c", "user.email=t@t"];
+            full.extend(args);
+            crate::gitrange::run_git(&r, &full).unwrap();
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("bun.lock"), "react@18").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "a"]);
+        write_setup_stamp(&r);
+        assert!(
+            !mark_setup_dirty_if_changed(&r),
+            "unchanged: nothing to mark"
+        );
+        // The agent's `bun add` (uncommitted), then the next iteration's reset.
+        std::fs::write(dir.join("bun.lock"), "react@18 zod@3").unwrap();
+        assert!(mark_setup_dirty_if_changed(&r));
+        git(&["reset", "-q", "--hard", "HEAD"]);
+        assert!(setup_is_stale(&r), "set up again for the next issue");
+        // The env-fault re-run installs from the working tree: stamp that.
+        std::fs::write(dir.join("bun.lock"), "react@18 zod@3").unwrap();
+        write_setup_stamp(&r);
+        assert!(!setup_is_stale(&r));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Item 4: a non-UTF-8 byte in a failing setup's log keeps its tail.
+    #[cfg(unix)]
+    #[test]
+    fn a_setup_tail_survives_a_non_utf8_byte() {
+        let log =
+            std::env::temp_dir().join(format!("sirius-setup-tail-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&log);
+        let opts = SetupOpts {
+            timeout: std::time::Duration::from_secs(30),
+            heartbeat_interval: std::time::Duration::from_secs(60),
+            log_path: Some(log.clone()),
+        };
+        let sh = crate::shell::resolve_shell();
+        let err = run_setup(
+            &crate::shell::RealRunner::default(),
+            &sh,
+            "X=found; printf 'bad \\377 byte\\nerror: real-%s\\n' \"$X\"; exit 3",
+            &opts,
+            &mut || {},
+        )
+        .unwrap_err();
+        let _ = std::fs::remove_file(&log);
+        // Only the OUTPUT says `real-found` (the command line does not).
+        assert!(err.contains("real-found"), "{err}");
     }
 
     /// A stalled install is killed at the setup wall clock, not waited on.
