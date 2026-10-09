@@ -262,13 +262,18 @@ fn fleet_line_files(runner: &dyn Runner, f: FleetBase<'_>) -> Result<Vec<String>
     // What this iteration resumed is this issue's work by definition, held
     // by whatever ref: never foreign.
     let mut own_tips = own_refs.clone();
-    own_tips.extend(
-        f.resumed_from
-            .map(str::trim)
-            .filter(|r| !r.is_empty())
-            .map(String::from),
-    );
-    let foreign = foreign_commits(runner, f.base, &own_tips, &other_refs, &landed)?;
+    if let Some(r) = f.resumed_from.map(str::trim).filter(|r| !r.is_empty()) {
+        // Only a real commit: a bad value must not fail the whole link.
+        let spec = format!("{r}^{{commit}}");
+        if run_git(runner, &["rev-parse", "--verify", "--quiet", &spec]).is_ok() {
+            own_tips.push(r.to_string());
+        }
+    }
+    let foreign = if other_refs.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        foreign_commits(runner, f.base, &own_tips, &landed)?
+    };
     let mut files: Vec<String> = Vec::new();
     let mut tip = "HEAD".to_string();
     let mut expect_parent = f.resumed_from.map(str::trim).filter(|r| !r.is_empty());
@@ -279,14 +284,16 @@ fn fleet_line_files(runner: &dyn Runner, f: FleetBase<'_>) -> Result<Vec<String>
             "--first-parent",
             "--no-merges",
             "--name-only",
-            "--format=@%H",
+            // NUL opens each commit's record: a path can never contain it
+            // (`@types/x.d.ts` would pass for an `@<sha>` header).
+            "--format=%x00%H",
             &range,
         ];
         log_args.extend(landed.iter().map(String::as_str));
-        // `@<sha>` opens each commit's file list; a foreign commit's is skipped.
+        // A foreign commit's file list is skipped.
         let mut skipping = false;
         for x in stdout_lines(&run_git(runner, &log_args)?) {
-            if let Some(sha) = x.strip_prefix('@') {
+            if let Some(sha) = x.strip_prefix('\0') {
                 skipping = foreign.contains(sha);
             } else if !skipping && !files.contains(&x) {
                 files.push(x);
@@ -362,21 +369,27 @@ fn issue_refs(
 /// takes those commits into its own first-parent line with no merge commit
 /// to recognise — they are the sibling's work, not this issue's. Commits this
 /// issue's refs also hold (a sibling that merged our earlier hold) stay ours.
+///
+/// The other issues' refs are named by GLOB, never listed: completed
+/// `sirius/<issue>` branches are kept forever, and one argument per ref would
+/// outgrow Windows' 32 KiB command line after ~1,200 issues. This issue's own
+/// refs match the globs too — harmless, they are subtracted by `--not`. Both
+/// glob depths are given because whether `*` crosses `/` varies by git version.
 fn foreign_commits(
     runner: &dyn Runner,
     base: &str,
-    own: &[String],
-    others: &[String],
+    own_tips: &[String],
     landed: &[String],
 ) -> Result<std::collections::HashSet<String>, String> {
-    if others.is_empty() {
-        return Ok(Default::default());
-    }
-    let mut args: Vec<&str> = vec!["rev-list"];
-    args.extend(others.iter().map(String::as_str));
-    args.push("--not");
-    args.push(base);
-    args.extend(own.iter().map(String::as_str));
+    let mut args: Vec<&str> = vec![
+        "rev-list",
+        "--glob=refs/heads/sirius/*",
+        "--glob=refs/sirius/*/*",
+        "--glob=refs/sirius/*/*/*",
+        "--not",
+        base,
+    ];
+    args.extend(own_tips.iter().map(String::as_str));
     // `landed` is `["--not", <base-branch tip>]` (or empty): already negated.
     args.extend(landed.iter().skip(1).map(String::as_str));
     Ok(stdout_lines(&run_git(runner, &args)?).into_iter().collect())
@@ -663,10 +676,8 @@ mod tests {
         assert_eq!(got.files, vec!["src/a.rs", "src/b.rs", "src/c.rs"]);
         let calls = m.recorded();
         assert!(
-            calls
-                .iter()
-                .any(|c| c
-                    == "git log --first-parent --no-merges --name-only --format=@%H base1..HEAD"),
+            calls.iter().any(|c| c
+                == "git log --first-parent --no-merges --name-only --format=%x00%H base1..HEAD"),
             "{calls:?}"
         );
         assert!(!calls.iter().any(|c| c.contains("HEAD~1")), "{calls:?}");
@@ -1112,6 +1123,25 @@ mod tests {
         r.git(&["merge", "-q", "--no-edit", "sirius/amt-2"]);
         r.file("mine.txt");
         assert_eq!(r.line(&base, Some(&h0)), vec!["h0.txt", "mine.txt"]);
+        r.drop();
+    }
+
+    /// Paths that begin with `@` (`@types/`, `@scope/` — common in TS repos)
+    /// are paths, never commit headers: ours are kept, a sibling's skipped.
+    #[test]
+    fn fleet_line_handles_paths_starting_with_at() {
+        let r = Repo::new("atpaths");
+        let base = r.file("base.txt");
+        r.git(&["switch", "-q", "--detach", &base]);
+        std::fs::create_dir_all(r.0.cwd.as_ref().unwrap().join("@types")).unwrap();
+        r.file("@types/sib.d.ts");
+        let sib = r.file("zsib.rs");
+        r.git(&["branch", "sirius/amt-2", &sib]);
+        r.git(&["switch", "-q", "--detach", &base]);
+        r.git(&["merge", "-q", "--no-edit", "sirius/amt-2"]); // fast-forward
+        std::fs::create_dir_all(r.0.cwd.as_ref().unwrap().join("@scope")).unwrap();
+        r.file("@scope/mine.ts");
+        assert_eq!(r.line(&base, None), vec!["@scope/mine.ts"]);
         r.drop();
     }
 
