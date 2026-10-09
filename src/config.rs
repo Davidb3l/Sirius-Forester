@@ -324,6 +324,51 @@ pub fn test_cmd_suggestion(root: &Path) -> String {
     }
 }
 
+/// A `worktree.setup_cmd` suggestion and the lockfile it was inferred from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedSetupCmd {
+    pub cmd: String,
+    pub from: String,
+}
+
+/// SIRF-50: infer how to install a worktree's dependencies from the lockfile
+/// at `root` (root only, like [`detect_test_cmd`]; first match wins).
+///
+/// Every command is the LOCKFILE-RESPECTING form (`--frozen-lockfile`, `npm
+/// ci`, `uv sync --frozen`): setup must reproduce the base commit's tree, never
+/// re-resolve and silently rewrite a tracked lockfile — that would show up as
+/// a change the agent never made.
+///
+/// Deliberately NOT detected:
+/// - `Cargo.lock` / `go.sum`: cargo and go fetch dependencies themselves on
+///   the first build/test, so a worktree is never "missing" them; a `cargo
+///   fetch` would only add a network round-trip to every launch.
+/// - `poetry.lock`: poetry's virtualenv location is per-user config (often a
+///   cache dir keyed by project path), not the worktree, so an install could
+///   land somewhere the gate never looks — or in a shared env.
+/// - `requirements*.txt`: `pip install -r` installs into whatever interpreter
+///   is active — a side effect on the operator's machine, not the worktree.
+///
+/// `uv.lock` IS detected: `uv sync` builds a worktree-local `.venv` (which
+/// carries its own `.gitignore`, so it never reads as agent changes).
+pub fn detect_setup_cmd(root: &Path) -> Option<DetectedSetupCmd> {
+    const LOCKFILES: &[(&str, &str)] = &[
+        ("bun.lock", "bun install --frozen-lockfile"),
+        ("bun.lockb", "bun install --frozen-lockfile"),
+        ("pnpm-lock.yaml", "pnpm install --frozen-lockfile"),
+        ("yarn.lock", "yarn install --frozen-lockfile"),
+        ("package-lock.json", "npm ci"),
+        ("uv.lock", "uv sync --frozen"),
+    ];
+    LOCKFILES
+        .iter()
+        .find(|(file, _)| root.join(file).is_file())
+        .map(|(file, cmd)| DetectedSetupCmd {
+            cmd: (*cmd).to_string(),
+            from: (*file).to_string(),
+        })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     #[serde(default = "default_true")]
@@ -373,6 +418,44 @@ pub struct Config {
     /// frontier, and whether a red run stops the fleet.
     #[serde(default)]
     pub integration: IntegrationConfig,
+    /// SIRF-50: how a fresh fleet worktree gets its dependencies.
+    #[serde(default)]
+    pub worktree: WorktreeConfig,
+}
+
+/// SIRF-50: per-worktree preparation. A fresh `git worktree add` has the
+/// tracked files and nothing else — no `node_modules`, no `.venv` — so a gate
+/// over it failed on the ENVIRONMENT (`Cannot find module 'react'`) and burned
+/// a work attempt on a fault no agent caused.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorktreeConfig {
+    /// Run through the resolved shell (as `gate.test_cmd` is), cwd = the
+    /// worker's worktree, ONCE after `sirius run` creates it and before any
+    /// agent runs. Unset/null ⇒ auto-detected from the root lockfile at run
+    /// time (see [`detect_setup_cmd`]); `""` disables setup entirely.
+    #[serde(default)]
+    pub setup_cmd: Option<String>,
+}
+
+/// Where the effective worktree setup command came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetupSource {
+    /// `worktree.setup_cmd` in `.sirius/config.json`.
+    Config,
+    /// Detected at run time from this file (the key was unset).
+    Detected(String),
+}
+
+impl WorktreeConfig {
+    /// The setup command to run, and where it came from. `None` when setup is
+    /// disabled (`""`) or the key is unset and nothing is detectable at `root`.
+    pub fn resolve(&self, root: &Path) -> Option<(String, SetupSource)> {
+        match &self.setup_cmd {
+            Some(c) if c.trim().is_empty() => None,
+            Some(c) => Some((c.clone(), SetupSource::Config)),
+            None => detect_setup_cmd(root).map(|d| (d.cmd, SetupSource::Detected(d.from))),
+        }
+    }
 }
 
 /// What a red integration run does to the fleet (SIRF-32).
@@ -455,6 +538,7 @@ impl Default for Config {
             review: ReviewConfig::default(),
             integration: IntegrationConfig::default(),
             models: crate::models::ModelsConfig::default(),
+            worktree: WorktreeConfig::default(),
         }
     }
 }
@@ -515,6 +599,10 @@ impl Config {
     pub fn default_json_for_root(root: &Path) -> String {
         let mut c = Config::default();
         c.gate.test_cmd = detect_test_cmd(root).map(|d| d.cmd);
+        // SIRF-50: same idea for worktree setup — written out so the operator
+        // SEES what every fleet worktree will run (null when undetectable,
+        // which then means "detect at run time" and finds nothing either).
+        c.worktree.setup_cmd = detect_setup_cmd(root).map(|d| d.cmd);
         serde_json::to_string_pretty(&c).unwrap()
     }
 
@@ -780,6 +868,100 @@ mod tests {
         // …as does a gate object that omits the key entirely.
         let c2: Config = serde_json::from_str(r#"{"gate":{}}"#).unwrap();
         assert_eq!(c2.gate, GateConfig::default());
+    }
+
+    // ---- SIRF-50 worktree setup detection ----------------------------------
+
+    #[test]
+    fn detects_setup_from_each_lockfile() {
+        for (lock, cmd) in [
+            ("bun.lock", "bun install --frozen-lockfile"),
+            ("bun.lockb", "bun install --frozen-lockfile"),
+            ("pnpm-lock.yaml", "pnpm install --frozen-lockfile"),
+            ("yarn.lock", "yarn install --frozen-lockfile"),
+            ("package-lock.json", "npm ci"),
+            ("uv.lock", "uv sync --frozen"),
+        ] {
+            let d = fixture("setup");
+            touch(&d, lock, "");
+            let got = detect_setup_cmd(&d).unwrap_or_else(|| panic!("{lock} not detected"));
+            assert_eq!((got.cmd.as_str(), got.from.as_str()), (cmd, lock));
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    // Ecosystems whose build tool fetches on its own, or whose install would
+    // land outside the worktree, get no auto-detected setup.
+    #[test]
+    fn no_setup_detected_for_self_fetching_or_global_installs() {
+        for lock in ["Cargo.lock", "go.sum", "poetry.lock", "requirements.txt"] {
+            let d = fixture("nosetup");
+            touch(&d, lock, "");
+            assert_eq!(detect_setup_cmd(&d), None, "{lock}");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    // A bun repo that also carries a stale package-lock.json is a bun repo
+    // (the same preference detect_test_cmd applies).
+    #[test]
+    fn bun_lockfile_wins_over_npm_lockfile() {
+        let d = fixture("bunnpm");
+        touch(&d, "package-lock.json", "{}");
+        touch(&d, "bun.lock", "");
+        assert_eq!(
+            detect_setup_cmd(&d).unwrap().cmd,
+            "bun install --frozen-lockfile"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn setup_cmd_resolution_config_detected_disabled() {
+        let d = fixture("resolve");
+        touch(&d, "bun.lock", "");
+        // Unset ⇒ detected, naming the file.
+        let unset = WorktreeConfig::default();
+        assert_eq!(
+            unset.resolve(&d),
+            Some((
+                "bun install --frozen-lockfile".to_string(),
+                SetupSource::Detected("bun.lock".into())
+            ))
+        );
+        // Set ⇒ verbatim, even when a lockfile would suggest otherwise.
+        let set = WorktreeConfig {
+            setup_cmd: Some("make deps".into()),
+        };
+        assert_eq!(
+            set.resolve(&d),
+            Some(("make deps".to_string(), SetupSource::Config))
+        );
+        // "" (or blank) ⇒ disabled outright.
+        for blank in ["", "  "] {
+            let off = WorktreeConfig {
+                setup_cmd: Some(blank.into()),
+            };
+            assert_eq!(off.resolve(&d), None);
+        }
+        // The key parses from JSON; absent and null both mean "detect".
+        let c: Config = serde_json::from_str(r#"{"worktree":{"setup_cmd":""}}"#).unwrap();
+        assert_eq!(c.worktree.setup_cmd.as_deref(), Some(""));
+        let c: Config = serde_json::from_str(r#"{"worktree":{"setup_cmd":null}}"#).unwrap();
+        assert_eq!(c.worktree, WorktreeConfig::default());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn init_json_prefills_a_detected_setup_cmd() {
+        let d = fixture("initsetup");
+        touch(&d, "bun.lock", "");
+        let c: Config = serde_json::from_str(&Config::default_json_for_root(&d)).unwrap();
+        assert_eq!(
+            c.worktree.setup_cmd.as_deref(),
+            Some("bun install --frozen-lockfile")
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

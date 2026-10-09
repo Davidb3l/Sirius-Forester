@@ -178,6 +178,9 @@ sirius gate AMT-7 [--tier safe] [--target-status in_review] [--range <git-range>
    # gate.test_cmd runs through an EXPLICIT shell, never the launcher's (SF-15):
    # $SIRIUS_SHELL if set; else /bin/sh -c on unix; else the first sh.exe on PATH;
    # else %ComSpec% /C.
+   # SIRF-48: a fail comment carries the runner's output tail (last 15 non-empty lines,
+   # ≤2KB, fenced); the ledger gate_tier fail event gains "error_tail":str and
+   # "env_fault":bool (the output looks like a missing dependency — SIRF-50).
 
 sirius escape <ISSUE> --kind <slug> -m "<what escaped>" [--found-by <who>] [--fix <commit>] [--json]
    -> {"ok":true,"id":int,"issue":str,"kind":str,"kind_count":int,"unretired":str|null,"nudge":str|null}
@@ -251,7 +254,17 @@ sirius integrate [--clear-red] [--json]   # SIRF-32 — build the frontier, run 
 
 sirius run --workers N --agent-cmd "<cmd>" [--from todo] [--review-cmd "<cmd>"]
            [--model <id>|inherit] [--review-model <id>|inherit] [--allow-default-model] --json
-   # first event: {"event":"fleet","phase":"start","models":{"default","source","review","fix_floor","routes","fallback"}}
+   # first event: {"event":"fleet","phase":"start","models":{"default","source","review","fix_floor","routes","fallback"},
+   #   "workers":N,"workers_source":"flag|worker_concurrency","workers_why":str,
+   #   "setup":{"cmd":str,"detected_from":str|null,"failed":[worker]}|null}   (SIRF-50, additive)
+   # --workers N WINS over worker_concurrency, which is the count only when the flag is
+   # absent (SIRF-50; it used to cap the flag silently); stderr says "workers: N (<why>)".
+   # SIRF-50: after creating each worktree, worktree.setup_cmd (unset ⇒ detected from the
+   # lockfile, "" ⇒ none) runs in it through the gate's shell, serially, before any agent.
+   # A worker whose setup fails does not start: {"event":"fleet","phase":"setup_failed",
+   # "worker","cmd","error"} right after the start event, and the run exits 1 at the end
+   # (the other workers still run); if EVERY setup fails, only those lines are printed and
+   # run exits 1 at once.
    # SIRF-27: {"event":"fleet","phase":"fallback","worker","issue","reason","models":{"default","review"}} once,
    #   when a fleet stop on the primary tier switches the WHOLE fleet to models.fallback; the
    #   failed phase is retried in place on the fallback tier (review: a "fell_back" review event)
@@ -271,6 +284,16 @@ sirius run --workers N --agent-cmd "<cmd>" [--from todo] [--review-cmd "<cmd>"]
    # {"event":"fleet","phase":"paused","reason":str}; spine: fleet.paused (+ job.blocked)
    # streams NDJSON iteration events to stdout, one object per line:
    -> {"event":"iteration","worker":"sirius/oak","issue":"AMT-7","phase":"claim|map|lock|brief|work|gate|review|fix|receipt|release","...":...}
+   # gate: {"result":"pass|fail|skipped","plan","tests_run","attempt",
+   #        "reason_code","error_tail":str|null (fail only),"env_fault":bool,"setup_rerun":bool}
+   #   SIRF-50: a fail whose output names a missing dependency ("Cannot find module",
+   #   ERR_MODULE_NOT_FOUND, "ModuleNotFoundError: No module named", E0463, the test
+   #   runner itself "not found", or exit 127 + "not found") in a fleet worktree with a
+   #   setup command re-runs setup and re-gates ONCE per work/fix pass, WITHOUT using a
+   #   retry_budget attempt; still failing ⇒ an ordinary failure. One gate event per attempt:
+   #   "env_fault" = the FIRST gate of that attempt looked like an env fault; result,
+   #   reason_code and error_tail describe the final (re-)gate. The lease is renewed before
+   #   setup re-runs (refused ⇒ the iteration aborts, as a lost lease does elsewhere).
    # review (SIRF-23, only with review.cmd): {"phase":"review","round":N,"result":"clean|blocking|error|tampered|skipped","confirmed":K,"notes":M}
    # fix:  {"phase":"fix","round":N,"agent_ok":bool,...}  (then a re-gate, as today)
    # release gains "review":"review: 2 rounds, 4 bugs fixed, 1 rebuttal accepted" when a review ran
@@ -294,6 +317,7 @@ every agent/reviewer process gets this environment (SIRF-22 #4/#5, SIRF-23):
 | `SIRIUS_REVIEW_OUT`, `SIRIUS_REVIEW_PROMPT` | (review) where to write findings; the rendered prompt |
 | `SIRIUS_REVIEW_FINDINGS` | (fix) this round's findings; (review, round > 1) the previous findings WITH the worker's responses |
 | `SIRIUS_FIX_OUT` | (fix) where the worker writes its responses |
+| `SIRIUS_LAST_GATE_TAIL` | (work, fix) set only on a RETRY after a failed gate: the previous attempt's gate output tail (last 15 lines, ≤2KB), or `<reason_code>: <reason>` when nothing ran (SIRF-48) |
 
 Sirius's own board writes (gate/review comments, decisions, forward stamps)
 pass `--author sirius/<tree>`; releases already pass `--agent`.
@@ -354,6 +378,12 @@ other stdout formats.
                                            //   DURING a review also holds (never an unreviewed advance).
                                            //   `sirius doctor` reports red + parked refs (advisory).
     "timeout_secs": 1800
+  },
+  "worktree": {                            // SIRF-50 — fleet worktree preparation
+    "setup_cmd": null                      // run once per fresh worktree, before any agent; null ⇒ detected
+                                           //   from the root lockfile (bun.lock/bun.lockb, pnpm-lock.yaml,
+                                           //   yarn.lock, package-lock.json, uv.lock); "" ⇒ no setup.
+                                           //   `sirius init` pre-fills the detected command.
   }
 }
 ```
