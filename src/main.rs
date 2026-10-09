@@ -1068,9 +1068,9 @@ fn cmd_run(
     // hand-run subagents). Claim atomicity (amt), entity locks (hayven), and
     // per-worker ledger connections make concurrent iterations safe.
     //
-    // SIRF-50: an explicit `--workers N` WINS; `worker_concurrency` is only
-    // the default when the flag is absent. It used to silently cap the flag
-    // (`--workers 4` ran 3 and the 4th ticket waited).
+    // SIRF-50: an explicit `--workers N` is the count, never capped by
+    // `worker_concurrency` (it used to be: `--workers 4` ran 3 and the 4th
+    // ticket waited); without the flag one worker runs, as always.
     let workers = resolve_workers(workers, cfg.worker_concurrency);
     let names: Vec<String> = tree_names(workers.count);
 
@@ -1696,9 +1696,9 @@ struct WorkerCount {
     why: String,
 }
 
-/// An explicit `--workers N` wins; `worker_concurrency` is the count only
-/// when the flag is absent. It used to CAP the flag silently — `--workers 4`
-/// ran 3 and nothing said so. Either way the count is at least 1.
+/// An explicit `--workers N` is the count; without the flag it is 1.
+/// `worker_concurrency` neither sets nor caps it — it used to CAP the flag
+/// silently (`--workers 4` ran 3 and nothing said so). At least 1 either way.
 fn resolve_workers(flag: Option<u32>, worker_concurrency: u32) -> WorkerCount {
     match flag {
         Some(n) => {
