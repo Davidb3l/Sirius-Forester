@@ -986,7 +986,7 @@ fn cmd_integrate(ws: &Workspace, runner: &RealRunner, clear_red: bool, json: boo
 #[allow(clippy::too_many_arguments)]
 fn cmd_run(
     ws: &Workspace,
-    workers: u32,
+    workers: Option<u32>,
     agent_cmd: &str,
     from: Option<String>,
     max_iterations: u32,
@@ -1067,8 +1067,12 @@ fn cmd_run(
     // foreman (field-observed: the fleet was killed for being slower than
     // hand-run subagents). Claim atomicity (amt), entity locks (hayven), and
     // per-worker ledger connections make concurrent iterations safe.
-    let n = workers.max(1).min(cfg.worker_concurrency.max(1));
-    let names: Vec<String> = tree_names(n);
+    //
+    // SIRF-50: an explicit `--workers N` WINS; `worker_concurrency` is only
+    // the default when the flag is absent. It used to silently cap the flag
+    // (`--workers 4` ran 3 and the 4th ticket waited).
+    let workers = resolve_workers(workers, cfg.worker_concurrency);
+    let names: Vec<String> = tree_names(workers.count);
 
     // Sanity: every phase name we emit is in the documented set (CONTRACTS §2).
     debug_assert!(run::PHASES.contains(&"claim") && run::PHASES.contains(&"release"));
@@ -1186,6 +1190,80 @@ fn cmd_run(
         assignments.push((name.clone(), wt_path));
     }
 
+    // SIRF-50: a fresh worktree has the tracked files and nothing else — no
+    // node_modules, no .venv — so a gate over it failed on the ENVIRONMENT.
+    // Run the setup command in each worktree, serially (package managers
+    // contend on their shared caches), before any agent starts. Detection
+    // reads the first worktree: it IS the base commit's tree, so an untracked
+    // lockfile in the main checkout cannot pick a command the worktrees can't
+    // run. No per-iteration re-run is needed: the iteration's reset is
+    // `git clean -fd` (no -x), which keeps ignored dirs like node_modules.
+    let setup = assignments
+        .first()
+        .and_then(|(_, wt)| cfg.worktree.resolve(wt));
+    // Normalize to the EFFECTIVE command so the loop's env-fault re-gate
+    // (run.rs) reads exactly what ran here: Some(cmd), or "" = none.
+    cfg.worktree.setup_cmd = Some(setup.as_ref().map(|(c, _)| c.clone()).unwrap_or_default());
+    let mut setup_failed: Vec<(String, String)> = Vec::new();
+    if let Some((cmd, source)) = &setup {
+        eprint_err(&setup_note(cmd, source));
+        let sh = shell::resolve_shell();
+        assignments.retain(|(name, wt_path)| {
+            eprint_err(&format!("{name}: running worktree setup…"));
+            let wt_runner = RealRunner {
+                cwd: Some(wt_path.clone()),
+            };
+            match gate::run_setup(&wt_runner, &sh, cmd) {
+                Ok(()) => true,
+                Err(e) => {
+                    // That worker does not start — like a worktree that could
+                    // not be created, but without sinking its siblings.
+                    eprint_err(&format!("{name}: {e}\n{name}: not starting this worker"));
+                    let wt_str = gitrange::git_path(wt_path);
+                    let _ = repo_runner.run("git", &["worktree", "remove", "--force", &wt_str]);
+                    setup_failed.push((name.clone(), e));
+                    false
+                }
+            }
+        });
+    }
+    let setup_failed_events: Vec<Value> = setup_failed
+        .iter()
+        .map(|(name, e)| {
+            json!({
+                "event": "fleet", "phase": "setup_failed", "worker": name,
+                "cmd": setup.as_ref().map(|(c, _)| c.as_str()), "error": e,
+            })
+        })
+        .collect();
+    if assignments.is_empty() {
+        for ev in &setup_failed_events {
+            StdoutLineWriter
+                .write_all(format!("{ev}\n").as_bytes())
+                .ok();
+        }
+        eprint_err(
+            "worktree setup failed for every worker — not starting the fleet. Fix the \
+             command, or set worktree.setup_cmd in .sirius/config.json (\"\" disables setup)",
+        );
+        let _ = std::fs::remove_file(&lock_path);
+        return 1;
+    }
+    let started = assignments.len() as u32;
+    eprint_err(&format!(
+        "workers: {started} ({}){}",
+        workers.why,
+        if setup_failed.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " — {} of {} not started: worktree setup failed",
+                setup_failed.len(),
+                workers.count
+            )
+        }
+    ));
+
     let iterations = std::sync::atomic::AtomicU32::new(0);
     let any_failed = std::sync::atomic::AtomicBool::new(false);
     // SF-14: did ANY worker find work? `iterations` cannot say — it only
@@ -1224,11 +1302,31 @@ fn cmd_run(
                         "fix_floor": cfg.models.fix_floor, "routes": cfg.models.routes,
                         "fallback": cfg.models.fallback,
                     },
+                    // SIRF-50 (additive): the count that actually started,
+                    // where it came from, and the worktree setup that ran.
+                    "workers": started,
+                    "workers_source": workers.source,
+                    "workers_why": workers.why,
+                    "setup": setup.as_ref().map(|(cmd, source)| json!({
+                        "cmd": cmd,
+                        "detected_from": match source {
+                            config::SetupSource::Config => None,
+                            config::SetupSource::Detected(f) => Some(f.as_str()),
+                        },
+                        "failed": setup_failed.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+                    })),
                 })
             )
             .as_bytes(),
         )
         .ok();
+    // After the start event (still the FIRST event of a launch): one line per
+    // worker whose worktree setup failed.
+    for ev in &setup_failed_events {
+        StdoutLineWriter
+            .write_all(format!("{ev}\n").as_bytes())
+            .ok();
+    }
     std::thread::scope(|s| {
         for ((name, _), fleet) in assignments.iter().zip(&fleets) {
             s.spawn(|| {
@@ -1571,6 +1669,56 @@ impl Write for StdoutLineWriter {
     }
 }
 
+/// How many workers a launch runs, and why (SIRF-50 #2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerCount {
+    count: u32,
+    /// `"flag"` or `"worker_concurrency"` — on the `fleet` start event.
+    source: &'static str,
+    /// Human explanation for stderr and the start event.
+    why: String,
+}
+
+/// An explicit `--workers N` wins; `worker_concurrency` is the count only
+/// when the flag is absent. It used to CAP the flag silently — `--workers 4`
+/// ran 3 and nothing said so. Either way the count is at least 1.
+fn resolve_workers(flag: Option<u32>, worker_concurrency: u32) -> WorkerCount {
+    match flag {
+        Some(n) => {
+            let count = n.max(1);
+            let why = if n == 0 {
+                "--workers 0 raised to 1".to_string()
+            } else if n > worker_concurrency {
+                format!("--workers; overrides worker_concurrency {worker_concurrency}")
+            } else {
+                "--workers".to_string()
+            };
+            WorkerCount {
+                count,
+                source: "flag",
+                why,
+            }
+        }
+        None => WorkerCount {
+            count: worker_concurrency.max(1),
+            source: "worker_concurrency",
+            why: format!(
+                "worker_concurrency {worker_concurrency} from .sirius/config.json (or its default); pass --workers N to override"
+            ),
+        },
+    }
+}
+
+/// The stderr line naming the worktree setup that will run (SIRF-50).
+fn setup_note(cmd: &str, source: &config::SetupSource) -> String {
+    match source {
+        config::SetupSource::Config => format!("worktree setup: {cmd} (worktree.setup_cmd)"),
+        config::SetupSource::Detected(from) => format!(
+            "worktree setup: {cmd} (detected from {from}; set worktree.setup_cmd to override, \"\" to disable)"
+        ),
+    }
+}
+
 /// Worker tree names, deterministic and stable (PRD §4).
 fn tree_names(n: u32) -> Vec<String> {
     const TREES: &[&str] = &[
@@ -1661,6 +1809,72 @@ mod tests {
         // A resolved model → fine.
         cfg.models.default = Some("claude-sonnet-5-5".into());
         assert!(check_models(&ws, &cfg, "x --model {model}").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // SIRF-50 #2: `--workers 4` with worker_concurrency 3 ran 3, silently.
+    // The flag wins; the config is only the default; either way it says why.
+    #[test]
+    fn explicit_workers_flag_wins_over_worker_concurrency() {
+        let w = resolve_workers(Some(4), 3);
+        assert_eq!((w.count, w.source), (4, "flag"));
+        assert!(
+            w.why.contains("overrides worker_concurrency 3"),
+            "{}",
+            w.why
+        );
+        let w = resolve_workers(Some(2), 3);
+        assert_eq!(
+            (w.count, w.source, w.why.as_str()),
+            (2, "flag", "--workers")
+        );
+        // Absent flag ⇒ the config's count, and the reason names it.
+        let w = resolve_workers(None, 5);
+        assert_eq!((w.count, w.source), (5, "worker_concurrency"));
+        assert!(w.why.contains("worker_concurrency 5"), "{}", w.why);
+        assert!(w.why.contains("--workers"), "{}", w.why);
+        // Never zero workers.
+        assert_eq!(resolve_workers(Some(0), 3).count, 1);
+        assert_eq!(resolve_workers(None, 0).count, 1);
+    }
+
+    #[test]
+    fn setup_note_names_the_lockfile_and_the_override() {
+        let n = setup_note(
+            "bun install --frozen-lockfile",
+            &config::SetupSource::Detected("bun.lock".into()),
+        );
+        assert_eq!(
+            n,
+            "worktree setup: bun install --frozen-lockfile (detected from bun.lock; set worktree.setup_cmd to override, \"\" to disable)"
+        );
+        assert_eq!(
+            setup_note("make deps", &config::SetupSource::Config),
+            "worktree setup: make deps (worktree.setup_cmd)"
+        );
+    }
+
+    // SIRF-50: `sirius init` in a bun repo writes the setup command it will
+    // run, beside the detected test command.
+    #[test]
+    fn init_writes_a_detected_setup_cmd_for_a_bun_repo() {
+        let dir = std::env::temp_dir().join(format!("sirius-init-setup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("bun.lock"), "{}").unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"scripts":{"test":"bun test"}}"#,
+        )
+        .unwrap();
+        let ws = ws_at(&dir);
+        assert_eq!(cmd_init(&ws, true), 0);
+        let cfg = Config::load(&ws.config_path()).unwrap();
+        assert_eq!(
+            cfg.worktree.setup_cmd.as_deref(),
+            Some("bun install --frozen-lockfile")
+        );
+        assert_eq!(cfg.gate.test_cmd.as_deref(), Some("bun test"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

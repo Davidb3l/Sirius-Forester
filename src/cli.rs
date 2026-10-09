@@ -112,8 +112,11 @@ pub enum Command {
     },
     /// Run the loop with N workers.
     Run {
-        #[arg(long, default_value_t = 1)]
-        workers: u32,
+        /// How many parallel workers. Wins over `worker_concurrency` in
+        /// .sirius/config.json, which is the count when this flag is absent
+        /// (SIRF-50: the config used to silently CAP the flag).
+        #[arg(long)]
+        workers: Option<u32>,
         /// Shell command each worker runs per claimed issue (e.g. `claude -p
         /// "…"`). Its program must be on PATH — `run` refuses to start (exit 2)
         /// when it is not. A Claude Code desktop or web session usually has no

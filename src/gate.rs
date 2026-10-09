@@ -278,6 +278,11 @@ pub struct GateVerdict {
     /// unconfigured `test_cmd`). Typed here — at the source of the verdict —
     /// so retry policy never string-matches the human-facing `plan` label.
     pub structural: bool,
+    /// SIRF-50: the output line that makes this failure look like an
+    /// ENVIRONMENT fault (a missing dependency, a test runner not installed)
+    /// rather than a code fault. Only ever set on a `tests_failed` verdict;
+    /// scanned over the FULL output, not just `detail`'s tail.
+    pub env_fault: Option<String>,
 }
 
 /// Execute a plan against the configured `test_cmd`, through `shell`.
@@ -305,6 +310,7 @@ pub fn execute_plan(
             tests_run: 0,
             test_ids: vec![],
             detail: String::new(),
+            env_fault: None,
         },
         GatePlan::WarnPass(reason) => GateVerdict {
             passed: true,
@@ -316,6 +322,7 @@ pub fn execute_plan(
             tests_run: 0,
             test_ids: vec![],
             detail: String::new(),
+            env_fault: None,
         },
         GatePlan::Full(reason) => run_cmd(runner, shell, test_cmd, &[], "full-suite", reason),
         GatePlan::Subset(ids, reason) => {
@@ -359,6 +366,7 @@ fn run_cmd(
             tests_run: 0,
             test_ids: vec![],
             detail: String::new(),
+            env_fault: None,
         };
     };
     let mut full = cmd.to_string();
@@ -381,6 +389,11 @@ fn run_cmd(
             tests_run: ids.len(),
             test_ids: ids.to_vec(),
             detail: last_lines(&out.stdout, &out.stderr, 20),
+            env_fault: if out.success() {
+                None
+            } else {
+                env_fault_line(&out.stdout, &out.stderr, out.code, cmd)
+            },
         },
         Err(e) => GateVerdict {
             passed: false,
@@ -397,6 +410,7 @@ fn run_cmd(
             // contract (ids the gate *ran*) this is empty, not the selection.
             test_ids: vec![],
             detail: e,
+            env_fault: None,
         },
     }
 }
@@ -423,6 +437,204 @@ pub fn evaluate(
 pub fn evaluate_doubt(runner: &dyn Runner, gate: &GateConfig, reason: &str) -> GateVerdict {
     let plan = fallback_plan(gate.fallback, reason.to_string());
     execute_plan(runner, &resolve_shell(), gate.test_cmd.as_deref(), plan)
+}
+
+/// The fleet's gate: an isolated worktree is invisible to the code-graph
+/// daemon (it watches the main checkout), so `affected-tests` would select
+/// from the PRE-change graph and a narrow subset could miss tests the change
+/// newly affects. Selection is therefore skipped and the fallback policy runs.
+///
+/// SIRF-48: the reason used to read "isolated worktree is not visible to the
+/// code-graph daemon — selection cannot be trusted", and it was the ONLY text
+/// in the failure comment — workers and humans alike read it as the CAUSE of
+/// the failure. It is a routine note about which tests ran, and now says so.
+pub fn evaluate_isolated(runner: &dyn Runner, gate: &GateConfig) -> GateVerdict {
+    evaluate_doubt(runner, gate, &isolated_reason(gate.fallback))
+}
+
+fn isolated_reason(fallback: GateFallback) -> String {
+    let then = match fallback {
+        GateFallback::FullSuite => "ran the full suite",
+        GateFallback::Fail => "gate.fallback=fail blocks instead of running the full suite",
+        GateFallback::PassWithWarning => {
+            "gate.fallback=pass-with-warning advances without running tests"
+        }
+    };
+    format!(
+        "selection skipped in an isolated worktree (the code graph watches the main checkout) — {then}"
+    )
+}
+
+// ── Failure diagnostics (SIRF-48 / SIRF-50) ──────────────────────────────────
+
+/// How much of a failing gate's output is surfaced — in the issue comment, on
+/// the NDJSON `gate` event and the ledger's `gate_tier` event (`error_tail`),
+/// and to the next attempt (`SIRIUS_LAST_GATE_TAIL`).
+pub const ERROR_TAIL_LINES: usize = 15;
+/// Byte cap on that tail (the END is kept — the summary and the last failure).
+pub const ERROR_TAIL_MAX_BYTES: usize = 2048;
+
+/// The last [`ERROR_TAIL_LINES`] non-empty lines of a verdict's output,
+/// capped at [`ERROR_TAIL_MAX_BYTES`] (keeping the end, cut on a line boundary
+/// where one exists, marked with a leading `…`). Empty when nothing ran.
+pub fn error_tail(v: &GateVerdict) -> String {
+    tail_of(&v.detail)
+}
+
+fn tail_of(output: &str) -> String {
+    let lines: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(ERROR_TAIL_LINES);
+    let tail = lines[start..].join("\n");
+    if tail.len() <= ERROR_TAIL_MAX_BYTES {
+        return tail;
+    }
+    let mut cut = tail.len() - ERROR_TAIL_MAX_BYTES;
+    while !tail.is_char_boundary(cut) {
+        cut += 1;
+    }
+    // Prefer starting on a whole line, unless that would leave nothing.
+    if let Some(nl) = tail[cut..].find('\n') {
+        if cut + nl + 1 < tail.len() {
+            cut += nl + 1;
+        }
+    }
+    format!("…{}", &tail[cut..])
+}
+
+/// `text` in a Markdown code fence that its own backticks cannot close.
+fn fenced(text: &str) -> String {
+    let mut longest = 0usize;
+    let mut run = 0usize;
+    for c in text.chars() {
+        if c == '`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    let fence = "`".repeat(longest.max(2) + 1);
+    format!("{fence}text\n{text}\n{fence}")
+}
+
+/// The fleet's failure comment for `v`. When the gate produced output, its
+/// tail leads and the selection/plan note is demoted to a trailing line — the
+/// note is never the cause of a red suite (SIRF-48). With no output (blocked,
+/// unconfigured), the reason IS the explanation and stays inline. `env_note`
+/// says what the env-fault re-gate did, when one was considered.
+pub fn loop_fail_comment(v: &GateVerdict, env_note: Option<&str>) -> String {
+    let tail = error_tail(v);
+    let mut body = if tail.is_empty() {
+        format!(
+            "sirius: gate failed [{}, {}]: {}",
+            v.plan, v.reason_code, v.reason
+        )
+    } else {
+        format!(
+            "sirius: gate failed [{}, {}] — output tail:\n{}\nPlan: {}",
+            v.plan,
+            v.reason_code,
+            fenced(&tail),
+            v.reason
+        )
+    };
+    if let Some(note) = env_note {
+        body.push('\n');
+        body.push_str(note);
+    }
+    body
+}
+
+/// Output patterns that mean "a dependency is missing from this environment",
+/// not "the code is wrong" (SIRF-50). Matched case-sensitively, per line.
+const ENV_FAULT_PATTERNS: &[&str] = &[
+    "Cannot find module",
+    "Cannot find package",
+    "ERR_MODULE_NOT_FOUND",
+    "ModuleNotFoundError: No module named",
+    "error[E0463]: can't find crate",
+];
+
+/// The first output line that marks a failing gate as an ENVIRONMENT fault, if
+/// any (SIRF-50):
+/// - a missing-dependency message ([`ENV_FAULT_PATTERNS`]) — EXCEPT a
+///   `Cannot find module/package` naming a relative or absolute PATH
+///   (`'./utlis'`, `'/abs/x.js'`): that is the code importing a file that does
+///   not exist, a code fault no setup run can fix;
+/// - the shell reporting the test runner ITSELF missing (`<runner>: command
+///   not found` / `<runner>: not found`, runner = `test_cmd`'s program);
+/// - exit 127 (the shell's "command not found") with such a line for any
+///   command — e.g. `npm test` running `vitest` with no `node_modules/.bin`.
+///
+/// A false positive costs one setup re-run and one re-gate (bounded: once per
+/// iteration); a false negative costs a work attempt — so the bar is
+/// "plausibly the environment", not proof.
+pub fn env_fault_line(
+    stdout: &str,
+    stderr: &str,
+    code: Option<i32>,
+    test_cmd: &str,
+) -> Option<String> {
+    let runner_prog = crate::shell::agent_program(test_cmd).map(|p| {
+        // `/usr/local/bin/bun` is reported by the shell under its full path,
+        // but match the basename too.
+        p.rsplit('/').next().unwrap_or(&p).to_string()
+    });
+    for line in stdout.lines().chain(stderr.lines()) {
+        let l = line.trim();
+        if l.is_empty() {
+            continue;
+        }
+        if let Some(p) = ENV_FAULT_PATTERNS.iter().find(|p| l.contains(**p)) {
+            if names_a_path(l, p) {
+                continue;
+            }
+            return Some(l.to_string());
+        }
+        let not_found = l.ends_with(": command not found") || l.ends_with(": not found");
+        if !not_found {
+            continue;
+        }
+        let runner_missing = runner_prog.as_deref().is_some_and(|prog| {
+            l.ends_with(&format!("{prog}: command not found"))
+                || l.ends_with(&format!("{prog}: not found"))
+        });
+        if runner_missing || code == Some(127) {
+            return Some(l.to_string());
+        }
+    }
+    None
+}
+
+/// True when the `Cannot find module|package` on `line` names a file PATH
+/// (`'./x'`, `"../x"`, `'/abs/x'`) rather than a package.
+fn names_a_path(line: &str, pattern: &str) -> bool {
+    if !pattern.starts_with("Cannot find") {
+        return false;
+    }
+    let Some(at) = line.find(pattern) else {
+        return false;
+    };
+    let rest = line[at + pattern.len()..].trim_start();
+    let rest = rest.trim_start_matches(['\'', '"', '`']);
+    rest.starts_with('.') || rest.starts_with('/')
+}
+
+/// Run a worktree setup command (`worktree.setup_cmd`, SIRF-50) through
+/// `shell`, with the runner's cwd (the worker's worktree). `Err` names the
+/// command and carries its exit code and output tail.
+pub fn run_setup(runner: &dyn Runner, shell: &ShellCmd, cmd: &str) -> Result<(), String> {
+    match run_in_shell(runner, shell, cmd) {
+        Ok(out) if out.success() => Ok(()),
+        Ok(out) => {
+            let tail = tail_of(&last_lines(&out.stdout, &out.stderr, ERROR_TAIL_LINES));
+            let code = out
+                .code
+                .map_or_else(|| "on a signal".to_string(), |c| format!("with code {c}"));
+            Err(format!("worktree setup `{cmd}` exited {code}:\n{tail}"))
+        }
+        Err(e) => Err(format!("worktree setup `{cmd}` could not start: {e}")),
+    }
 }
 
 // ── CLI orchestration ────────────────────────────────────────────────────────
@@ -502,13 +714,25 @@ pub fn run_gate(
         // Name the CODE in the comment too: a reader of the issue thread must
         // be able to tell "the suite went red" from "this workspace was never
         // wired to run a suite" without decoding the plan label.
-        let body = format!(
-            "sirius gate FAILED (tier {tier}, plan {}, reason {}): {}. {}",
-            v.plan,
-            v.reason_code,
-            v.reason,
-            first_line(&v.detail)
+        //
+        // SIRF-48: the comment used to carry only the FIRST of the kept output
+        // lines — usually a progress line, never the failure. It now carries
+        // the output tail (the failing tests and the runner's summary).
+        let tail = error_tail(&v);
+        let mut body = format!(
+            "sirius gate FAILED (tier {tier}, plan {}, reason {}): {}.",
+            v.plan, v.reason_code, v.reason,
         );
+        if !tail.is_empty() {
+            body.push_str("\nOutput tail:\n");
+            body.push_str(&fenced(&tail));
+        }
+        if let Some(line) = &v.env_fault {
+            body.push_str(&format!(
+                "\nThis looks like a missing dependency in the environment, not the code: `{}`",
+                line.replace('`', "'")
+            ));
+        }
         let comment_filed = amt.comment(issue, &body).is_ok();
         ledger
             .log_policy_event(
@@ -517,7 +741,8 @@ pub fn run_gate(
                 &serde_json::json!({
                     "issue": issue, "tier": tier, "result": "fail", "plan": v.plan,
                     "reason": v.reason, "reason_code": v.reason_code,
-                    "structural": v.structural, "tests_run": v.tests_run
+                    "structural": v.structural, "tests_run": v.tests_run,
+                    "error_tail": tail, "env_fault": v.env_fault.is_some()
                 }),
             )
             .ok();
@@ -1112,6 +1337,238 @@ mod tests {
             comment.contains(reason_code::UNCONFIGURED_TEST_CMD),
             "{comment}"
         );
+    }
+
+    // ---- SIRF-48 / SIRF-50 failure diagnostics ---------------------------
+
+    fn verdict_with_detail(detail: &str) -> GateVerdict {
+        GateVerdict {
+            passed: false,
+            plan: "full-suite".into(),
+            reason: "r".into(),
+            ran_tests: true,
+            tests_run: 0,
+            test_ids: vec![],
+            detail: detail.into(),
+            reason_code: reason_code::TESTS_FAILED,
+            structural: false,
+            env_fault: None,
+        }
+    }
+
+    #[test]
+    fn error_tail_keeps_the_last_lines_and_caps_bytes() {
+        let detail: Vec<String> = (1..=20).map(|i| format!("line {i}")).collect();
+        let tail = error_tail(&verdict_with_detail(&detail.join("\n")));
+        assert_eq!(tail.lines().count(), ERROR_TAIL_LINES);
+        assert!(
+            tail.starts_with("line 6\n") && tail.ends_with("line 20"),
+            "{tail}"
+        );
+        // Oversized lines: the END is kept, within the byte cap, starting on
+        // a whole line and marked as cut.
+        let long: Vec<String> = (0..15)
+            .map(|i| format!("{i}:{}", "é".repeat(200)))
+            .collect();
+        let tail = error_tail(&verdict_with_detail(&long.join("\n")));
+        assert!(
+            tail.len() <= ERROR_TAIL_MAX_BYTES + '…'.len_utf8(),
+            "{}",
+            tail.len()
+        );
+        assert!(tail.starts_with('…'));
+        assert!(tail.ends_with(&long[14]));
+        let first = tail.trim_start_matches('…').lines().next().unwrap();
+        assert!(long.iter().any(|l| l == first), "cut mid-line: {first}");
+        // Nothing ran ⇒ nothing to show.
+        assert_eq!(error_tail(&verdict_with_detail("")), "");
+    }
+
+    #[test]
+    fn fence_outlasts_backticks_in_the_output() {
+        assert_eq!(fenced("x"), "```text\nx\n```");
+        assert_eq!(fenced("a ```` b"), "`````text\na ```` b\n`````");
+    }
+
+    #[test]
+    fn env_fault_lines_are_dependency_misses_not_code_faults() {
+        let f = |out: &str| env_fault_line(out, "", Some(1), "bun test");
+        // The MainSpanX shapes, plus Node/Python/Rust equivalents.
+        assert!(f("error: Cannot find module \"react\" from \"/w/src/a.ts\"").is_some());
+        assert!(f("Error: Cannot find module 'clsx'").is_some());
+        assert!(
+            f("Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'zod' imported from /w/x.js")
+                .is_some()
+        );
+        assert!(f("ModuleNotFoundError: No module named 'requests'").is_some());
+        assert!(f("error[E0463]: can't find crate for `serde`").is_some());
+        // A relative/absolute PATH that does not resolve is the code's fault.
+        assert_eq!(f("Error: Cannot find module './utlis'"), None);
+        assert_eq!(
+            f("Cannot find module '/w/src/gone.js' imported from /w/x.js"),
+            None
+        );
+        // An ordinary failure is not an env fault.
+        assert_eq!(f("expected 2, received 3\n 1 fail"), None);
+        // The test runner itself missing (as the shell reports it)…
+        assert!(env_fault_line("", "sh: bun: command not found", Some(127), "bun test").is_some());
+        assert!(env_fault_line("", "/bin/sh: 1: bun: not found", Some(2), "bun test").is_some());
+        // …or any command the shell could not find, when it exited 127
+        // (`npm test` → `vitest` with no node_modules/.bin).
+        assert!(
+            env_fault_line("", "sh: vitest: command not found", Some(127), "npm test").is_some()
+        );
+        // …but a test's own "not found" output with an ordinary exit is not.
+        assert_eq!(
+            env_fault_line("user: not found", "", Some(1), "npm test"),
+            None
+        );
+    }
+
+    // run_cmd scans the FULL output (not just the kept 20-line detail) and
+    // only flags failures.
+    #[test]
+    fn run_cmd_flags_env_faults_only_on_failure() {
+        let mut out = String::from("error: Cannot find module \"react\"\n");
+        for i in 0..40 {
+            out.push_str(&format!("(pass) test {i}\n"));
+        }
+        let m = MockRunner::new();
+        m.push(MockResponse::new(&["sh", "-c"], 1, &out, ""));
+        let v = execute_plan(
+            &m,
+            &test_shell(),
+            Some("bun test"),
+            GatePlan::Full("d".into()),
+        );
+        assert!(!v.detail.contains("Cannot find module"), "outside the tail");
+        assert_eq!(
+            v.env_fault.as_deref(),
+            Some("error: Cannot find module \"react\"")
+        );
+        let m = MockRunner::new();
+        m.push(MockResponse::new(&["sh", "-c"], 0, &out, ""));
+        let v = execute_plan(
+            &m,
+            &test_shell(),
+            Some("bun test"),
+            GatePlan::Full("d".into()),
+        );
+        assert!(v.passed && v.env_fault.is_none());
+    }
+
+    #[test]
+    fn isolated_gate_reason_reads_as_a_note_not_a_cause() {
+        let m = MockRunner::new();
+        m.push(MockResponse::new(&["sh", "-c"], 1, "1 fail", ""));
+        let v = evaluate_isolated(&m, &gate_cfg(Some("t"), GateFallback::FullSuite));
+        assert_eq!(v.plan, "full-suite");
+        assert_eq!(
+            v.reason,
+            "selection skipped in an isolated worktree (the code graph watches the main checkout) — ran the full suite"
+        );
+        let v = evaluate_isolated(&MockRunner::new(), &gate_cfg(Some("t"), GateFallback::Fail));
+        assert!(
+            v.reason.contains("gate.fallback=fail blocks"),
+            "{}",
+            v.reason
+        );
+    }
+
+    #[test]
+    fn loop_fail_comment_leads_with_the_tail_and_demotes_the_plan_note() {
+        let v = verdict_with_detail("FAILED a::b\n1 failed");
+        let c = loop_fail_comment(&v, Some("Environment fault suspected"));
+        assert_eq!(
+            c,
+            "sirius: gate failed [full-suite, tests_failed] — output tail:\n```text\nFAILED a::b\n1 failed\n```\nPlan: r\nEnvironment fault suspected"
+        );
+        // No output (blocked/unconfigured): the reason IS the explanation.
+        let mut blocked = verdict_with_detail("");
+        blocked.plan = "blocked".into();
+        blocked.reason_code = reason_code::BLOCKED_BY_POLICY;
+        assert_eq!(
+            loop_fail_comment(&blocked, None),
+            "sirius: gate failed [blocked, blocked_by_policy]: r"
+        );
+    }
+
+    #[test]
+    fn run_setup_names_the_command_and_its_output_on_failure() {
+        let m = MockRunner::new();
+        m.expect(&["sh", "-c", "bun install --frozen-lockfile"], 0, "ok");
+        assert!(run_setup(&m, &test_shell(), "bun install --frozen-lockfile").is_ok());
+        let m = MockRunner::new();
+        m.push(MockResponse::new(
+            &["sh", "-c"],
+            1,
+            "",
+            "error: lockfile had changes, but lockfile is frozen",
+        ));
+        let e = run_setup(&m, &test_shell(), "bun install --frozen-lockfile").unwrap_err();
+        assert!(
+            e.contains("`bun install --frozen-lockfile` exited with code 1"),
+            "{e}"
+        );
+        assert!(e.contains("lockfile is frozen"), "{e}");
+    }
+
+    // SIRF-48: the CLI comment carries the output tail (it used to carry only
+    // the first kept line), and the ledger's gate_tier event carries it too.
+    #[test]
+    fn run_gate_fail_comment_and_ledger_event_carry_the_tail() {
+        let m = MockRunner::new();
+        m.expect(&["git", "diff"], 0, "src/run.rs\n");
+        m.expect(
+            &["hayven", "affected-tests"],
+            0,
+            r#"{"roots":["run"],"note":"no traces yet — may UNDER-report","tests":[]}"#,
+        );
+        m.push(MockResponse::new(
+            &["sh", "-c"],
+            101,
+            "running 40 tests\ntest db::fires ... FAILED\ntest result: FAILED. 1 failed",
+            "",
+        ));
+        m.expect(&["amt", "--json", "issue", "comment"], 0, r#"{"ok":true}"#);
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let cfg = gate_cfg(Some("cargo test"), GateFallback::FullSuite);
+        let o = run_gate(
+            &amt,
+            &hv,
+            &led,
+            &m,
+            &cfg,
+            "AMT-7",
+            "safe",
+            "in_review",
+            None,
+        )
+        .unwrap();
+        assert!(!o.passed);
+        let comment = m
+            .recorded()
+            .into_iter()
+            .find(|c| c.contains("issue comment"))
+            .unwrap();
+        assert!(comment.contains("```text\nrunning 40 tests\n"), "{comment}");
+        assert!(comment.contains("test db::fires ... FAILED"), "{comment}");
+        let detail: String = led
+            .conn
+            .query_row(
+                "SELECT detail FROM policy_events WHERE kind = 'gate_tier'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let ev: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        assert!(ev["error_tail"]
+            .as_str()
+            .unwrap()
+            .ends_with("test result: FAILED. 1 failed"));
+        assert_eq!(ev["env_fault"], false);
     }
 
     #[test]

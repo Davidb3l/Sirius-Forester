@@ -1157,6 +1157,17 @@ pub fn run_iteration(
         let mut attempt: u32 = 0;
         let mut last_exit: Option<i32>;
         let mut last_log: Option<std::path::PathBuf>;
+        // SIRF-50: the env-fault re-gate (re-run worktree setup, gate again)
+        // happens at most ONCE per WORK⇄GATE unit, and only in a fleet
+        // worktree with a setup command (cmd_run resolves an unset
+        // `worktree.setup_cmd` to the detected one before any worker starts).
+        let mut setup_rerun_used = false;
+        let setup_cmd = isolate_base
+            .and(config.worktree.setup_cmd.as_deref())
+            .filter(|c| !c.trim().is_empty());
+        // SIRF-48: the previous attempt's failing gate output, handed to the
+        // next attempt as SIRIUS_LAST_GATE_TAIL.
+        let mut last_gate_tail: Option<String> = None;
         loop {
             // WORK: spawn the agent command under supervision (SIRF-7). One beat
             //    fires before the spawn, and then a periodic heartbeat renews BOTH
@@ -1216,6 +1227,9 @@ pub fn run_iteration(
                 env.push(kv("SIRIUS_MODEL", m));
             }
             env.extend(extra_env.iter().cloned());
+            if let Some(t) = &last_gate_tail {
+                env.push(kv("SIRIUS_LAST_GATE_TAIL", t.as_str()));
+            }
             let log_path = agent_log_path(
                 fleet,
                 &format!(
@@ -1377,8 +1391,7 @@ pub fn run_iteration(
             //    the verdict from the test runner (never from the selector's exit
             //    code). `hayven affected-tests` only selects; on any doubt the gate
             //    runs the full suite. See gate.rs / SIRF-5 / D-3.
-            let verdict =
-            match baseline_err.clone().map_or_else(
+            let gate_once = || match baseline_err.clone().map_or_else(
                 || crate::gitrange::changed_since(runner, pre_head.as_deref(), &pre_untracked),
                 Err,
             ) {
@@ -1401,29 +1414,86 @@ pub fn run_iteration(
                 // Fleet mode therefore always takes the doubt path (full
                 // suite under the default fallback); narrow selection remains
                 // for the serial `sirius gate` CLI, which runs where the
-                // daemon watches.
-                Ok(_) if isolate_base.is_some() => Some(crate::gate::evaluate_doubt(
-                    runner,
-                    &config.gate,
-                    "isolated worktree is not visible to the code-graph daemon — selection cannot be trusted",
-                )),
+                // daemon watches. (SIRF-48: the reason now reads as the
+                // routine note it is, not as a cause of failure.)
+                Ok(_) if isolate_base.is_some() => {
+                    Some(crate::gate::evaluate_isolated(runner, &config.gate))
+                }
                 Ok(files) => Some(crate::gate::evaluate(hv, runner, &config.gate, &files)),
             };
+            let mut verdict = gate_once();
+            // SIRF-50: a failure whose output says a DEPENDENCY is missing
+            // (`Cannot find module 'react'`) is the environment's fault, not
+            // the agent's. Re-run worktree setup and gate again — ONCE, and
+            // without consuming a work attempt. Still failing ⇒ an ordinary
+            // gate failure below.
+            let env_fault = verdict.as_ref().and_then(|v| v.env_fault.clone());
+            let mut setup_rerun = false;
+            let mut env_note: Option<String> = None;
+            if let Some(line) = &env_fault {
+                let line = line.replace('`', "'");
+                env_note = Some(match setup_cmd {
+                    Some(cmd) if !setup_rerun_used => {
+                        setup_rerun_used = true;
+                        setup_rerun = true;
+                        eprintln!(
+                            "sirius: {worker} {issue}: gate output looks like a missing dependency ({line}) — re-running worktree setup `{cmd}` and re-gating (no work attempt used)"
+                        );
+                        let sh = crate::shell::resolve_shell();
+                        match crate::gate::run_setup(runner, &sh, cmd) {
+                            Ok(()) => {
+                                verdict = gate_once();
+                                let after = if verdict.as_ref().is_some_and(|v| v.passed) {
+                                    "the re-gate passed"
+                                } else {
+                                    "still failing, so this is an ordinary gate failure"
+                                };
+                                format!(
+                                    "Environment fault suspected (`{line}`): re-ran worktree setup `{cmd}` and re-gated without using a work attempt — {after}."
+                                )
+                            }
+                            Err(e) => format!(
+                                "Environment fault suspected (`{line}`), but re-running worktree setup failed: {e}"
+                            ),
+                        }
+                    }
+                    Some(_) => format!(
+                        "Environment fault suspected (`{line}`); worktree setup was already re-run once in this pass."
+                    ),
+                    None => format!(
+                        "Environment fault suspected (`{line}`); no worktree.setup_cmd is configured to repair it."
+                    ),
+                });
+            }
             // A pass does NOT move the issue by itself: the status changes once,
             // at RELEASE, after the review stage (SIRF-23) has had its say — a
             // gate pass is necessary, not sufficient.
             gate_result = match &verdict {
                 Some(v) if v.passed => "pass",
                 Some(v) => {
+                    // SIRF-48: the comment leads with the failing output's
+                    // tail; the selection note is demoted to a trailing line.
                     let _ = amt.comment_as(
                         &issue,
-                        &format!("sirius: gate failed [{}]: {}", v.plan, v.reason),
+                        &crate::gate::loop_fail_comment(v, env_note.as_deref()),
                         worker,
                     );
                     "fail"
                 }
                 None => "skipped",
             };
+            let error_tail = verdict
+                .as_ref()
+                .filter(|v| !v.passed)
+                .map(crate::gate::error_tail)
+                .filter(|t| !t.is_empty());
+            if let Some(v) = verdict.as_ref().filter(|v| !v.passed) {
+                last_gate_tail = Some(
+                    error_tail
+                        .clone()
+                        .unwrap_or_else(|| format!("{}: {}", v.reason_code, v.reason)),
+                );
+            }
             emit_event(
                 out,
                 worker,
@@ -1434,6 +1504,10 @@ pub fn run_iteration(
                     "plan": verdict.as_ref().map(|v| v.plan.clone()),
                     "tests_run": verdict.as_ref().map(|v| v.tests_run),
                     "attempt": attempt + 1,
+                    "reason_code": verdict.as_ref().map(|v| v.reason_code),
+                    "error_tail": error_tail,
+                    "env_fault": env_fault.is_some(),
+                    "setup_rerun": setup_rerun,
                 }),
             );
             // Durable: amt status advance (pass) / comment (fail) applied above. A
@@ -6605,5 +6679,301 @@ mod tests {
             .query_row("SELECT oracle_verdicts FROM iterations", [], |r| r.get(0))
             .unwrap();
         assert_eq!(verdicts, r#"["backoff"]"#);
+    }
+
+    // ---- SIRF-50 / SIRF-48: env-fault re-gate and the failure tail -------
+
+    const SETUP: &str = "bun install --frozen-lockfile";
+    /// The MainSpanX output: the suite's own tests pass, a dependency is gone.
+    const MISSING_DEP: &str =
+        "error: Cannot find module \"react\" from \"/wt/src/ui.tsx\"\n 270 pass\n 3 fail";
+
+    fn setup_cfg(retry_budget: u32, setup: &str) -> Config {
+        Config {
+            retry_budget,
+            worktree: crate::config::WorktreeConfig {
+                setup_cmd: Some(setup.into()),
+            },
+            ..cfg()
+        }
+    }
+
+    /// Fleet worktree prep (reset → clean → detached checkout).
+    fn program_fleet_prep(m: &MockRunner) {
+        m.expect(&["git", "reset"], 0, "");
+        m.expect(&["git", "clean"], 0, "");
+        m.expect(&["git", "checkout"], 0, "");
+    }
+
+    fn gate_events(out: &[u8]) -> Vec<Value> {
+        String::from_utf8_lossy(out)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["phase"] == "gate")
+            .collect()
+    }
+
+    fn setup_runs(m: &MockRunner) -> usize {
+        let want = format!("{}{SETUP}", shell_prefix());
+        m.recorded().iter().filter(|c| **c == want).count()
+    }
+
+    fn agent_runs(m: &MockRunner) -> usize {
+        m.recorded()
+            .iter()
+            .filter(|c| **c == agent_call("true"))
+            .count()
+    }
+
+    // SIRF-50: a gate that failed on a MISSING DEPENDENCY re-runs worktree
+    // setup and gates again without consuming a work attempt — with
+    // retry_budget 1, a consumed attempt would have been a deadend.
+    #[test]
+    fn env_fault_regate_reruns_setup_without_consuming_an_attempt() {
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-60");
+        program_fleet_prep(&m);
+        m.expect(&["sh", "-c"], 0, ""); // agent
+        m.expect(
+            &["git", "diff", "--name-only", "base999"],
+            0,
+            "src/ui.tsx\n",
+        );
+        m.push(MockResponse::new(&["sh", "-c"], 1, "", MISSING_DEP)); // gate
+        m.expect(&["sh", "-c", SETUP], 0, "installed 312 packages");
+        m.expect(
+            &["git", "diff", "--name-only", "base999"],
+            0,
+            "src/ui.tsx\n",
+        );
+        m.expect(&["sh", "-c"], 0, "302 pass"); // re-gate
+        m.expect(&["amt", "--json", "release"], 0, r#"{"id":"AMT-60"}"#);
+
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &setup_cfg(1, SETUP),
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
+            None,
+            Some(&test_fleet("base999")),
+        );
+        assert_eq!(o, IterationOutcome::Completed, "{:?}", m.recorded());
+        assert_eq!(agent_runs(&m), 1, "no fresh work attempt");
+        assert_eq!(setup_runs(&m), 1);
+        assert_eq!(led.count_policy_events("retry_budget", 100).unwrap(), 0);
+        let gates = gate_events(&out);
+        assert_eq!(gates.len(), 1, "{gates:?}");
+        assert_eq!(gates[0]["result"], "pass");
+        assert_eq!(gates[0]["env_fault"], true);
+        assert_eq!(gates[0]["setup_rerun"], true);
+        assert_eq!(gates[0]["attempt"], 1);
+        assert!(gates[0]["error_tail"].is_null(), "a pass carries no tail");
+        // A recovered env fault files no failure comment.
+        assert!(
+            !m.recorded().iter().any(|c| c.contains("gate failed")),
+            "{:?}",
+            m.recorded()
+        );
+    }
+
+    // The re-gate happens ONCE per WORK⇄GATE pass: still failing is an
+    // ordinary failure (an attempt IS used), and the next attempt's env fault
+    // does not re-run setup again. The next attempt is told why it failed.
+    #[test]
+    fn env_fault_regate_happens_once_then_counts_as_an_ordinary_failure() {
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-61");
+        program_fleet_prep(&m);
+        // Attempt 1: env fault → setup → re-gate, still missing.
+        m.expect(&["sh", "-c"], 0, ""); // agent
+        m.expect(
+            &["git", "diff", "--name-only", "base999"],
+            0,
+            "src/ui.tsx\n",
+        );
+        m.push(MockResponse::new(&["sh", "-c"], 1, "", MISSING_DEP));
+        m.expect(&["sh", "-c", SETUP], 0, "");
+        m.expect(
+            &["git", "diff", "--name-only", "base999"],
+            0,
+            "src/ui.tsx\n",
+        );
+        m.push(MockResponse::new(&["sh", "-c"], 1, "", MISSING_DEP));
+        // Attempt 2: the same fault — no second setup run.
+        m.expect(&["sh", "-c"], 0, ""); // agent
+        m.expect(
+            &["git", "diff", "--name-only", "base999"],
+            0,
+            "src/ui.tsx\n",
+        );
+        m.push(MockResponse::new(&["sh", "-c"], 1, "", MISSING_DEP));
+        m.expect(&["amt", "--json", "release"], 0, r#"{"id":"AMT-61"}"#);
+
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &setup_cfg(2, SETUP),
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
+            None,
+            Some(&test_fleet("base999")),
+        );
+        assert_eq!(o, IterationOutcome::Deadend);
+        assert_eq!(setup_runs(&m), 1, "setup re-runs at most once");
+        assert_eq!(agent_runs(&m), 2, "the failed re-gate used attempt 1");
+        let gates = gate_events(&out);
+        assert_eq!(gates.len(), 2, "{gates:?}");
+        assert_eq!(
+            (&gates[0]["env_fault"], &gates[0]["setup_rerun"]),
+            (&json!(true), &json!(true))
+        );
+        assert_eq!(
+            (&gates[1]["env_fault"], &gates[1]["setup_rerun"]),
+            (&json!(true), &json!(false))
+        );
+        assert!(gates[0]["error_tail"]
+            .as_str()
+            .unwrap()
+            .contains("Cannot find module"));
+        // The failure comment says what was tried.
+        let comments: Vec<String> = m
+            .recorded()
+            .into_iter()
+            .filter(|c| c.starts_with("amt --json issue comment") && c.contains("gate failed"))
+            .collect();
+        assert_eq!(comments.len(), 2, "{comments:?}");
+        assert!(
+            comments[0].contains("re-ran worktree setup") && comments[0].contains("still failing"),
+            "{}",
+            comments[0]
+        );
+        assert!(
+            comments[1].contains("already re-run once"),
+            "{}",
+            comments[1]
+        );
+        // Attempt 2's agent was handed attempt 1's failing tail.
+        let envs = m.agent_envs();
+        assert_eq!(env_of(&envs[0], "SIRIUS_LAST_GATE_TAIL"), None);
+        let tail = env_of(&envs[1], "SIRIUS_LAST_GATE_TAIL").expect("tail handed over");
+        assert!(tail.contains("Cannot find module \"react\""), "{tail}");
+    }
+
+    // No setup command (disabled) ⇒ an env fault is flagged but nothing is
+    // re-run; it is an ordinary failure.
+    #[test]
+    fn env_fault_without_a_setup_cmd_is_an_ordinary_failure() {
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-62");
+        program_fleet_prep(&m);
+        m.expect(&["sh", "-c"], 0, ""); // agent
+        m.expect(
+            &["git", "diff", "--name-only", "base999"],
+            0,
+            "src/ui.tsx\n",
+        );
+        m.push(MockResponse::new(&["sh", "-c"], 1, "", MISSING_DEP));
+        m.expect(&["amt", "--json", "release"], 0, r#"{"id":"AMT-62"}"#);
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &setup_cfg(1, ""),
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
+            None,
+            Some(&test_fleet("base999")),
+        );
+        assert_eq!(o, IterationOutcome::Deadend);
+        let gates = gate_events(&out);
+        assert_eq!(gates[0]["env_fault"], true);
+        assert_eq!(gates[0]["setup_rerun"], false);
+        assert!(m
+            .recorded()
+            .iter()
+            .any(|c| c.contains("no worktree.setup_cmd is configured")));
+    }
+
+    // SIRF-48: a failing gate's comment leads with the OUTPUT TAIL (not the
+    // first kept line, not the selection note), the selection note reads as
+    // the routine note it is, and the gate event carries `error_tail`.
+    #[test]
+    fn gate_failure_comment_and_event_carry_the_output_tail() {
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-63");
+        program_fleet_prep(&m);
+        m.expect(&["sh", "-c"], 0, ""); // agent
+        m.expect(&["git", "diff", "--name-only", "base999"], 0, "src/db.rs\n");
+        let mut output: String = (1..=24).map(|i| format!("progress line {i}\n")).collect();
+        output.push_str("FAILED db::trigger_fires — relation \"audit\" does not exist\n");
+        m.push(MockResponse::new(&["sh", "-c"], 101, &output, ""));
+        m.expect(&["amt", "--json", "release"], 0, r#"{"id":"AMT-63"}"#);
+        let amt = Amt::new(&m);
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &setup_cfg(1, ""),
+            &m,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
+            None,
+            Some(&test_fleet("base999")),
+        );
+        assert_eq!(o, IterationOutcome::Deadend);
+        let comment = m
+            .recorded()
+            .into_iter()
+            .find(|c| c.starts_with("amt --json issue comment") && c.contains("gate failed"))
+            .expect("a failure comment");
+        assert!(comment.contains("```text"), "{comment}");
+        assert!(comment.contains("FAILED db::trigger_fires"), "{comment}");
+        assert!(comment.contains("[full-suite, tests_failed]"), "{comment}");
+        // The last 15 lines only (14 progress lines + the failure): line 11
+        // is in, line 10 is out.
+        assert!(comment.contains("progress line 11\n"), "{comment}");
+        assert!(!comment.contains("progress line 10\n"), "{comment}");
+        // The selection note is demoted and reworded.
+        assert!(
+            comment.contains("Plan: selection skipped in an isolated worktree"),
+            "{comment}"
+        );
+        assert!(!comment.contains("not visible to the code-graph daemon"));
+        let gates = gate_events(&out);
+        assert_eq!(gates[0]["reason_code"], "tests_failed");
+        assert_eq!(gates[0]["env_fault"], false);
+        assert_eq!(gates[0]["setup_rerun"], false);
+        let tail = gates[0]["error_tail"].as_str().unwrap();
+        assert!(tail.ends_with("does not exist"), "{tail}");
+        assert_eq!(tail.lines().count(), crate::gate::ERROR_TAIL_LINES);
     }
 }
