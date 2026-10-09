@@ -753,7 +753,7 @@ pub fn run_iteration(
         // which `reset --hard` and `clean` never touch). The previous
         // issue is not known here: a rebase's un-replayed commits are
         // parked per worker.
-        quit_operations(runner, false, &|sha| {
+        quit_operations(runner, &|sha| {
             let r = format!(
                 "refs/sirius/wip-orphaned/{}/{}",
                 ref_segment(worker),
@@ -2784,7 +2784,7 @@ fn preserve_wip(
         // markers — see below. Detect that BEFORE quitting, then quit
         // whatever is in progress (a rebase's un-replayed commits parked).
         let unmerged = has_unmerged_paths(runner);
-        quit_operations(runner, true, &|sha| {
+        quit_operations(runner, &|sha| {
             let parked = park_superseded(runner, issue, sha);
             eprintln!(
                 "sirius: {issue}: a half-done rebase's original commits are parked at {parked}"
@@ -2885,13 +2885,7 @@ fn has_unmerged_paths(runner: &dyn Runner) -> bool {
 /// only by its state (`rebase-*/orig-head`): when HEAD and no ref contain
 /// that commit, `park` gets it BEFORE the quit — never left to the reflog of
 /// a worktree that will be removed.
-///
-/// `keep_clean_merge` (a snapshot follows): a merge with NO unmerged paths
-/// is left in progress, so the snapshot commit records it as the
-/// two-parent merge it is — quitting would fold the merged branch (a
-/// sibling's) into a single-parent commit that `link --changed` then
-/// stamps as this issue's.
-fn quit_operations(runner: &dyn Runner, keep_clean_merge: bool, park: &dyn Fn(&str)) {
+fn quit_operations(runner: &dyn Runner, park: &dyn Fn(&str)) {
     const STATE: [(&str, &[&str]); 6] = [
         ("MERGE_HEAD", &["merge"]),
         ("CHERRY_PICK_HEAD", &["cherry-pick"]),
@@ -2950,10 +2944,6 @@ fn quit_operations(runner: &dyn Runner, keep_clean_merge: bool, park: &dyn Fn(&s
         if !is_ancestor(runner, o, "HEAD") && !reachable_from_a_ref(runner, o).unwrap_or(false) {
             park(o);
         }
-    }
-    let mut found = found;
-    if keep_clean_merge && !has_unmerged_paths(runner) {
-        found[0] = false;
     }
     let mut done: Vec<&str> = Vec::new();
     for ((_, ops), hit) in STATE.iter().zip(found) {
@@ -3034,7 +3024,7 @@ pub fn preserve_stale_worktree(
     // un-replayed commits are parked, even when the tree is otherwise clean.
     let unmerged = has_unmerged_paths(wt);
     let w = ref_segment(worker);
-    quit_operations(wt, true, &|sha| {
+    quit_operations(wt, &|sha| {
         let parked = match issue {
             Some(i) => park_superseded(wt, i, sha),
             None => {
@@ -9999,7 +9989,7 @@ mod tests {
             0,
             "--path-format=absolute\n.git/MERGE_HEAD\n.git/CHERRY_PICK_HEAD\n.git/REVERT_HEAD\n.git/sequencer\n.git/rebase-merge\n.git/rebase-apply\n",
         );
-        quit_operations(&m, false, &|_| {});
+        quit_operations(&m, &|_| {});
         let rec = m.recorded();
         for op in ["merge", "cherry-pick", "revert", "rebase", "am"] {
             assert!(
@@ -10014,26 +10004,5 @@ mod tests {
     fn the_setup_log_is_one_flat_file_per_worker() {
         let p = setup_log_path(std::path::Path::new("/s"), "sirius/oak");
         assert_eq!(p, std::path::Path::new("/s/logs/setup-sirius_oak.log"));
-    }
-
-    /// Review: a merge killed partway WITHOUT conflicts (`merge --no-commit`)
-    /// is snapshotted as the two-parent merge it is — never folded into a
-    /// single-parent commit that would make the merged sibling's files ours.
-    #[test]
-    fn preserve_wip_keeps_a_clean_in_progress_merge_two_parent() {
-        let w = GitWorld::new("cleanmerge");
-        let base = w.base.clone();
-        let sib = commit_file(&w.wt, "sib.txt");
-        git_at(&w.wt, &["checkout", "-q", "--detach", &base]);
-        let mine = commit_file(&w.wt, "mine.txt");
-        git_at(&w.wt, &["merge", "--no-commit", "--no-ff", &sib]);
-        let got = preserve_wip(&w.git, "AMT-65", &base, &base, WipKind::Resume)
-            .unwrap()
-            .expect("pinned");
-        assert_eq!(got.ref_name, "refs/sirius/wip/amt-65");
-        assert_eq!(
-            git_at(&w.repo, &["rev-list", "--parents", "-n", "1", &got.sha]),
-            format!("{} {mine} {sib}", got.sha)
-        );
     }
 }
