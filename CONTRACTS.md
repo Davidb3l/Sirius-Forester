@@ -311,8 +311,10 @@ sirius run --workers N --agent-cmd "<cmd>" [--from todo] [--review-cmd "<cmd>"]
    #   "partial" when only the committed part could be pinned — or "wip_error":str when pinning
    #   failed; the release comment ends "— work preserved at <ref> (<sha12>, <diffstat>)".
    #   An agent that itself failed counts as interrupted (wip), even if the gate then failed;
-   #   so does a gate whose FINAL failure still looks like an environment fault (SIRF-50 —
-   #   after the one setup re-run, or with none configured). Resumed wip AND held work that
+   #   so does a gate whose FINAL failure still looks like an environment fault that setup
+   #   could NOT repair (SIRF-50 — no setup command, or its re-run failed). A dependency still
+   #   missing after a SUCCESSFUL re-run is judged (the work likely never declared it), so it
+   #   is never re-merged on every claim. Resumed wip AND held work that
    #   is then judged moves to wip-failed (the resumed refs are compare-and-deleted once
    #   wip-failed contains them). A fix round's discarded attempt is parked at wip-superseded
    #   before the revert. Every ref sirius removes is compare-and-deleted against the sha it

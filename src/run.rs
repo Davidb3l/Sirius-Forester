@@ -1283,6 +1283,10 @@ pub fn run_iteration(
         // worktree with a setup command (cmd_run resolves an unset
         // `worktree.setup_cmd` to the detected one before any worker starts).
         let mut setup_rerun_used = false;
+        // Set once a setup re-run SUCCEEDED in this pass: a dependency still
+        // missing after that is likely undeclared by the work itself, so the
+        // failure is judged — resuming it would re-merge it on every claim.
+        let mut setup_repaired = false;
         let setup_cmd = isolate_base
             .and(config.worktree.setup_cmd.as_deref())
             .filter(|c| !c.trim().is_empty());
@@ -1619,12 +1623,12 @@ pub fn run_iteration(
                         }) {
                             Ok(()) => {
                                 crate::gate::write_setup_stamp(runner);
+                                setup_repaired = true;
                                 verdict = gate_once();
                                 let after = match &verdict {
                                     Some(v) if v.passed => "the re-gate passed",
-                                    // Not judged on the work: kept to resume.
                                     Some(v) if v.env_fault.is_some() => {
-                                        "still failing on a missing dependency, so the work is kept to resume rather than judged"
+                                        "still missing a dependency after a successful setup — likely one the work never declared, so this is an ordinary gate failure"
                                     }
                                     _ => "still failing, so this is an ordinary gate failure",
                                 };
@@ -1645,9 +1649,12 @@ pub fn run_iteration(
                     ),
                 });
             }
-            final_env_fault = verdict
-                .as_ref()
-                .is_some_and(|v| !v.passed && v.env_fault.is_some());
+            // Only a fault setup could NOT repair (no setup command, or the
+            // re-run failed) leaves the work unjudged.
+            final_env_fault = !setup_repaired
+                && verdict
+                    .as_ref()
+                    .is_some_and(|v| !v.passed && v.env_fault.is_some());
             // A pass does NOT move the issue by itself: the status changes once,
             // at RELEASE, after the review stage (SIRF-23) has had its say — a
             // gate pass is necessary, not sufficient.
@@ -8110,7 +8117,8 @@ mod tests {
             .collect();
         assert_eq!(comments.len(), 2, "{comments:?}");
         assert!(
-            comments[0].contains("re-ran worktree setup") && comments[0].contains("still failing"),
+            comments[0].contains("re-ran worktree setup")
+                && comments[0].contains("ordinary gate failure"),
             "{}",
             comments[0]
         );
@@ -9472,9 +9480,11 @@ mod tests {
         assert!(tree_files(&w.repo, &wip).contains(&"a.txt".to_string()));
     }
 
-    /// …and when the one setup re-run did not repair it either.
+    /// …but when the one setup re-run SUCCEEDED and the dependency is still
+    /// missing, the work itself likely never declared it: judged, offered as
+    /// prior work, never re-merged on every claim.
     #[test]
-    fn an_env_fault_that_survives_the_setup_rerun_keeps_the_work_resumable() {
+    fn an_env_fault_that_survives_a_successful_setup_rerun_is_judged() {
         let w = GitWorld::new("envfault2");
         w.agent(|wt| {
             commit_file(wt, "a.txt");
@@ -9487,8 +9497,8 @@ mod tests {
         assert_eq!(o, IterationOutcome::Deadend);
         let gate = event(&evs, "gate");
         assert_eq!(gate["setup_rerun"], true, "{evs:?}");
-        assert_eq!(w.ref_at("refs/sirius/wip-failed/amt-45"), None);
-        assert!(w.ref_at("refs/sirius/wip/amt-45").is_some());
+        assert_eq!(w.ref_at("refs/sirius/wip/amt-45"), None);
+        assert!(w.ref_at("refs/sirius/wip-failed/amt-45").is_some());
     }
 
     /// Review: an agent killed mid-merge — its snapshot (conflict markers)
