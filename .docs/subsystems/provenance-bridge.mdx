@@ -7,8 +7,8 @@ relatedFiles: ["src/bridge.rs"]
 anchors: [{"file":"src/gitrange.rs","symbol":"changed_symbols"},{"file":"src/gitrange.rs","symbol":"fleet_line_files"}]
 evidence: []
 refs: []
-verifiedCommit: "bb69e4246d340fa05fec08746290cb0a4b6bef22"
-verifiedAt: "2026-10-09T00:18:23.939Z"
+verifiedCommit: "36b59aabe116ce22bcdccfb36208562c95958f49"
+verifiedAt: "2026-10-09T00:27:38.413Z"
 driftSuspectSince: ""
 driftSuspectReason: ""
 createdAt: 1785915503544
@@ -46,7 +46,7 @@ sirius link --decision D-3 --symbols ... --json
 `--changed` resolves the symbols from a git range instead of an explicit list. Which files count (`gitrange::changed_symbols`):
 
 - **`--range` given** — exactly that range; an empty answer stays empty.
-- **Inside a fleet iteration** (`$SIRIUS_ISSUE` and `$SIRIUS_BASE` set, and HEAD descends from that base — a stale SHA in a human shell is ignored) — this issue's own line of work (`fleet_line_files`) plus uncommitted tracked edits: the first-parent, merge-free commits since the base, minus anything already on the fleet's base branch (`$SIRIUS_BASE_REF`), so a fix round's merge of the moved base — or a base brought in by fast-forward — never stamps other workers' files. Work resumed from an earlier hold sits behind a resume merge at the bottom of the line; it is followed when that merge's second parent is `$SIRIUS_RESUMED_FROM` or is contained in one of the issue's own refs (`sirius/<issue>`, `refs/sirius/<kind>/<issue>`) — never by commit message, which a hook can rewrite.
+- **Inside a fleet iteration** (`$SIRIUS_ISSUE` and `$SIRIUS_BASE` set, and HEAD descends from that base — a stale SHA in a human shell is ignored) — this issue's own line of work (`fleet_line_files`) plus uncommitted tracked edits: the first-parent, merge-free commits since the base, minus anything already on the fleet's base branch (`$SIRIUS_BASE_REF`) and any commit only OTHER issues' refs hold (`foreign_commits` — a sibling's `sirius/<x>` fast-forwarded into the line; a commit this issue's refs or `$SIRIUS_RESUMED_FROM` also hold stays ours), so a fix round's merge of the moved base, a base brought in by fast-forward, or a sibling built upon never stamps other workers' files. Work resumed from an earlier hold sits behind a resume merge at the bottom of the line; it is followed when that merge's second parent is `$SIRIUS_RESUMED_FROM` or is contained in one of the issue's own refs (`sirius/<issue>`, `refs/sirius/<kind>/<issue>`) — never by commit message, which a hook can rewrite.
 - **Otherwise (solo)** — working tree vs HEAD; if that is empty (the documented work → gate → commit → receipt order), the commit just made (`HEAD~1..HEAD`; nothing on a root commit).
 
 In both no-range cases, new untracked files with nothing else to link are a refusal (`commit or git add the work first, or pass --range`) rather than a guess — the suite's own `.suite/`, `.sirius/`, `.ametrite/`, `.hayven/` output excepted. Resolution is by **path**: `gitrange::changed_symbols` takes the `roots` of `hayven affected-tests --changed <files>`, hayven's own path-exact file → entity mapping, so a change to one package's `types.ts` never stamps every other `types` module in a monorepo (the SIRF-20 basename bug: a full-text `hayven query <file stem>`). Unindexed files (lockfiles, configs, docs) contribute nothing, and a daemon that cannot answer fails the link instead of stamping nothing. The output reports "N symbols from M changed file(s)" (`changed_files` in `--json`). `LinkKind` distinguishes `issue` from `decision`; both produce a `LinkReceipt` and a `receipts` row.

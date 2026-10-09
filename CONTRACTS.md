@@ -285,7 +285,7 @@ every agent/reviewer process gets this environment (SIRF-22 #4/#5, SIRF-23):
 | `AMT_AGENT` | `sirius/<tree>` — the agent's own `amt` writes are attributed to the worker |
 | `SIRIUS_PHASE` | `work` \| `review` \| `fix` |
 | `SIRIUS_BASE` | the launch base commit |
-| `SIRIUS_BASE_REF` | the branch the fleet lands on (`review.base_ref`, else the launch branch); unset on a detached launch. `sirius link --changed` never stamps commits already on it |
+| `SIRIUS_BASE_REF` | the branch the fleet lands on (`review.base_ref`, else the launch branch); unset only when neither exists (a detached launch with no `review.base_ref`). `sirius link --changed` never stamps commits already on it |
 | `ANTHROPIC_MODEL`, `SIRIUS_MODEL` | (work, fix) this ticket's resolved worker model — Claude Code honors `ANTHROPIC_MODEL` over settings.json |
 | `ANTHROPIC_MODEL`, `SIRIUS_REVIEW_MODEL` | (review) the reviewer's model |
 | `SIRIUS_REVIEW_DIR`, `SIRIUS_DIFF_RANGE` | (review, fix) the tree to review, and `git diff $SIRIUS_DIFF_RANGE` |
