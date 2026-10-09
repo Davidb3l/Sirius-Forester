@@ -1133,6 +1133,17 @@ pub fn run_iteration(
     if let Some(sha) = &resumed {
         base_env.push(kv("SIRIUS_RESUMED_FROM", sha.as_str()));
     }
+    // The branch this fleet lands on (the review's base ref, else the branch
+    // launched from): `sirius link --changed` never stamps commits already on
+    // it as this issue's work.
+    if let Some(r) = config
+        .review
+        .base_ref
+        .clone()
+        .or_else(|| fleet.and_then(|f| f.base_ref.clone()))
+    {
+        base_env.push(kv("SIRIUS_BASE_REF", r));
+    }
     // WORK⇄GATE as a reusable unit: the initial work pass (phase `work`) and
     // every review fix round (phase `fix`) run through the same supervision,
     // heartbeat, timeout, log capture, baseline diff, and retry budget.

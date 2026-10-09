@@ -908,7 +908,9 @@ function Write-PathHint {
     }
     Write-Log ''
     Write-Log ('note: ' + $BinDir + ' is not on your PATH. Add it with:')
-    Write-Log ('      [Environment]::SetEnvironmentVariable(''Path'', [Environment]::GetEnvironmentVariable(''Path'',''User'') + '';' + $BinDir + ''', ''User'')')
+    # Keeps Path's REG_EXPAND_SZ kind (the SetEnvironmentVariable('Path', ...)
+    # one-liner flattens it to REG_SZ, freezing every %VAR% entry).
+    Write-Log ('      $d=''' + $BinDir.Replace("'", "''") + '''; $k=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Environment"); $p=[string]$k.GetValue("Path","",[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames); $k.SetValue("Path",($p.TrimEnd(";")+";"+$d).TrimStart(";"),[Microsoft.Win32.RegistryValueKind]::ExpandString); $k.Close(); [Environment]::SetEnvironmentVariable("SIRIUS_PATH_BROADCAST",$null,"User")')
     Write-Log '      (or re-run this installer with -AddToPath)'
     Write-Log 'note: PATH changes only reach NEW processes - restart your shell'
     Write-Log '      (and Claude Code / the Claude desktop app) to pick it up.'

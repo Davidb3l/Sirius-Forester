@@ -265,9 +265,12 @@ print_path_hint() {
     log "  Permanently, for ALL of Windows (PowerShell, cmd, editors, Claude Code)"
     log "  — run this ONCE in PowerShell, then close and reopen your shells:"
     log ""
-    log "      [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','User') + ';' + \"\$env:USERPROFILE\\.local\\bin\", 'User')"
+    # Raw registry write, keeping Path's REG_EXPAND_SZ kind: the old
+    # [Environment]::SetEnvironmentVariable one-liner flattened it to REG_SZ,
+    # freezing every %VAR% entry. The dummy-variable delete broadcasts it.
+    log '      $d="$env:USERPROFILE\.local\bin"; $k=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Environment"); $p=[string]$k.GetValue("Path","",[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames); $k.SetValue("Path",($p.TrimEnd(";")+";"+$d).TrimStart(";"),[Microsoft.Win32.RegistryValueKind]::ExpandString); $k.Close(); [Environment]::SetEnvironmentVariable("SIRIUS_PATH_BROADCAST",$null,"User")'
     log ""
-    log "  That one-liner appends the DEFAULT prefix (%USERPROFILE%\\.local\\bin)."
+    log "  That command appends the DEFAULT prefix (%USERPROFILE%\\.local\\bin)."
     log "  You installed into: $BIN_DIR"
     log "  If those differ, substitute the Windows form of the path above."
     log "  Already-running shells, editors and apps must be RESTARTED to see it."

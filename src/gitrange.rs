@@ -210,6 +210,11 @@ pub fn changed_symbols(
 pub struct FleetBase<'a> {
     pub base: &'a str,
     pub resumed_from: Option<&'a str>,
+    /// `$SIRIUS_ISSUE`: whose held/wip/branch refs mark this issue's own work.
+    pub issue: Option<&'a str>,
+    /// `$SIRIUS_BASE_REF`: the branch the fleet lands on. Commits already on
+    /// it are never this issue's to stamp.
+    pub base_ref: Option<&'a str>,
 }
 
 /// How many resume merges [`fleet_line_files`] follows back. Each is one
@@ -222,40 +227,60 @@ const MAX_RESUME_DEPTH: usize = 8;
 /// the base, and a fix round merges the CURRENT base into it — so a plain
 /// `base..HEAD` (tree diff or log) would also stamp every other worker's
 /// commit that merge brought in. `--no-merges` alone does not help: it drops
-/// the merge commits, not the commits they reach.
+/// the merge commits, not the commits they reach. Commits already on the
+/// fleet's base branch (`$SIRIUS_BASE_REF`) are excluded outright, which also
+/// covers a worker that brought the base in by fast-forward or rebase — no
+/// merge commit there to recognise.
 ///
-/// Held work resumed from an earlier hold is the one second parent that IS
-/// this issue's: `resume_held` merges it before the agent runs, so that merge
-/// sits at the BOTTOM of the line. Follow it — but only a real resume merge:
-/// the one `$SIRIUS_RESUMED_FROM` names, or one carrying resume_held's
-/// `Merge commit '<sha>'` subject
-/// (git's default for `merge --no-edit <sha>`). A
-/// worker that opens with its own `git merge main` also leaves a merge at the
-/// bottom, and following that would stamp the whole base onto the issue.
+/// Held or wip work resumed from an earlier hold is the one second parent that
+/// IS this issue's: `resume_held` merges it before the agent runs, so that
+/// merge sits at the BOTTOM of the line. It is followed when its second parent
+/// is the one `$SIRIUS_RESUMED_FROM` names, or is contained in one of this
+/// issue's own refs (`sirius/<issue>`, `refs/sirius/<kind>/<issue>[/…]`) —
+/// ancestry sirius itself recorded, so neither a commit-message hook nor a
+/// human's branch on the held sha can hide it. A worker's own merge of the
+/// base or of a sibling is never in those refs, and is not followed.
 fn fleet_line_files(runner: &dyn Runner, f: FleetBase<'_>) -> Result<Vec<String>, String> {
+    let landed: Vec<String> = match f.base_ref.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(r) => match run_git(
+            runner,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{r}^{{commit}}"),
+            ],
+        ) {
+            Ok(o) if !o.stdout.trim().is_empty() => {
+                vec!["--not".to_string(), o.stdout.trim().to_string()]
+            }
+            _ => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    let own_refs = issue_refs(runner, f.issue)?;
     let mut files: Vec<String> = Vec::new();
     let mut tip = "HEAD".to_string();
     let mut expect_parent = f.resumed_from.map(str::trim).filter(|r| !r.is_empty());
     for _ in 0..=MAX_RESUME_DEPTH {
         let range = format!("{}..{tip}", f.base);
-        let log = run_git(
-            runner,
-            &[
-                "log",
-                "--first-parent",
-                "--no-merges",
-                "--name-only",
-                "--format=",
-                &range,
-            ],
-        )?;
-        for x in stdout_lines(&log) {
+        let mut log_args: Vec<&str> = vec![
+            "log",
+            "--first-parent",
+            "--no-merges",
+            "--name-only",
+            "--format=",
+            &range,
+        ];
+        log_args.extend(landed.iter().map(String::as_str));
+        for x in stdout_lines(&run_git(runner, &log_args)?) {
             if !files.contains(&x) {
                 files.push(x);
             }
         }
-        let line = run_git(runner, &["rev-list", "--first-parent", &range])?;
-        let Some(bottom) = stdout_lines(&line).pop() else {
+        let mut line_args: Vec<&str> = vec!["rev-list", "--first-parent", &range];
+        line_args.extend(landed.iter().map(String::as_str));
+        let Some(bottom) = stdout_lines(&run_git(runner, &line_args)?).pop() else {
             break;
         };
         let parents = run_git(runner, &["rev-list", "--parents", "-n", "1", &bottom])?;
@@ -267,23 +292,12 @@ fn fleet_line_files(runner: &dyn Runner, f: FleetBase<'_>) -> Result<Vec<String>
         let Some(second) = parents.get(2) else {
             break; // the bottom is an ordinary commit: the line ends here
         };
-        // A resume merge is the one `$SIRIUS_RESUMED_FROM` names, OR any merge
-        // carrying resume_held's signature — at EVERY depth: when this run's
-        // resume fast-forwarded (main had not moved since the hold), the line's
-        // bottom is an OLDER cross-run resume merge whose second parent is an
-        // earlier held sha, not $SIRIUS_RESUMED_FROM.
         let named =
             expect_parent.is_some_and(|r| second.starts_with(r) || r.starts_with(second.as_str()));
-        let is_resume = named || {
-            let subject = run_git(runner, &["log", "-1", "--format=%s", &bottom])?;
-            // `Merge commit '<sha>'`, plus ` into HEAD` on a detached
-            // worktree (or ` into <branch>`).
-            subject
-                .stdout
-                .trim()
-                .starts_with(&format!("Merge commit '{second}'"))
-                && !landed_on_a_branch(runner, second)?
-        };
+        let is_resume = named
+            || own_refs
+                .iter()
+                .any(|r| run_git(runner, &["merge-base", "--is-ancestor", second, r]).is_ok());
         if !is_resume {
             break;
         }
@@ -293,24 +307,29 @@ fn fleet_line_files(runner: &dyn Runner, f: FleetBase<'_>) -> Result<Vec<String>
     Ok(files)
 }
 
-/// Whether `sha` is on any local branch other than sirius's own `sirius/*`.
-/// Held and wip work has never landed, so this tells a resume merge apart from
-/// a worker merging the base BY SHA — both get git's `Merge commit '<sha>'`
-/// subject, but the base is on `main` (or whatever branch the fleet tracks).
-fn landed_on_a_branch(runner: &dyn Runner, sha: &str) -> Result<bool, String> {
-    let refs = run_git(
+/// This issue's own refs: its `sirius/<issue>` branch and every
+/// `refs/sirius/<kind>/<issue>` (held, held-superseded/…, wip, …). Matched on
+/// whole path segments, so `amt-1` never claims `amt-10`'s refs.
+fn issue_refs(runner: &dyn Runner, issue: Option<&str>) -> Result<Vec<String>, String> {
+    let Some(key) = issue
+        .map(|i| i.trim().to_lowercase())
+        .filter(|i| !i.is_empty())
+    else {
+        return Ok(Vec::new());
+    };
+    let out = run_git(
         runner,
         &[
             "for-each-ref",
-            "--contains",
-            sha,
             "--format=%(refname)",
-            "refs/heads/",
+            "refs/heads/sirius/",
+            "refs/sirius/",
         ],
     )?;
-    Ok(stdout_lines(&refs)
-        .iter()
-        .any(|r| !r.starts_with("refs/heads/sirius/")))
+    Ok(stdout_lines(&out)
+        .into_iter()
+        .filter(|r| r.split('/').any(|seg| seg.eq_ignore_ascii_case(&key)))
+        .collect())
 }
 
 /// Whether `base` names a commit HEAD descends from. Anything else — a stale
@@ -586,6 +605,8 @@ mod tests {
             Some(FleetBase {
                 base: "base1",
                 resumed_from: None,
+                issue: None,
+                base_ref: None,
             }),
         )
         .unwrap();
@@ -613,6 +634,8 @@ mod tests {
         let fleet = FleetBase {
             base: "base1",
             resumed_from: None,
+            issue: None,
+            base_ref: None,
         };
         let e = changed_symbols(&m, &hv, None, Some(fleet)).unwrap_err();
         assert!(e.contains("src/brand_new.rs"), "{e}");
@@ -634,6 +657,8 @@ mod tests {
             Some(FleetBase {
                 base: "oldsha",
                 resumed_from: None,
+                issue: None,
+                base_ref: None,
             }),
         )
         .unwrap();
@@ -691,6 +716,8 @@ mod tests {
             Some(FleetBase {
                 base: "base1",
                 resumed_from: None,
+                issue: None,
+                base_ref: None,
             }),
         )
         .unwrap();
@@ -835,11 +862,22 @@ mod tests {
             tip
         }
         fn line(&self, base: &str, resumed: Option<&str>) -> Vec<String> {
+            self.line_with(base, resumed, Some("AMT-1"), Some("main"))
+        }
+        fn line_with(
+            &self,
+            base: &str,
+            resumed: Option<&str>,
+            issue: Option<&str>,
+            base_ref: Option<&str>,
+        ) -> Vec<String> {
             let mut got = fleet_line_files(
                 &self.0,
                 FleetBase {
                     base,
                     resumed_from: resumed,
+                    issue,
+                    base_ref,
                 },
             )
             .unwrap();
@@ -896,6 +934,8 @@ mod tests {
         r.git(&["switch", "-q", "--detach", &b3]);
         r.git(&["merge", "-q", "--no-edit", &h1]); // run 3 resumes h1
         r.file("w2.txt");
+        // Held work is on the issue's held ref until the completion stamp.
+        r.git(&["update-ref", "refs/sirius/held/amt-1", &h1]);
         assert_eq!(r.line(&b3, Some(&h1)), vec!["h0.txt", "w.txt", "w2.txt"]);
         r.drop();
     }
@@ -924,6 +964,12 @@ mod tests {
             "the resume fast-forwarded"
         );
         r.file("w2.txt");
+        r.git(&["update-ref", "refs/sirius/held/amt-1", &h1]);
+        assert_eq!(r.line(&b2, Some(&h1)), vec!["h0.txt", "w.txt", "w2.txt"]);
+        // A commit-message hook can rewrite resume_held's merge subject, and a
+        // human can branch the held sha to inspect it: recognition is by the
+        // issue's own refs, so neither hides h0's work.
+        r.git(&["branch", "inspect-x", &h0]);
         assert_eq!(r.line(&b2, Some(&h1)), vec!["h0.txt", "w.txt", "w2.txt"]);
         r.drop();
     }
@@ -944,6 +990,53 @@ mod tests {
         r.git(&["merge", "-q", "--no-ff", "--no-edit", &main_tip]);
         r.file("mine.txt");
         assert_eq!(r.line(&base, None), vec!["mine.txt"]);
+        r.drop();
+    }
+
+    /// A resume merge whose subject a commit-msg hook rewrote is still a
+    /// resume: it is recognised by the issue's held ref, not by its message.
+    #[test]
+    fn fleet_line_follows_a_resume_merge_with_a_rewritten_subject() {
+        let r = Repo::new("hooked");
+        let b1 = r.file("base.txt");
+        r.git(&["switch", "-q", "--detach", &b1]);
+        let h0 = r.file("h0.txt");
+        r.git(&["switch", "-q", "main"]);
+        r.file("landed1.txt");
+        let b2 = r.git(&["rev-parse", "HEAD"]);
+        r.git(&["switch", "-q", "--detach", &b2]);
+        r.git(&["merge", "-q", "--no-edit", "-m", "[AMT-1] resumed", &h0]);
+        let h1 = r.file("w.txt");
+        r.git(&["switch", "-q", "--detach", &b2]);
+        r.git(&["merge", "-q", "--no-edit", &h1]); // fast-forward
+        r.file("w2.txt");
+        r.git(&["update-ref", "refs/sirius/held/amt-1", &h1]);
+        assert_eq!(r.line(&b2, Some(&h1)), vec!["h0.txt", "w.txt", "w2.txt"]);
+        // Another issue's refs never vouch for it: `amt-10` is not `amt-1`.
+        r.git(&["update-ref", "-d", "refs/sirius/held/amt-1"]);
+        r.git(&["update-ref", "refs/sirius/held/amt-10", &h1]);
+        assert_eq!(r.line(&b2, Some(&h1)), vec!["w.txt", "w2.txt"]);
+        r.drop();
+    }
+
+    /// The base brought in by FAST-FORWARD (main moved linearly) leaves no
+    /// merge commit to recognise: commits on the base branch are excluded
+    /// outright, so main's own commits are never stamped.
+    #[test]
+    fn fleet_line_excludes_base_commits_brought_in_by_fast_forward() {
+        let r = Repo::new("ffbase");
+        let base = r.file("base.txt");
+        r.git(&["switch", "-q", "main"]);
+        let main_tip = r.file("other.txt");
+        r.git(&["switch", "-q", "--detach", &base]);
+        r.git(&["merge", "-q", "--no-edit", &main_tip]); // fast-forward
+        r.file("mine.txt");
+        assert_eq!(r.line(&base, None), vec!["mine.txt"]);
+        // Without a known base branch the commit cannot be told apart.
+        assert_eq!(
+            r.line_with(&base, None, Some("AMT-1"), None),
+            vec!["mine.txt", "other.txt"]
+        );
         r.drop();
     }
 

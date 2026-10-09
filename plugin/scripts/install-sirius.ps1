@@ -529,7 +529,10 @@ function Test-DirOnUserPath {
     return (Test-DirInPathString -PathValue ([Environment]::GetEnvironmentVariable('Path', 'User')) -Dir $Dir)
 }
 
-$PathAddCommand = '[Environment]::SetEnvironmentVariable(''Path'', [Environment]::GetEnvironmentVariable(''Path'',''User'') + '';' + $BinDir + ''', ''User'')'
+# Printed for the user to paste. A raw registry write that keeps Path's
+# REG_EXPAND_SZ kind (see Add-BinDirToUserPath for why the familiar
+# SetEnvironmentVariable('Path', ...) one-liner must NOT be suggested).
+$PathAddCommand = '$d=''' + $BinDir.Replace("'", "''") + '''; $k=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Environment"); $p=[string]$k.GetValue("Path","",[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames); $k.SetValue("Path",($p.TrimEnd(";")+";"+$d).TrimStart(";"),[Microsoft.Win32.RegistryValueKind]::ExpandString); $k.Close(); [Environment]::SetEnvironmentVariable("SIRIUS_PATH_BROADCAST",$null,"User")'
 
 function Add-BinDirToUserPath {
     # Writes the USER (not machine) Path only - no elevation, no other user

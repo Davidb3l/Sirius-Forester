@@ -312,6 +312,8 @@ fn cmd_link(
         .ok()
         .and_then(|_| std::env::var("SIRIUS_BASE").ok());
     let resumed_from = std::env::var("SIRIUS_RESUMED_FROM").ok();
+    let issue_env = std::env::var("SIRIUS_ISSUE").ok();
+    let base_ref_env = std::env::var("SIRIUS_BASE_REF").ok();
     if changed {
         match gitrange::changed_symbols(
             runner,
@@ -320,6 +322,8 @@ fn cmd_link(
             fleet_base.as_deref().map(|base| gitrange::FleetBase {
                 base,
                 resumed_from: resumed_from.as_deref(),
+                issue: issue_env.as_deref(),
+                base_ref: base_ref_env.as_deref(),
             }),
         ) {
             Ok(c) => {
