@@ -7,8 +7,8 @@ relatedFiles: ["src/ledger.rs"]
 anchors: []
 evidence: []
 refs: []
-verifiedCommit: "174510b28ba1e88de7fd5e4b411317da8d6d26e6"
-verifiedAt: "2026-10-04T18:26:30.131Z"
+verifiedCommit: "b7d14b18bd2a4b39a35b93589ea97b1df0ccff8e"
+verifiedAt: "2026-10-09T01:52:26.928Z"
 driftSuspectSince: ""
 driftSuspectReason: ""
 createdAt: 1785915503544
@@ -28,7 +28,7 @@ Parallel fleet workers each hold their own connection; WAL plus a 5-second `busy
 
 `Ledger::open` refuses a missing **or uninitialized** db: it opens without SQLite's CREATE flag and probes `meta.schema_version` before handing the connection out. A zero-byte or never-init'ed file used to "open" fine and then fail every write — each failure swallowed at its call site, which is how a fleet once ran for hours against a permanently-empty ledger with zero diagnostics. Failed ledger writes in the loop now also warn on stderr (`ledger_warn` in `src/run.rs`).
 
-## Six tables
+## The tables
 
 | Table | Holds |
 |---|---|
@@ -40,7 +40,7 @@ Parallel fleet workers each hold their own connection; WAL plus a 5-second `busy
 | `policy_events` | why the policy engine did what it did |
 | `review_rounds` | one row per review attempt (SIRF-23): issue, worker, round, result (`clean`/`blocking`/`error`/`tampered`, or `fell_back` when a fleet stop on the primary tier switched the review to the fallback reviewer), confirmed/notes counts, findings JSON |
 
-`review_rounds` is **additive**: `ADDITIVE_TABLES` runs on `create` and on every `open` (`CREATE TABLE IF NOT EXISTS`), so ledgers made by older binaries gain it without a re-init, `schema_version` stays 1, and older binaries never read it.
+`review_rounds`, `escapes`, `escape_kinds_automated`, and `canary_runs` are **additive**: `ADDITIVE_TABLES` runs on `create` and on every `open` (`CREATE TABLE IF NOT EXISTS`), so ledgers made by older binaries gain them without a re-init, `schema_version` stays 1, and older binaries never read them.
 
 `receipts` is created **before** `iterations` in `apply_schema`, because `iterations.receipt_id` references it and foreign keys are ON.
 
@@ -48,6 +48,7 @@ Parallel fleet workers each hold their own connection; WAL plus a 5-second `busy
 
 - `upsert_worker(id, status)` — insert-or-refresh, so a worker rejoining updates `last_seen_at` rather than erroring.
 - `start_iteration(worker, issue)` → row id; `finish_iteration(...)` fills in outcome, gate result, oracle verdicts, tokens, duration, receipt. Two calls, one row.
+- `unfinished_issue(worker)` — the issue of the worker's LATEST iteration when that iteration never finished (no `ended_at`), else `None`. A killed run leaves exactly that behind, so at launch `sirius run` reads it to pin a stale worktree's work at `refs/sirius/wip/<issue>` for that issue to resume (see [subsystems/loop](./loop)).
 - `insert_receipt(kind, ref, symbols, forward_ok, reverse_ok, worker)` → row id. `forward_ok` / `reverse_ok` are stored independently, so a half-landed stamp is recorded honestly rather than as a success or a failure.
 - `log_policy_event(iteration_id, kind, detail)` — `detail` is arbitrary JSON.
 - `insert_review_round(...)` / `review_rounds_for_issue(issue)` — the review history `sirius why <ISSUE>` prints.

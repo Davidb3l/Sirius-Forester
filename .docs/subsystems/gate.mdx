@@ -4,11 +4,11 @@ title: "The Gate — select, doubt, run, verdict"
 path: "subsystems/gate"
 tags: ["gate", "tests", "rust", "safety"]
 relatedFiles: ["src/gate.rs"]
-anchors: [{"file":"src/config.rs","symbol":"GateConfig"},{"file":"src/config.rs","symbol":"detect_test_cmd"},{"file":"src/shell.rs","symbol":"resolve_shell_from"},{"file":"src/main.rs","symbol":"cmd_gate"}]
+anchors: [{"file":"src/config.rs","symbol":"GateConfig"},{"file":"src/config.rs","symbol":"WorktreeConfig"},{"file":"src/config.rs","symbol":"detect_test_cmd"},{"file":"src/shell.rs","symbol":"resolve_shell_from"},{"file":"src/main.rs","symbol":"cmd_gate"}]
 evidence: []
 refs: []
-verifiedCommit: "c38e8f247abfea0e0869ef1ce1722628990274f2"
-verifiedAt: "2026-10-08T23:09:30.142Z"
+verifiedCommit: "b7d14b18bd2a4b39a35b93589ea97b1df0ccff8e"
+verifiedAt: "2026-10-09T01:52:26.871Z"
 driftSuspectSince: ""
 driftSuspectReason: ""
 createdAt: 1785915503544
@@ -46,7 +46,7 @@ The governing rule is *"ran too much, never missed a test."*
 - the selector's own `note` raises no under-reporting flag
 - **no global-impact file changed**
 
-Anything short of all of that is *doubt*, and doubt defers to `gate.fallback`. Fleet iterations in isolated worktrees are ALWAYS doubt (the daemon's graph reflects the main checkout, not the worktree), and the `unconfigured` verdict is the one marked `structural` — the retry budget skips it, since no fresh agent attempt can change it.
+Anything short of all of that is *doubt*, and doubt defers to `gate.fallback`. Fleet iterations in isolated worktrees are ALWAYS doubt (the daemon's graph reflects the main checkout, not the worktree) — `evaluate_isolated` skips selection with a reason that reads as the routine note it is (`selection skipped in an isolated worktree (the code graph watches the main checkout) — ran the full suite`, or the `fail` / `pass-with-warning` equivalent), not as a cause of failure — and the `unconfigured` verdict is the one marked `structural` — the retry budget skips it, since no fresh agent attempt can change it.
 
 `note_is_suspect` matches the selector's self-reported caveats: `stale`, `cold`, `under-report`, `under report`, `under_report`, `no traces`, `may under`. This matters in practice — an untraced index emits `"no traces yet — static only, may UNDER-report"`, and that alone forces the full suite even when the selection looks narrow and healthy.
 
@@ -81,11 +81,31 @@ To keep that state rare, `sirius init` writes a starter config with `gate.test_c
 
 Subset ids are quoted for the resolved shell (`shell_quote`): ids made only of `[A-Za-z0-9_\-./:=]` pass bare; otherwise POSIX single quotes, or for `cmd.exe` MSVC-quoting with every cmd metacharacter (quotes and `%` included) caret-escaped (`cmd_quote`). `execute_plan` takes the shell as a parameter, so gate tests pin `ShellCmd::posix_sh()` instead of depending on the developer's box. A shell that cannot be spawned yields `reason_code: shell_spawn_failed` with `ran_tests: false` and a detail that names the shell and says it is not the test binary.
 
-Only `gate.test_cmd` and `--agent-cmd` (see [subsystems/loop](./loop)) go through this resolution; the review, integration, and review-canary spawns still run literal `sh -c`, since each wraps its command in a Sirius-built POSIX `cd "$…" || exit 1; …` script.
+Only `gate.test_cmd`, `--agent-cmd` (see [subsystems/loop](./loop)), and `worktree.setup_cmd` ([below](#environment-faults-and-worktree-setup)) go through this resolution; the review, integration, and review-canary spawns still run literal `sh -c`, since each wraps its command in a Sirius-built POSIX `cd "$…" || exit 1; …` script.
 
 ## Outcome
 
-On pass: `amt issue update --status <target>` advances the issue (a `pass-with-warning` also files its warning comment). On fail: an issue comment `sirius gate FAILED (tier …, plan …, reason <reason_code>): <reason>. <line>` is filed, where `<line>` is only the **first** of the last 20 non-empty lines of combined stdout/stderr the verdict kept as `detail`; the status is left untouched. Either way a `gate_tier` policy event lands in the ledger carrying `plan`, `reason`, `reason_code`, and `tests_run` (plus `structural` on a fail, `advanced_to` on a pass).
+On pass: `amt issue update --status <target>` advances the issue (a `pass-with-warning` also files its warning comment). On fail: an issue comment `sirius gate FAILED (tier …, plan …, reason <reason_code>): <reason>.` is filed; when the run produced output it continues `Output tail:` and the [error tail](#the-error-tail) in a Markdown fence, and when the output looks like an [environment fault](#environment-faults-and-worktree-setup) a closing line quotes the offending output line. The status is left untouched. Either way a `gate_tier` policy event lands in the ledger carrying `plan`, `reason`, `reason_code`, and `tests_run` (plus `structural`, `error_tail`, and `env_fault` as a bool on a fail; `advanced_to` on a pass).
+
+## The error tail
+
+A verdict's `detail` keeps the last 20 non-empty lines of combined stdout+stderr. `error_tail` narrows that to the last `ERROR_TAIL_LINES` (15) non-empty lines, capped at `ERROR_TAIL_MAX_BYTES` (2048) — the **end** is kept, cut onto a line boundary where one exists and marked with a leading `…`. Control characters other than newline and tab become spaces first: a NUL cannot go into an environment variable, and the fleet hands the tail to the next attempt as `SIRIUS_LAST_GATE_TAIL`. It is empty when nothing ran. `fenced` wraps it in a fence longer than any backtick run inside it, so the output cannot close its own fence.
+
+The fleet files its own failure comment, `loop_fail_comment`: `sirius: gate failed [<plan>, <reason_code>] — output tail:`, the fenced tail, then `Plan: <reason>` last — the selection note is demoted because it is never the cause of a red suite (SIRF-48). With no output (blocked, unconfigured) the reason *is* the explanation and stays inline. A note on what the env-fault re-gate did, when one was considered, is appended.
+
+## Environment faults and worktree setup
+
+A fresh fleet worktree has the tracked files and nothing else — no `node_modules`, no `.venv` — so a gate over it can fail on the *environment* rather than the code (SIRF-50). On a `tests_failed` verdict only, `env_fault_line` scans the full output and sets `GateVerdict.env_fault` to the first line that is:
+
+- a missing-dependency message: `Cannot find module`, `Cannot find package`, `ERR_MODULE_NOT_FOUND`, `ModuleNotFoundError: No module named`, `error[E0463]: can't find crate` — **except** a `Cannot find module/package` naming a relative or absolute path (`'./x'`, `'/abs/x'`, `C:\…`), which is the code importing a file that does not exist;
+- the shell reporting the test runner itself missing — `<runner>: command not found` / `<runner>: not found`, with `<runner>` the program of `test_cmd` matched as a whole word;
+- any such `not found` line when the exit code is 127.
+
+The bar is "plausibly the environment": a false positive costs one setup re-run and one re-gate, a false negative a work attempt. `sirius gate` only reports it (the comment's closing line, `env_fault: true` on the ledger event). The fleet acts on it: in a fleet worktree with a setup command, the loop re-runs setup and gates again — once per work/fix pass, without consuming a `retry_budget` attempt; still failing is an ordinary gate failure (see [subsystems/loop](./loop)).
+
+`run_setup` runs `worktree.setup_cmd` (see [subsystems/policy-config](./policy-config)) through the resolved shell in the runner's cwd — the worker's worktree — supervised by `Runner::run_agent` with a wall clock (`SetupOpts.timeout`, from `worktree.setup_timeout_secs`) and its output streamed to `SetupOpts.log_path`. A process-wide `SETUP_LOCK` serializes setups, since package managers contend on their shared caches; while it waits for a sibling's setup, and while it runs, the heartbeat callback fires every `heartbeat_interval`, so the caller's leases do not lapse. `Err` names the command and carries its exit code or the timeout, plus an error tail read back from the log.
+
+`setup_fingerprint` is `git ls-tree HEAD --` over `SETUP_LOCKFILES` (`bun.lock`, `bun.lockb`, `pnpm-lock.yaml`, `yarn.lock`, `package-lock.json`, `uv.lock`). `write_setup_stamp` records it as `sirius-setup-stamp` inside the worktree's git dir — never a file the work could commit — and `setup_is_stale` reports a mismatch, so an iteration whose fresh base changed a lockfile re-runs setup. With no stamp to compare, it reports not stale.
 
 ## Reason codes and exit 3
 

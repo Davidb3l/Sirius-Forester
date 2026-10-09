@@ -20,8 +20,8 @@
       "anchors": [],
       "evidence": [],
       "refs": [],
-      "verifiedCommit": "bb69e4246d340fa05fec08746290cb0a4b6bef22",
-      "verifiedAt": "2026-10-09T00:18:23.907Z",
+      "verifiedCommit": "b7d14b18bd2a4b39a35b93589ea97b1df0ccff8e",
+      "verifiedAt": "2026-10-09T01:52:26.855Z",
       "driftSuspectSince": "",
       "driftSuspectReason": "",
       "createdAt": 1785915503544,
@@ -48,6 +48,10 @@
         },
         {
           "file": "src/config.rs",
+          "symbol": "WorktreeConfig"
+        },
+        {
+          "file": "src/config.rs",
           "symbol": "detect_test_cmd"
         },
         {
@@ -61,8 +65,8 @@
       ],
       "evidence": [],
       "refs": [],
-      "verifiedCommit": "c38e8f247abfea0e0869ef1ce1722628990274f2",
-      "verifiedAt": "2026-10-08T23:09:30.142Z",
+      "verifiedCommit": "b7d14b18bd2a4b39a35b93589ea97b1df0ccff8e",
+      "verifiedAt": "2026-10-09T01:52:26.871Z",
       "driftSuspectSince": "",
       "driftSuspectReason": "",
       "createdAt": 1785915503544,
@@ -85,8 +89,8 @@
       "anchors": [],
       "evidence": [],
       "refs": [],
-      "verifiedCommit": "174510b28ba1e88de7fd5e4b411317da8d6d26e6",
-      "verifiedAt": "2026-10-04T18:26:30.131Z",
+      "verifiedCommit": "b7d14b18bd2a4b39a35b93589ea97b1df0ccff8e",
+      "verifiedAt": "2026-10-09T01:52:26.928Z",
       "driftSuspectSince": "",
       "driftSuspectReason": "",
       "createdAt": 1785915503544,
@@ -126,12 +130,40 @@
         {
           "file": "src/gitrange.rs",
           "symbol": "git_path"
+        },
+        {
+          "file": "src/main.rs",
+          "symbol": "worker_loop"
+        },
+        {
+          "file": "src/main.rs",
+          "symbol": "resolve_workers"
+        },
+        {
+          "file": "src/shell.rs",
+          "symbol": "worktree_probe"
+        },
+        {
+          "file": "src/shell.rs",
+          "symbol": "bg_tasks_killed_in"
+        },
+        {
+          "file": "src/config.rs",
+          "symbol": "agent_timeouts"
+        },
+        {
+          "file": "src/ledger.rs",
+          "symbol": "unfinished_issue"
+        },
+        {
+          "file": "src/gate.rs",
+          "symbol": "setup_is_stale"
         }
       ],
       "evidence": [],
       "refs": [],
-      "verifiedCommit": "bb69e4246d340fa05fec08746290cb0a4b6bef22",
-      "verifiedAt": "2026-10-09T00:18:23.924Z",
+      "verifiedCommit": "b7d14b18bd2a4b39a35b93589ea97b1df0ccff8e",
+      "verifiedAt": "2026-10-09T01:52:26.886Z",
       "driftSuspectSince": "",
       "driftSuspectReason": "",
       "createdAt": 1785915503544,
@@ -155,8 +187,8 @@
       "anchors": [],
       "evidence": [],
       "refs": [],
-      "verifiedCommit": "bb69e4246d340fa05fec08746290cb0a4b6bef22",
-      "verifiedAt": "2026-10-09T00:18:23.953Z",
+      "verifiedCommit": "b7d14b18bd2a4b39a35b93589ea97b1df0ccff8e",
+      "verifiedAt": "2026-10-09T01:52:26.900Z",
       "driftSuspectSince": "",
       "driftSuspectReason": "",
       "createdAt": 1785915503544,
@@ -183,12 +215,28 @@
         {
           "file": "src/gitrange.rs",
           "symbol": "fleet_line_files"
+        },
+        {
+          "file": "src/gitrange.rs",
+          "symbol": "is_resume_parent"
+        },
+        {
+          "file": "src/gitrange.rs",
+          "symbol": "foreign_commits"
+        },
+        {
+          "file": "src/gitrange.rs",
+          "symbol": "issue_refs"
+        },
+        {
+          "file": "src/gitrange.rs",
+          "symbol": "unquote_path"
         }
       ],
       "evidence": [],
       "refs": [],
-      "verifiedCommit": "36b59aabe116ce22bcdccfb36208562c95958f49",
-      "verifiedAt": "2026-10-09T00:27:38.413Z",
+      "verifiedCommit": "b7d14b18bd2a4b39a35b93589ea97b1df0ccff8e",
+      "verifiedAt": "2026-10-09T01:52:26.914Z",
       "driftSuspectSince": "",
       "driftSuspectReason": "",
       "createdAt": 1785915503544,
@@ -256,5 +304,5 @@
       "createdBy": "claude-code"
     }
   ],
-  "lastUpdated": 1791505658414
+  "lastUpdated": 1791510746928
 }

@@ -7,8 +7,8 @@ relatedFiles: ["src/config.rs", "src/shell.rs", "src/doctor.rs"]
 anchors: []
 evidence: []
 refs: []
-verifiedCommit: "bb69e4246d340fa05fec08746290cb0a4b6bef22"
-verifiedAt: "2026-10-09T00:18:23.953Z"
+verifiedCommit: "b7d14b18bd2a4b39a35b93589ea97b1df0ccff8e"
+verifiedAt: "2026-10-09T01:52:26.900Z"
 driftSuspectSince: ""
 driftSuspectReason: ""
 createdAt: 1785915503544
@@ -31,6 +31,18 @@ createdBy: "claude-code"
 
 Nothing detectable ⇒ `test_cmd` stays `null` (still a valid shape — every pre-SF-11 config has it on disk). Whenever `test_cmd` is null, `sirius doctor`'s **gating** `gate_configured` check fails (so `ok` is false) with `test_cmd_suggestion(root)`: the detected command plus the file it came from, or, with no marker, a placeholder listing the markers it looked for.
 
+The same starter config also pre-fills **`worktree.setup_cmd`** from `detect_setup_cmd(root)` (SIRF-50), so the operator sees what every fleet worktree will run. It reads root lockfiles only, first match wins, and always picks the lockfile-respecting form — setup must reproduce the base commit's tree, never re-resolve and rewrite a tracked lockfile:
+
+| Root lockfile | Detected `setup_cmd` |
+|---|---|
+| `bun.lock`, then `bun.lockb` | `bun install --frozen-lockfile` |
+| `pnpm-lock.yaml` | `pnpm install --frozen-lockfile` |
+| `yarn.lock` | `yarn install --frozen-lockfile` |
+| `package-lock.json` | `npm ci` |
+| `uv.lock` | `uv sync --frozen` |
+
+`Cargo.lock` / `go.sum` (cargo and go fetch on first build), `poetry.lock` (its virtualenv lives outside the worktree), and `requirements*.txt` (`pip install -r` mutates the active interpreter) are deliberately not detected.
+
 ## The knobs, as the struct actually defines them
 
 | Field | Default | Meaning |
@@ -42,11 +54,16 @@ Nothing detectable ⇒ `test_cmd` stays `null` (still a valid shape — every pr
 | `gate_tier` | `"safe"` | recorded in the ledger and `--json` |
 | `target_status` | `"in_review"` | where a passing gate advances an issue |
 | `retry_budget` | `3` | before an iteration is a deadend |
-| `worker_concurrency` | `3` | |
+| `worker_concurrency` | `3` | informational only (SIRF-50): `sirius run` runs `--workers N`, 1 when the flag is absent, and no longer caps the flag at this value |
 | `claim_mode` | `adaptive` | `always` / `never` / `adaptive` |
 | `gate.test_cmd` | *unset* (`sirius init` pre-fills a detected one) | full-suite command, run through the resolved shell (below). Unset or blank ⇒ fail-closed (structural `unconfigured_test_cmd`; `sirius run` refuses to start), and `sirius doctor` fails it |
 | `gate.fallback` | `full-suite` | `fail` / `pass-with-warning` also available |
-| `agent_timeout_secs` | `1800` | hard wall-clock cap on one agent run |
+| `timeouts.idle_secs` | *unset* ⇒ `1800` | kill a work/fix agent after this long with no output and no worktree change |
+| `timeouts.hard_secs` | *unset* ⇒ `10800` (3h) | kill it after this long regardless of progress |
+| `timeouts.routes` | `[]` | `[{"labels": [...], "idle_secs": …, "hard_secs": …}]` — per-ticket overrides by Ametrite label, first match wins (the `models.routes` rule, case-insensitive); a route's unset field keeps the base value |
+| `agent_timeout_secs` | *unset* | LEGACY (SIRF-41), no longer written by `sirius init`: the hard cap when `timeouts.hard_secs` is unset — except `1800`, the old init default, which is ignored. Never sets idle |
+| `worktree.setup_cmd` | *unset* (`sirius init` pre-fills a detected one) | run once in each fresh fleet worktree, through the resolved shell, before any agent. Unset/null ⇒ detected from the root lockfile at run time; `""` disables setup |
+| `worktree.setup_timeout_secs` | *unset* ⇒ `1800` | wall clock for one setup run (a stalled registry is killed, not waited on) |
 | `models.default` | *unset* | the workers' model (`--model`; `inherit` = `$SIRIUS_PARENT_MODEL`). Unset ⇒ `sirius run` refuses unless `models.allow_default` / `--allow-default-model` |
 | `models.routes` | `[]` | `[{"labels": [...], "model": "<id>"}]` — per-ticket routing by Ametrite label, first match wins |
 | `models.fix_floor` | *unset* | fix rounds of UN-routed tickets use this model |
@@ -68,20 +85,33 @@ Nothing detectable ⇒ `test_cmd` stays `null` (still a valid shape — every pr
 | `integration.timeout_secs` | `1800` | hard cap on one integration run (the whole process tree is killed) |
 | `lease_ttl_secs` | `900` | amt/hayven lease TTL |
 
-**Which shell runs `gate.test_cmd`** (`shell::resolve_shell`, SF-15 — the same rule runs `sirius run --agent-cmd`): `$SIRIUS_SHELL` if set, verbatim (a `cmd`/`command` program stem gets `/C`, anything else `-c`); otherwise `/bin/sh -c` on unix; on Windows the first `sh.exe`/`sh` on `PATH` (absolute path, `-c`), else `%ComSpec%` (`cmd.exe`) with `/C`. `bash` is never auto-probed on Windows (`System32\bash.exe` is the WSL launcher). `review.cmd` and `integration.cmd` still spawn literal `sh -c`. When `gate.test_cmd` is set, `sirius doctor`'s passing `gate_configured` line names the shell it resolved.
+**Which shell runs `gate.test_cmd`** (`shell::resolve_shell`, SF-15 — the same rule runs `sirius run --agent-cmd`, and `worktree.setup_cmd` uses it too): `$SIRIUS_SHELL` if set, verbatim (a `cmd`/`command` program stem gets `/C`, anything else `-c`); otherwise `/bin/sh -c` on unix; on Windows the first `sh.exe`/`sh` on `PATH` (absolute path, `-c`), else `%ComSpec%` (`cmd.exe`) with `/C`. `bash` is never auto-probed on Windows (`System32\bash.exe` is the WSL launcher). `review.cmd` and `integration.cmd` still spawn literal `sh -c`. When `gate.test_cmd` is set, `sirius doctor`'s passing `gate_configured` line names the shell it resolved.
 
 `backoff_delay_ms(attempt)` is `base << attempt`, clamped to `max_ms`: 500, 1000, 2000, 4000, 8000, then flat.
 
+## Agent timeouts: idle watchdog plus hard cap
+
+`Config::agent_timeouts(labels)` resolves the limits one work/fix agent runs under (SIRF-41), per field:
+
+- **hard**: the first matching `timeouts.routes[].hard_secs` > `timeouts.hard_secs` > legacy `agent_timeout_secs` (unless it is `1800`) > `DEFAULT_HARD_SECS` (10800)
+- **idle**: the first matching `timeouts.routes[].idle_secs` > `timeouts.idle_secs` > `DEFAULT_IDLE_SECS` (1800). The legacy key never sets idle.
+
+It also returns the knob that set each value (`hard_from` / `idle_from`), which `sirius doctor` names. `Config::load` rejects a `0` for any of these, the legacy key and `worktree.setup_timeout_secs` included — a zero limit would kill every agent on its first tick.
+
+The supervisor (`Runner::run_agent_watched` with a `shell::ProgressWatch`) kills an agent once it has made no **progress** for the idle window — progress is its log growing, or `shell::worktree_probe` returning a different snapshot (`HEAD` plus a hash of `git status --porcelain -uall` and the size+mtime of each listed path; ignored paths like `node_modules/` are invisible to it). One extra probe runs right before any kill. The hard cap fires regardless of progress. A kill due within `FINISH_GRACE_SECS` (60s) of a commit is deferred once by that long. The kill reports a `shell::TimeoutKind` (`idle` / `hard`). Reviewer, integration, and review-canary runs keep plain wall clocks (`review.timeout_secs`, `integration.timeout_secs`).
+
+`sirius doctor`'s advisory `agent_timeouts` check WARNs (never gates) when the effective hard cap — the default or any route's own values — is under 3600s or the idle window under 300s, naming the knob that set it, and says what became of a legacy `agent_timeout_secs` (ignored as the old default, overridden by `timeouts.hard_secs`, or acting as the hard cap).
+
 ## The timeout / lease relationship is deliberately counter-intuitive
 
-`agent_timeout_secs` (1800) **exceeds** `lease_ttl_secs` (900), and that is correct. The loop renews both leases every `heartbeat_interval_secs()` = `lease_ttl_secs / 3` (floored at 1s, so 300s by default) for as long as the agent runs, so the lease never lapses mid-run however long the cap is.
+Both limits (1800s idle, 10800s hard by default) **exceed** `lease_ttl_secs` (900), and that is correct. The loop renews both leases every `heartbeat_interval_secs()` = `lease_ttl_secs / 3` (floored at 1s, so 300s by default) for as long as the agent runs, so the lease never lapses mid-run however long the cap is.
 
-The invariant that actually matters is **`heartbeat_interval_secs < lease_ttl_secs`**, not `timeout < lease_ttl`. The timeout only bounds a hung or runaway agent; on expiry the agent process is killed and the iteration fails with a release and a deadend note.
+The invariant that actually matters is **`heartbeat_interval_secs < lease_ttl_secs`**, not `timeout < lease_ttl`. The timeouts only bound a hung or runaway agent; on a work-phase kill the issue is released back to `todo` with a deadend note, and in a fleet worktree its work is pinned at `refs/sirius/wip/<issue>` to be resumed on the next claim (see [subsystems/loop](./loop)).
 
 ## Removed knob
 
 `force_budget_tokens` was removed (SIRF-9): the loop cannot meter an agent's token spend, so the knob was never read and the `ForceWithBudget` path forces unconditionally. The `Oracle202::ForceWithBudget` variant and its behavior are unchanged — only the unused dial is gone.
 
 <Callout type="warning">
-[`CONTRACTS.md` §3](../../CONTRACTS.md) shows an older shape of this file. It omits `gate` (`test_cmd`, `fallback`), `agent_timeout_secs`, and `lease_ttl_secs`, all of which `Config` defines today. Treat `src/config.rs` as ground truth for the shape and CONTRACTS §3 as the record of intent.
+[`CONTRACTS.md` §3](../../CONTRACTS.md) shows an older shape of this file. It omits `gate` (`test_cmd`, `fallback`) and `lease_ttl_secs`, both of which `Config` defines today, and mentions legacy `agent_timeout_secs` only in a comment. Treat `src/config.rs` as ground truth for the shape and CONTRACTS §3 as the record of intent.
 </Callout>

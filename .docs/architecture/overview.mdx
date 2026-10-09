@@ -7,8 +7,8 @@ relatedFiles: ["src/main.rs", "src/cli.rs", "src/workspace.rs", "src/doctor.rs",
 anchors: []
 evidence: []
 refs: []
-verifiedCommit: "bb69e4246d340fa05fec08746290cb0a4b6bef22"
-verifiedAt: "2026-10-09T00:18:23.907Z"
+verifiedCommit: "b7d14b18bd2a4b39a35b93589ea97b1df0ccff8e"
+verifiedAt: "2026-10-09T01:52:26.855Z"
 driftSuspectSince: ""
 driftSuspectReason: ""
 createdAt: 1785915503544
@@ -54,8 +54,8 @@ Sirius never opens either parent's SQLite for writing. The console (`web/`) read
 | `src/bridge.rs` | `sirius link` / `sirius why` two-way provenance | [subsystems/provenance-bridge](../subsystems/provenance-bridge) |
 | `src/spine.rs` | The `.suite/` append-only event log | [subsystems/suite-spine](../subsystems/suite-spine) |
 | `src/amt.rs`, `src/hayven.rs` | Thin adapters over the two parent CLIs | — |
-| `src/shell.rs` | `Runner` trait + `MockRunner`, the seam every test uses; shell resolution for `gate.test_cmd` / `--agent-cmd` (`resolve_shell`, `$SIRIUS_SHELL`); the `--agent-cmd` PATH preflight (`agent_program` / `find_program`) | [subsystems/policy-config](../subsystems/policy-config) |
-| `src/doctor.rs` | `sirius doctor` — the five contract facts live, plus the gating `gate_configured` fact (SF-11: a null/blank `gate.test_cmd` flips `ok`), plus advisories `plugin_handoff`, `fleet_models`, `integration`, `plugin_version` (WARN, never gate `ok`) | — |
+| `src/shell.rs` | `Runner` trait + `MockRunner`, the seam every test uses; shell resolution for `gate.test_cmd` / `--agent-cmd` / `worktree.setup_cmd` (`resolve_shell`, `$SIRIUS_SHELL`); the `--agent-cmd` PATH preflight (`agent_program` / `find_program`); agent supervision — `run_agent` (wall clock) and `run_agent_watched` (SIRF-41: `ProgressWatch` idle watchdog over `worktree_probe` snapshots, hard cap, finish grace; the kill reports a `TimeoutKind`); `BG_WAIT_CEILING_ENV` (exported as `0` so the agent CLI never kills its own background tasks) and `bg_tasks_killed_in` (SIRF-52: detects that it did) | [subsystems/policy-config](../subsystems/policy-config) |
+| `src/doctor.rs` | `sirius doctor` — the five contract facts live, plus the gating `gate_configured` fact (SF-11: a null/blank `gate.test_cmd` flips `ok`), plus advisories `plugin_handoff`, `fleet_models`, `integration`, `plugin_version`, `agent_timeouts` (WARN, never gate `ok`) — eleven checks in all | — |
 | `src/gitrange.rs` | Changed-file resolution from a git range | — |
 | `src/models.rs` | Fleet model selection (SIRF-26): launch-time resolution + refusal, per-ticket label routing, fix floor, alias check, usage-limit detection | [subsystems/loop](../subsystems/loop) |
 | `src/review.rs` | The review stage's pure half: findings/fix JSON contracts, blocking rule, skip globs, prompt rendering, round bookkeeping | [subsystems/loop](../subsystems/loop) |
@@ -69,18 +69,18 @@ Sirius never opens either parent's SQLite for writing. The console (`web/`) read
 `src/cli.rs` defines exactly nine (`Init`, `Doctor`, `Link`, `Why`, `Gate`, `Escape`, `ReviewCanary`, `Integrate`, `Run`). Every one takes `--json`.
 
 ```
-sirius init            create .sirius/sirius.db beside an existing .ametrite/ (+ config.json with a detected gate.test_cmd, if absent)
-sirius doctor          five contract facts live + gate_configured; advisories: plugin handoff, fleet models, integration red, plugin version
+sirius init            create .sirius/sirius.db beside an existing .ametrite/ (+ config.json with a detected gate.test_cmd and worktree.setup_cmd, if absent)
+sirius doctor          five contract facts live + gate_configured; advisories: plugin handoff, fleet models, integration red, plugin version, agent timeouts
 sirius link <AMT-n>    stamp two-way provenance (--decision D-n for decisions)
 sirius why <target>    explain a symbol's issues/decisions, or an issue's symbols
 sirius gate <AMT-n>    select affected tests, run them, advance on pass
 sirius escape <AMT-n>  record a defect that got past review (--automated-by retires a kind; --list)
 sirius review-canary   replay escapes + patch canaries through the reviewer, report recall
 sirius integrate       build the integration frontier, run integration.cmd on it (red → issue + optional stop-the-line)
-sirius run             the loop, --workers N --agent-cmd "<cmd>" --model <id> [--review-cmd "<cmd>"] [--review-model <id>]
+sirius run             the loop, --workers N (default 1) --agent-cmd "<cmd>" --model <id> [--review-cmd "<cmd>"] [--review-model <id>]
 ```
 
-Exit codes follow the suite convention: `0` ok, `1` operational failure, `2` usage error, `3` soft-block; `sirius run` adds `4` = the fleet paused on a fleet-wide stop (`models::fleet_stop`: a usage/plan limit, a model the agent CLI cannot run, or a logged-out agent CLI — or integration red under `on_fail: block`). `sirius run` also exits `2` up front when `--agent-cmd`'s program is not on `PATH` (a command too dynamic to read statically skips this preflight). An unconfigured gate is still exit `3`; `sirius gate --json` carries `reason_code` / `structural` to tell it apart from a real failure. `sirius doctor --json` is the discovery handshake and deliberately **exits 0 even when unhealthy** — a peer that exits non-zero is read as ABSENT, so an unhealthy-but-present tool must report its health in the envelope body, not the exit code (`doctor_exit_code` in `src/main.rs`).
+Exit codes follow the suite convention: `0` ok, `1` operational failure, `2` usage error, `3` soft-block; `sirius run` adds `4` = the fleet paused on a fleet-wide stop (`models::fleet_stop`: a usage/plan limit, a model the agent CLI cannot run, or a logged-out agent CLI — or integration red under `on_fail: block`). `sirius run` also exits `2` up front when `--agent-cmd`'s program is not on `PATH` (a command too dynamic to read statically skips this preflight), and exits `1` when a worker's worktree setup (`worktree.setup_cmd`) fails — at once if it failed for every worker; otherwise the other workers still run and the launch ends `1` (or `4`, if a fleet-wide stop paused it). An unconfigured gate is still exit `3`; `sirius gate --json` carries `reason_code` / `structural` to tell it apart from a real failure. `sirius doctor --json` is the discovery handshake and deliberately **exits 0 even when unhealthy** — a peer that exits non-zero is read as ABSENT, so an unhealthy-but-present tool must report its health in the envelope body, not the exit code (`doctor_exit_code` in `src/main.rs`).
 
 ## Workspace discovery
 
