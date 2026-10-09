@@ -311,8 +311,16 @@ sirius run --workers N --agent-cmd "<cmd>" [--from todo] [--review-cmd "<cmd>"]
    #   "partial" when only the committed part could be pinned — or "wip_error":str when pinning
    #   failed; the release comment ends "— work preserved at <ref> (<sha12>, <diffstat>)".
    #   An agent that itself failed counts as interrupted (wip), even if the gate then failed;
-   #   resumed wip work that is then judged moves to wip-failed. A fix round's discarded
-   #   attempt is parked at wip-superseded before the revert.
+   #   so does a gate whose FINAL failure still looks like an environment fault (SIRF-50 —
+   #   after the one setup re-run, or with none configured). Resumed wip AND held work that
+   #   is then judged moves to wip-failed (the resumed refs are compare-and-deleted once
+   #   wip-failed contains them). A fix round's discarded attempt is parked at wip-superseded
+   #   before the revert. Every ref sirius removes is compare-and-deleted against the sha it
+   #   read: newer work a lost-lease worker pinned meanwhile is never deleted.
+   #   At launch, a stale worktree a killed run left behind is preserved before it is
+   #   removed (dirty, or HEAD reachable from no ref): pinned at refs/sirius/wip/<issue>
+   #   when the worker's last ledger iteration never finished, else at
+   #   refs/sirius/wip-orphaned/<worker-sanitized>/<sha12>; stderr says what was kept.
    #   Refs (issue key = 4th segment, so `sirius link --changed` counts them as the issue's own):
    #   refs/sirius/wip/<issue>        interrupted work — merged back on the next claim
    #                                  (SIRIUS_RESUMED_FROM / SIRIUS_RESUME_REF), removed once stamped

@@ -236,6 +236,25 @@ impl Ledger {
         Ok(())
     }
 
+    /// The issue of `worker_id`'s LATEST iteration when that iteration never
+    /// finished (no `ended_at`): what a killed run's worker was working on.
+    /// `None` when its last iteration finished, or it has none.
+    pub fn unfinished_issue(&self, worker_id: &str) -> rusqlite::Result<Option<String>> {
+        let row: Option<(Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT issue_ref, ended_at FROM iterations
+                 WHERE worker_id = ?1 ORDER BY id DESC LIMIT 1",
+                [worker_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(match row {
+            Some((Some(issue), None)) if !issue.trim().is_empty() => Some(issue),
+            _ => None,
+        })
+    }
+
     // ---- policy events -------------------------------------------------
 
     pub fn log_policy_event(
@@ -713,6 +732,32 @@ mod tests {
         assert_eq!(symbols, "[\"a\",\"b\"]");
         assert_eq!(fwd, 1);
         assert_eq!(rev, 0);
+    }
+
+    #[test]
+    fn unfinished_issue_is_the_latest_iteration_only_if_it_never_ended() {
+        let led = Ledger::open_in_memory().unwrap();
+        led.upsert_worker("sirius/oak", "working").unwrap();
+        led.upsert_worker("sirius/elm", "working").unwrap();
+        assert_eq!(led.unfinished_issue("sirius/oak").unwrap(), None);
+        let a = led.start_iteration("sirius/oak", Some("AMT-1")).unwrap();
+        assert_eq!(
+            led.unfinished_issue("sirius/oak").unwrap().as_deref(),
+            Some("AMT-1")
+        );
+        led.finish_iteration(a, &[], "completed", None, &[], None, None, None)
+            .unwrap();
+        assert_eq!(led.unfinished_issue("sirius/oak").unwrap(), None);
+        led.start_iteration("sirius/oak", Some("AMT-2")).unwrap();
+        led.start_iteration("sirius/elm", Some("AMT-3")).unwrap();
+        assert_eq!(
+            led.unfinished_issue("sirius/oak").unwrap().as_deref(),
+            Some("AMT-2")
+        );
+        assert_eq!(
+            led.unfinished_issue("sirius/elm").unwrap().as_deref(),
+            Some("AMT-3")
+        );
     }
 
     #[test]

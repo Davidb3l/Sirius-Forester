@@ -1166,6 +1166,9 @@ fn cmd_run(
     };
     let worktrees_root = sirius_abs.join("worktrees");
     let _ = repo_runner.run("git", &["worktree", "prune"]);
+    // SIRF-41: what a killed run's worker was working on (its unfinished
+    // iteration), so its stale worktree's work resumes with that issue.
+    let stale_ledger = Ledger::open(&ws.ledger_path()).ok();
     let mut assignments: Vec<(String, std::path::PathBuf)> = Vec::new();
     for name in &names {
         let wt_path = worktrees_root.join(name.replace('/', "-"));
@@ -1174,9 +1177,9 @@ fn cmd_run(
         // rewrites to `//?/C:/...` and then cannot create. That failed every
         // worker at the worktree step — no fleet on Windows at all (SF-16).
         let wt_str = gitrange::git_path(&wt_path);
-        // Clear any stale worktree left by a killed run, then create fresh.
-        let _ = repo_runner.run("git", &["worktree", "remove", "--force", &wt_str]);
-        let _ = std::fs::remove_dir_all(&wt_path);
+        // Clear any stale worktree left by a killed run — its work pinned
+        // first, never destroyed (SIRF-41) — then create fresh.
+        run::clear_stale_worktree(&repo_runner, &wt_path, name, stale_ledger.as_ref());
         // NO silent fallback to the shared checkout — that would be the
         // unsound configuration the isolation design exists to prevent.
         if let Err(e) = gitrange::run_git(

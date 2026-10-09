@@ -261,9 +261,10 @@ pub struct FleetBase<'a> {
     pub base_ref: Option<&'a str>,
 }
 
-/// How many resume merges [`fleet_line_files`] follows back. Each is one
-/// earlier hold of the same issue; a chain longer than this is pathological.
-const MAX_RESUME_DEPTH: usize = 8;
+/// How many resume merges [`fleet_line_files`] follows in all. Each is one
+/// earlier hold or preserve of the same issue (a claim can stack two: held,
+/// then wip); more than this is pathological.
+const MAX_RESUME_MERGES: usize = 16;
 
 /// The files this issue's own commits touched since the fleet base.
 ///
@@ -276,14 +277,19 @@ const MAX_RESUME_DEPTH: usize = 8;
 /// covers a worker that brought the base in by fast-forward or rebase — no
 /// merge commit there to recognise.
 ///
-/// Held or wip work resumed from an earlier hold is the one second parent that
-/// IS this issue's: `resume_held` merges it before the agent runs, so that
-/// merge sits at the BOTTOM of the line. It is followed when its second parent
-/// is the one `$SIRIUS_RESUMED_FROM` names, or is contained in one of this
-/// issue's own refs (`sirius/<issue>`, `refs/sirius/<kind>/<issue>[/…]`) —
-/// ancestry sirius itself recorded, so neither a commit-message hook nor a
-/// human's branch on the held sha can hide it. A worker's own merge of the
-/// base or of a sibling is never in those refs, and is not followed.
+/// Held or wip work resumed from an earlier hold is the second parent that IS
+/// this issue's: `resume_work` merges it before the agent runs — the held
+/// commit, then the preserved wip on top when the wip does not contain it, so
+/// a line can carry STACKED resume merges, and an agent can merge its
+/// `$SIRIUS_PRIOR_WORK` mid-line. EVERY first-parent merge on the line is
+/// therefore checked, and followed (its second parent's own line walked the
+/// same way) when that parent is the one `$SIRIUS_RESUMED_FROM` names, or is
+/// contained in one of this issue's own refs (`sirius/<issue>`,
+/// `refs/sirius/<kind>/<issue>[/…]`) — ancestry sirius itself recorded, so
+/// neither a commit-message hook nor a human's branch on the held sha can
+/// hide it. A worker's own merge of the base or of a sibling is never in
+/// those refs, and is not followed. Followed lines still lose landed and
+/// foreign commits.
 fn fleet_line_files(runner: &dyn Runner, f: FleetBase<'_>) -> Result<Vec<String>, String> {
     let landed: Vec<String> = match f.base_ref.map(str::trim).filter(|r| !r.is_empty()) {
         Some(r) => match run_git(
@@ -323,10 +329,15 @@ fn fleet_line_files(runner: &dyn Runner, f: FleetBase<'_>) -> Result<Vec<String>
     } else {
         foreign_commits(runner, f.base, &own_tips, &landed)?
     };
+    let named = f.resumed_from.map(str::trim).filter(|r| !r.is_empty());
     let mut files: Vec<String> = Vec::new();
-    let mut tip = "HEAD".to_string();
-    let mut expect_parent = f.resumed_from.map(str::trim).filter(|r| !r.is_empty());
-    for _ in 0..=MAX_RESUME_DEPTH {
+    // Lines still to walk (HEAD's, then every resume merge's second parent),
+    // and every tip already queued — a sha reachable by two resume merges is
+    // walked once.
+    let mut queue: std::collections::VecDeque<String> = ["HEAD".to_string()].into();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut followed = 0usize;
+    while let Some(tip) = queue.pop_front() {
         let range = format!("{}..{tip}", f.base);
         let mut log_args: Vec<&str> = vec![
             "log",
@@ -350,31 +361,34 @@ fn fleet_line_files(runner: &dyn Runner, f: FleetBase<'_>) -> Result<Vec<String>
                 files.push(x);
             }
         }
-        let mut line_args: Vec<&str> = vec!["rev-list", "--first-parent", &range];
+        // Every merge on this line (oldest first, so the bottom resume is
+        // followed before anything stacked above it): `<sha> <p1> <p2> …`.
+        let mut line_args: Vec<&str> = vec![
+            "rev-list",
+            "--first-parent",
+            "--parents",
+            "--reverse",
+            &range,
+        ];
         line_args.extend(landed.iter().map(String::as_str));
-        let Some(bottom) = stdout_lines(&run_git(runner, &line_args)?).pop() else {
-            break;
-        };
-        let parents = run_git(runner, &["rev-list", "--parents", "-n", "1", &bottom])?;
-        let parents: Vec<String> = parents
-            .stdout
-            .split_whitespace()
-            .map(String::from)
-            .collect();
-        let Some(second) = parents.get(2) else {
-            break; // the bottom is an ordinary commit: the line ends here
-        };
-        let named =
-            expect_parent.is_some_and(|r| second.starts_with(r) || r.starts_with(second.as_str()));
-        let is_resume = named
-            || own_refs
-                .iter()
-                .any(|r| run_git(runner, &["merge-base", "--is-ancestor", second, r]).is_ok());
-        if !is_resume {
-            break;
+        for l in stdout_lines(&run_git(runner, &line_args)?) {
+            for second in l.split_whitespace().skip(2) {
+                if followed >= MAX_RESUME_MERGES || seen.contains(second) {
+                    continue;
+                }
+                let is_named =
+                    named.is_some_and(|r| second.starts_with(r) || r.starts_with(second));
+                let is_resume = is_named
+                    || own_refs.iter().any(|r| {
+                        run_git(runner, &["merge-base", "--is-ancestor", second, r]).is_ok()
+                    });
+                if is_resume {
+                    seen.insert(second.to_string());
+                    followed += 1;
+                    queue.push_back(second.to_string());
+                }
+            }
         }
-        expect_parent = None;
-        tip = second.clone();
     }
     Ok(files)
 }
@@ -1216,6 +1230,52 @@ mod tests {
         r.git(&["merge", "-q", "--no-ff", "--no-edit", &main_tip]);
         r.file("mine.txt");
         assert_eq!(r.line(&base, None), vec!["mine.txt"]);
+        r.drop();
+    }
+
+    /// A claim that resumes held work AND a preserved wip that does not
+    /// contain it stacks two resume merges; the wip merge sits mid-line,
+    /// above the held one. Both lines are this issue's work.
+    #[test]
+    fn fleet_line_follows_stacked_held_and_wip_resume_merges() {
+        let r = Repo::new("stacked");
+        let b1 = r.file("base.txt");
+        r.git(&["switch", "-q", "--detach", &b1]);
+        let held = r.file("h.txt");
+        r.git(&["update-ref", "refs/sirius/held/amt-1", &held]);
+        r.git(&["switch", "-q", "--detach", &b1]);
+        let wip = r.file("w.txt");
+        r.git(&["update-ref", "refs/sirius/wip/amt-1", &wip]);
+        r.git(&["switch", "-q", "main"]);
+        let b2 = r.file("landed.txt");
+        r.git(&["switch", "-q", "--detach", &b2]);
+        r.git(&["merge", "-q", "--no-edit", &held]);
+        r.git(&["merge", "-q", "--no-edit", &wip]);
+        r.file("mine.txt");
+        assert_eq!(r.line(&b2, Some(&wip)), vec!["h.txt", "mine.txt", "w.txt"]);
+        // Recognised by the issue's refs alone, too (no RESUMED_FROM).
+        assert_eq!(r.line(&b2, None), vec!["h.txt", "mine.txt", "w.txt"]);
+        r.drop();
+    }
+
+    /// An agent that merges its `$SIRIUS_PRIOR_WORK` (wip-failed) mid-line
+    /// gets that work stamped; a sibling merged the same way does not.
+    #[test]
+    fn fleet_line_follows_prior_work_merged_mid_line_but_not_a_sibling() {
+        let r = Repo::new("midprior");
+        let b1 = r.file("base.txt");
+        r.git(&["switch", "-q", "--detach", &b1]);
+        let prior = r.file("p.txt");
+        r.git(&["update-ref", "refs/sirius/wip-failed/amt-1", &prior]);
+        r.git(&["switch", "-q", "--detach", &b1]);
+        let sib = r.file("sib.txt");
+        r.git(&["branch", "sirius/amt-2", &sib]);
+        r.git(&["switch", "-q", "--detach", &b1]);
+        r.file("mine.txt");
+        r.git(&["merge", "-q", "--no-edit", &prior]);
+        r.git(&["merge", "-q", "--no-edit", "sirius/amt-2"]);
+        r.file("mine2.txt");
+        assert_eq!(r.line(&b1, None), vec!["mine.txt", "mine2.txt", "p.txt"]);
         r.drop();
     }
 }
