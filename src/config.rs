@@ -387,6 +387,8 @@ pub struct Config {
     pub target_status: String,
     #[serde(default = "default_retry_budget")]
     pub retry_budget: u32,
+    /// Informational since SIRF-50: `sirius run` runs `--workers N` (1 when
+    /// the flag is absent) and no longer caps the flag at this value.
     #[serde(default = "default_worker_concurrency")]
     pub worker_concurrency: u32,
     #[serde(default)]

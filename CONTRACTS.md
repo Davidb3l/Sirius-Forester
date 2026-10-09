@@ -255,10 +255,10 @@ sirius integrate [--clear-red] [--json]   # SIRF-32 — build the frontier, run 
 sirius run --workers N --agent-cmd "<cmd>" [--from todo] [--review-cmd "<cmd>"]
            [--model <id>|inherit] [--review-model <id>|inherit] [--allow-default-model] --json
    # first event: {"event":"fleet","phase":"start","models":{"default","source","review","fix_floor","routes","fallback"},
-   #   "workers":N,"workers_source":"flag|worker_concurrency","workers_why":str,
+   #   "workers":N,"workers_source":"flag|default","workers_why":str,
    #   "setup":{"cmd":str,"detected_from":str|null,"failed":[worker]}|null}   (SIRF-50, additive)
-   # --workers N WINS over worker_concurrency, which is the count only when the flag is
-   # absent (SIRF-50; it used to cap the flag silently); stderr says "workers: N (<why>)".
+   # --workers N is the count — worker_concurrency no longer caps it (SIRF-50; it used to,
+   # silently); no flag ⇒ 1 worker, as always. stderr says "workers: N (<why>)".
    # SIRF-50: after creating each worktree, worktree.setup_cmd (unset ⇒ detected from the
    # lockfile, "" ⇒ none) runs in it through the gate's shell, serially, before any agent.
    # A worker whose setup fails does not start: {"event":"fleet","phase":"setup_failed",

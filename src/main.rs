@@ -1675,7 +1675,7 @@ impl Write for StdoutLineWriter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WorkerCount {
     count: u32,
-    /// `"flag"` or `"worker_concurrency"` — on the `fleet` start event.
+    /// `"flag"` or `"default"` — on the `fleet` start event.
     source: &'static str,
     /// Human explanation for stderr and the start event.
     why: String,
@@ -1691,7 +1691,8 @@ fn resolve_workers(flag: Option<u32>, worker_concurrency: u32) -> WorkerCount {
             let why = if n == 0 {
                 "--workers 0 raised to 1".to_string()
             } else if n > worker_concurrency {
-                format!("--workers; overrides worker_concurrency {worker_concurrency}")
+                // It used to CAP the flag silently (SIRF-50) — say it no longer does.
+                format!("--workers; above worker_concurrency {worker_concurrency}, which no longer caps it")
             } else {
                 "--workers".to_string()
             };
@@ -1701,12 +1702,12 @@ fn resolve_workers(flag: Option<u32>, worker_concurrency: u32) -> WorkerCount {
                 why,
             }
         }
+        // No flag ⇒ ONE worker, as always: worker_concurrency is not a
+        // default, so a plain `sirius run` never multiplies agent spend.
         None => WorkerCount {
-            count: worker_concurrency.max(1),
-            source: "worker_concurrency",
-            why: format!(
-                "worker_concurrency {worker_concurrency} from .sirius/config.json (or its default); pass --workers N to override"
-            ),
+            count: 1,
+            source: "default",
+            why: "default; pass --workers N to run more in parallel".to_string(),
         },
     }
 }
@@ -1815,25 +1816,20 @@ mod tests {
     }
 
     // SIRF-50 #2: `--workers 4` with worker_concurrency 3 ran 3, silently.
-    // The flag wins; the config is only the default; either way it says why.
+    // The flag wins; without it one worker runs; either way it says why.
     #[test]
     fn explicit_workers_flag_wins_over_worker_concurrency() {
         let w = resolve_workers(Some(4), 3);
         assert_eq!((w.count, w.source), (4, "flag"));
-        assert!(
-            w.why.contains("overrides worker_concurrency 3"),
-            "{}",
-            w.why
-        );
+        assert!(w.why.contains("above worker_concurrency 3"), "{}", w.why);
         let w = resolve_workers(Some(2), 3);
         assert_eq!(
             (w.count, w.source, w.why.as_str()),
             (2, "flag", "--workers")
         );
-        // Absent flag ⇒ the config's count, and the reason names it.
+        // Absent flag ⇒ one worker, whatever worker_concurrency says.
         let w = resolve_workers(None, 5);
-        assert_eq!((w.count, w.source), (5, "worker_concurrency"));
-        assert!(w.why.contains("worker_concurrency 5"), "{}", w.why);
+        assert_eq!((w.count, w.source), (1, "default"));
         assert!(w.why.contains("--workers"), "{}", w.why);
         // Never zero workers.
         assert_eq!(resolve_workers(Some(0), 3).count, 1);
