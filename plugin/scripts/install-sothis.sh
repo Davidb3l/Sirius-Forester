@@ -410,7 +410,19 @@ install_hayven() {
     log "hayven: installing via local install-hayven.sh ($local_installer)"
     set --
     [ "$PREFIX_EXPLICIT" = "1" ] && set -- --prefix "$PREFIX"
-    sh "$local_installer" "$@" || hayven_failed "install-hayven.sh failed"
+    # Same interrupt rule as the fetched path below: Ctrl-C must STOP the run.
+    # hayven's own installer traps INT for cleanup and then exits normally, so
+    # bash would otherwise see an ordinary failure and carry on (on Windows,
+    # into the warn-and-continue path and on to plugin installs).
+    hayven_rc=0
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    sh "$local_installer" "$@" || hayven_rc=$?
+    trap - INT TERM
+    if [ "$hayven_rc" -gt 128 ]; then
+      fail "install-hayven.sh was interrupted (exit $hayven_rc) — stopping"
+    fi
+    [ "$hayven_rc" = "0" ] || hayven_failed "install-hayven.sh failed (exit $hayven_rc)"
     return 0
   fi
   url="https://raw.githubusercontent.com/$HAYVEN_REPO/$HAYVEN_INSTALLER_REF/plugin/scripts/install-hayven.sh"

@@ -258,7 +258,17 @@ fn fleet_line_files(runner: &dyn Runner, f: FleetBase<'_>) -> Result<Vec<String>
         },
         None => Vec::new(),
     };
-    let own_refs = issue_refs(runner, f.issue)?;
+    let (own_refs, other_refs) = issue_refs(runner, f.issue)?;
+    // What this iteration resumed is this issue's work by definition, held
+    // by whatever ref: never foreign.
+    let mut own_tips = own_refs.clone();
+    own_tips.extend(
+        f.resumed_from
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .map(String::from),
+    );
+    let foreign = foreign_commits(runner, f.base, &own_tips, &other_refs, &landed)?;
     let mut files: Vec<String> = Vec::new();
     let mut tip = "HEAD".to_string();
     let mut expect_parent = f.resumed_from.map(str::trim).filter(|r| !r.is_empty());
@@ -269,12 +279,16 @@ fn fleet_line_files(runner: &dyn Runner, f: FleetBase<'_>) -> Result<Vec<String>
             "--first-parent",
             "--no-merges",
             "--name-only",
-            "--format=",
+            "--format=@%H",
             &range,
         ];
         log_args.extend(landed.iter().map(String::as_str));
+        // `@<sha>` opens each commit's file list; a foreign commit's is skipped.
+        let mut skipping = false;
         for x in stdout_lines(&run_git(runner, &log_args)?) {
-            if !files.contains(&x) {
+            if let Some(sha) = x.strip_prefix('@') {
+                skipping = foreign.contains(sha);
+            } else if !skipping && !files.contains(&x) {
                 files.push(x);
             }
         }
@@ -307,16 +321,18 @@ fn fleet_line_files(runner: &dyn Runner, f: FleetBase<'_>) -> Result<Vec<String>
     Ok(files)
 }
 
-/// This issue's own refs: its `sirius/<issue>` branch and every
-/// `refs/sirius/<kind>/<issue>` (held, held-superseded/…, wip, …). Matched on
-/// whole path segments, so `amt-1` never claims `amt-10`'s refs.
-fn issue_refs(runner: &dyn Runner, issue: Option<&str>) -> Result<Vec<String>, String> {
-    let Some(key) = issue
+/// Issue-scoped sirius refs, split into this issue's own and every other
+/// issue's: `refs/heads/sirius/<key>` and `refs/sirius/<kind>/<key>[/…]` (held,
+/// held-superseded/…, wip, …) — the key is always the 4th path segment, matched
+/// whole and case-insensitively, so `amt-1` never claims `amt-10`'s refs.
+/// Refs that name no issue (e.g. `refs/sirius/frontier`) are in neither list.
+fn issue_refs(
+    runner: &dyn Runner,
+    issue: Option<&str>,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let key = issue
         .map(|i| i.trim().to_lowercase())
-        .filter(|i| !i.is_empty())
-    else {
-        return Ok(Vec::new());
-    };
+        .filter(|i| !i.is_empty());
     let out = run_git(
         runner,
         &[
@@ -326,10 +342,44 @@ fn issue_refs(runner: &dyn Runner, issue: Option<&str>) -> Result<Vec<String>, S
             "refs/sirius/",
         ],
     )?;
-    Ok(stdout_lines(&out)
-        .into_iter()
-        .filter(|r| r.split('/').any(|seg| seg.eq_ignore_ascii_case(&key)))
-        .collect())
+    let (mut own, mut others) = (Vec::new(), Vec::new());
+    for r in stdout_lines(&out) {
+        let Some(seg) = r.split('/').nth(3) else {
+            continue;
+        };
+        if key.as_deref().is_some_and(|k| seg.eq_ignore_ascii_case(k)) {
+            own.push(r);
+        } else {
+            others.push(r);
+        }
+    }
+    Ok((own, others))
+}
+
+/// Commits only OTHER issues' refs hold: reachable from another issue's
+/// branch/held/wip ref but from none of this issue's, and not already at or
+/// below the base. A worker that fast-forwards onto a sibling's `sirius/<x>`
+/// takes those commits into its own first-parent line with no merge commit
+/// to recognise — they are the sibling's work, not this issue's. Commits this
+/// issue's refs also hold (a sibling that merged our earlier hold) stay ours.
+fn foreign_commits(
+    runner: &dyn Runner,
+    base: &str,
+    own: &[String],
+    others: &[String],
+    landed: &[String],
+) -> Result<std::collections::HashSet<String>, String> {
+    if others.is_empty() {
+        return Ok(Default::default());
+    }
+    let mut args: Vec<&str> = vec!["rev-list"];
+    args.extend(others.iter().map(String::as_str));
+    args.push("--not");
+    args.push(base);
+    args.extend(own.iter().map(String::as_str));
+    // `landed` is `["--not", <base-branch tip>]` (or empty): already negated.
+    args.extend(landed.iter().skip(1).map(String::as_str));
+    Ok(stdout_lines(&run_git(runner, &args)?).into_iter().collect())
 }
 
 /// Whether `base` names a commit HEAD descends from. Anything else — a stale
@@ -613,9 +663,10 @@ mod tests {
         assert_eq!(got.files, vec!["src/a.rs", "src/b.rs", "src/c.rs"]);
         let calls = m.recorded();
         assert!(
-            calls.iter().any(
-                |c| c == "git log --first-parent --no-merges --name-only --format= base1..HEAD"
-            ),
+            calls
+                .iter()
+                .any(|c| c
+                    == "git log --first-parent --no-merges --name-only --format=@%H base1..HEAD"),
             "{calls:?}"
         );
         assert!(!calls.iter().any(|c| c.contains("HEAD~1")), "{calls:?}");
@@ -1037,6 +1088,30 @@ mod tests {
             r.line_with(&base, None, Some("AMT-1"), None),
             vec!["mine.txt", "other.txt"]
         );
+        r.drop();
+    }
+
+    /// Fast-forwarding onto a sibling's in-flight branch brings its commits
+    /// into this line with no merge commit: they are the sibling's, excluded
+    /// because only the sibling's refs hold them. Our own earlier hold that
+    /// the sibling merged stays ours.
+    #[test]
+    fn fleet_line_excludes_a_siblings_commits_but_keeps_ours_it_merged() {
+        let r = Repo::new("sibling");
+        let base = r.file("base.txt");
+        r.git(&["switch", "-q", "--detach", &base]);
+        let h0 = r.file("h0.txt"); // this issue's earlier hold
+        r.git(&["update-ref", "refs/sirius/held/amt-1", &h0]);
+        r.git(&["switch", "-q", "--detach", &base]);
+        r.git(&["merge", "-q", "--no-edit", &h0]); // sibling builds on our hold (ff)
+        let sib = r.file("sib.txt");
+        r.git(&["branch", "sirius/amt-2", &sib]);
+        // This issue resumes h0 and then fast-forwards onto the sibling.
+        r.git(&["switch", "-q", "--detach", &base]);
+        r.git(&["merge", "-q", "--no-edit", &h0]);
+        r.git(&["merge", "-q", "--no-edit", "sirius/amt-2"]);
+        r.file("mine.txt");
+        assert_eq!(r.line(&base, Some(&h0)), vec!["h0.txt", "mine.txt"]);
         r.drop();
     }
 
