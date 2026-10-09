@@ -274,6 +274,24 @@ sirius run --workers N --agent-cmd "<cmd>" [--from todo] [--review-cmd "<cmd>"]
    # review (SIRF-23, only with review.cmd): {"phase":"review","round":N,"result":"clean|blocking|error|tampered|skipped","confirmed":K,"notes":M}
    # fix:  {"phase":"fix","round":N,"agent_ok":bool,...}  (then a re-gate, as today)
    # release gains "review":"review: 2 rounds, 4 bugs fixed, 1 rebuttal accepted" when a review ran
+   # SIRF-42: claim events carry "base_sha" (fleet): the base ref's tip at claim — the commit the
+   #   worktree is reset to (launch base when no base ref exists / it does not resolve)
+   # SIRF-41: before ANY non-advancing release (timeout, agent failure, usage limit, gate deadend,
+   #   review release, failed stamp; and a lost lease, which does not release) the worktree's
+   #   new work is committed ("sirius: wip <issue>", --no-verify) and pinned; the release
+   #   event (lease_lost included) gains "wip_ref":{"ref","sha","diffstat"} — or "wip_error":str
+   #   when pinning failed — and the release comment ends "— work preserved at <ref> (<sha12>, <diffstat>)".
+   #   Refs (issue key = 4th segment, so `sirius link --changed` counts them as the issue's own):
+   #   refs/sirius/wip/<issue>        interrupted work — merged back on the next claim
+   #                                  (SIRIUS_RESUMED_FROM / SIRIUS_RESUME_REF), removed once stamped
+   #   refs/sirius/wip-failed/<issue> gate deadend / review release — offered as SIRIUS_PRIOR_WORK,
+   #                                  never auto-merged; parked at completion if unused
+   #   refs/sirius/wip-superseded/<issue>/<sha12>  an older pin newer work does not contain
+   #   refs/sirius/wip-conflicted/<issue>          preserved work that no longer merges (fresh start)
+   # SIRF-49: an agent (or fix agent) that leaves a named branch checked out in its worktree:
+   #   pinned at refs/sirius/keep/<issue>/<branch-lowercased-sanitized>, HEAD detached in place,
+   #   the branch untouched; stderr warning +
+   #   {"event":"branch_guard","worker","issue","phase","branch","sha","ref","detached"}
 ```
 
 `--agent-cmd` and `--review-cmd` support `{issue}` / `{worker}` / `{model}` templating, and
@@ -284,7 +302,10 @@ every agent/reviewer process gets this environment (SIRF-22 #4/#5, SIRF-23):
 | `SIRIUS_ISSUE`, `SIRIUS_WORKER`, `SIRIUS_WORKTREE` | identity + the private worktree |
 | `AMT_AGENT` | `sirius/<tree>` — the agent's own `amt` writes are attributed to the worker |
 | `SIRIUS_PHASE` | `work` \| `review` \| `fix` |
-| `SIRIUS_BASE` | the launch base commit |
+| `SIRIUS_BASE` | this iteration's base commit — the tip of `SIRIUS_BASE_REF` when the issue was claimed (SIRF-42), else the launch base; the worktree was reset to it |
+| `SIRIUS_RESUMED_FROM` | (fleet) the sha of earlier work merged onto the fresh worktree before the agent ran — held (SIRF-32) or preserved interrupted work (SIRF-41); the LAST one merged |
+| `SIRIUS_RESUME_REF` | (fleet) the ref that resumed work came from (`refs/sirius/held/<issue>` or `refs/sirius/wip/<issue>`) |
+| `SIRIUS_PRIOR_WORK` | (fleet) `refs/sirius/wip-failed/<issue>`: an earlier attempt the gate or review judged and failed — kept, NOT merged; look at it, don't trust it |
 | `SIRIUS_BASE_REF` | the branch the fleet lands on (`review.base_ref`, else the launch branch); unset only when neither exists (a detached launch with no `review.base_ref`). `sirius link --changed` never stamps commits already on it |
 | `ANTHROPIC_MODEL`, `SIRIUS_MODEL` | (work, fix) this ticket's resolved worker model — Claude Code honors `ANTHROPIC_MODEL` over settings.json |
 | `ANTHROPIC_MODEL`, `SIRIUS_REVIEW_MODEL` | (review) the reviewer's model |
