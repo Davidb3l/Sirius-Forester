@@ -339,6 +339,8 @@ fn replay(cx: &Ctx, src: &Source, i: usize) -> Result<(Vec<Finding>, Vec<String>
             kv("SIRIUS_WORKTREE", &t),
             kv("SIRIUS_BASE", &cx.base),
             kv("SIRIUS_PHASE", "review"),
+            // SIRF-52: the same env a real review round gets.
+            kv(crate::shell::BG_WAIT_CEILING_ENV, "0"),
             kv("SIRIUS_REVIEW_DIR", &t),
             kv("SIRIUS_DIFF_RANGE", &format!("{}..HEAD", cx.base)),
             kv("SIRIUS_ROUND", "1"),

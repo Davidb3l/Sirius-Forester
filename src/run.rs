@@ -1128,6 +1128,7 @@ pub fn run_iteration(
                 .unwrap_or_default(),
         ),
         kv("SIRIUS_BASE", pre_head.clone().unwrap_or_default()),
+        kv(crate::shell::BG_WAIT_CEILING_ENV, "0"), // SIRF-52: sirius owns the timeout
     ];
     let mut base_env = base_env;
     if let Some(sha) = &resumed {
@@ -1244,11 +1245,20 @@ pub fn run_iteration(
                     if ran_on_fallback { "-fb" } else { "" }
                 ),
             );
+            // SIRF-41: hard cap + idle watchdog + finish grace, per label.
+            let limits = config.agent_timeouts(&labels);
             let opts = AgentRunOpts {
-                timeout: Duration::from_secs(config.agent_timeout_secs),
+                timeout: Duration::from_secs(limits.hard_secs),
                 heartbeat_interval: Duration::from_secs(config.heartbeat_interval_secs()),
                 log_path: log_path.clone(),
                 env,
+            };
+            let mut probe = || crate::shell::worktree_probe(runner);
+            let mut watch = crate::shell::ProgressWatch {
+                idle: Duration::from_secs(limits.idle_secs),
+                probe_every: Duration::from_secs((limits.idle_secs / 3).clamp(1, 30)),
+                grace: Duration::from_secs(crate::config::FINISH_GRACE_SECS),
+                probe: &mut probe,
             };
             let cmd = template_cmd(agent_cmd, &issue, worker, phase_model);
             // SF-15: the agent command is the operator's own string (template_cmd
@@ -1259,14 +1269,20 @@ pub fn run_iteration(
             // below deliberately stays on `sh`: it runs a script sirius builds in
             // POSIX syntax, which cmd.exe could not run even if we handed it over.)
             let sh = crate::shell::resolve_shell();
-            let work = runner.run_agent(
+            let work = runner.run_agent_watched(
                 &sh.program,
                 &[sh.flag.as_str(), &cmd],
                 &opts,
+                &mut watch,
                 &mut heartbeat,
             );
             let timed_out = work.as_ref().map(AgentOutcome::timed_out).unwrap_or(false);
+            let timeout_kind = work.as_ref().ok().and_then(AgentOutcome::timeout_kind);
             work_ok = work.as_ref().map(AgentOutcome::success).unwrap_or(false);
+            // SIRF-52: the CLI killed the agent's helper tasks on its way out —
+            // an INCOMPLETE run, whatever its exit code says.
+            let bg_killed = !timed_out && crate::shell::bg_tasks_killed_in(log_path.as_deref());
+            work_ok &= !bg_killed;
             // Agent exit code, from the captured output (durably logged by the runner).
             let agent_code = work.as_ref().ok().and_then(|w| w.output().code);
             // A spawn-level failure (sh missing, fork failure) used to be dropped
@@ -1278,6 +1294,12 @@ pub fn run_iteration(
             let mut ev = json!({"agent_ok": work_ok, "timed_out": timed_out, "exit": agent_code, "attempt": attempt + 1, "spawn_error": spawn_err, "model": phase_model, "tier": if ran_on_fallback { "fallback" } else { "primary" }});
             if phase != "work" {
                 ev["round"] = json!(round);
+            }
+            if let Some(k) = timeout_kind {
+                ev["timeout_kind"] = json!(k.as_str());
+            }
+            if bg_killed {
+                ev["reason"] = json!("agent_bg_tasks_killed");
             }
             emit_event(out, worker, Some(&issue), phase, ev);
 
@@ -1357,8 +1379,10 @@ pub fn run_iteration(
                     worker,
                     Some("todo"),
                     Some(&format!(
-                        "sirius: released — agent timed out after {}s (killed)",
-                        config.agent_timeout_secs
+                        "sirius: released — agent timed out: {} (killed)",
+                        timeout_kind
+                            .unwrap_or(crate::shell::TimeoutKind::Hard)
+                            .describe(limits.idle_secs, limits.hard_secs)
                     )),
                 );
                 emit_event(
@@ -1366,7 +1390,7 @@ pub fn run_iteration(
                     worker,
                     Some(&issue),
                     "release",
-                    json!({"reason": "agent_timeout", "advanced": false}),
+                    json!({"reason": "agent_timeout", "advanced": false, "timeout_kind": timeout_kind.map(crate::shell::TimeoutKind::as_str)}),
                 );
                 ledger_warn(
                     "finish_iteration",
@@ -1791,6 +1815,10 @@ pub fn run_iteration(
         Some(format!(
             "sirius: released without advancing — agent {}{}",
             match work_exit {
+                // SIRF-52: exit 0, but its helper tasks were killed unfinished.
+                Some(c) if crate::shell::bg_tasks_killed_in(work_log.as_deref()) => format!(
+                    "exited {c} but its CLI killed its still-running background tasks (agent_bg_tasks_killed) — the work is incomplete"
+                ),
                 Some(c) => format!("exited {c}"),
                 None => "did not run (spawn failure)".into(),
             },
@@ -2996,8 +3024,7 @@ pub fn run_review_stage(cx: &ReviewCtx, out: &mut dyn Write, fix_round: &FixRoun
                         (
                             rc.on_review_error,
                             format!(
-                                "the fix-mode worker timed out in round {round} (killed after {}s); reverted to the last reviewed state",
-                                cx.config.agent_timeout_secs
+                                "the fix-mode worker timed out in round {round} (killed by the agent timeout — idle or hard cap; the fix event's timeout_kind says which); reverted to the last reviewed state"
                             ),
                         )
                     } else if !work_ok {
@@ -5622,7 +5649,7 @@ mod tests {
         assert_eq!(o, IterationOutcome::Completed);
         assert!(released_with(&m, "in_review"));
         assert!(rec.iter().any(|c| c.contains("--add-label review:open")));
-        assert!(!rec.iter().any(|c| c.contains("agent timed out after")));
+        assert!(!rec.iter().any(|c| c.contains("agent timed out:")));
     }
 
     #[test]
@@ -6345,6 +6372,121 @@ mod tests {
             .unwrap();
         assert!(rel.contains("agent exited 1"), "{rel}");
         assert!(!rel.contains("gate did not pass"), "{rel}");
+    }
+
+    // ---- SIRF-41 (progress-aware timeout) / SIRF-52 (helper agents) ---------
+
+    fn release_comment(m: &MockRunner) -> String {
+        m.recorded()
+            .into_iter()
+            .find(|c| c.starts_with("amt --json release"))
+            .expect("released")
+    }
+
+    // SIRF-52: sirius owns the timeout, so the CLI's own 600s background-wait
+    // ceiling is lifted for the worker AND the reviewer.
+    #[test]
+    fn work_and_review_agents_get_an_unlimited_bg_wait_ceiling() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-140");
+        checkpoint_heads(&m, &["ck1"]);
+        m.on_phase_write("review", "SIRIUS_REVIEW_OUT", CLEAN);
+        let (o, _led, _nd) = run_fleet(&m, &review_cfg(3));
+        assert_eq!(o, IterationOutcome::Completed);
+        assert_eq!(phases(&m), vec!["work", "review"]);
+        for env in m.agent_envs() {
+            assert_eq!(
+                env_of(&env, "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS").as_deref(),
+                Some("0")
+            );
+        }
+    }
+
+    // SIRF-41 #3: a ticket's labels pick its limits (first matching route,
+    // per-field), and they reach the supervisor with the worktree probe.
+    #[test]
+    fn timeouts_route_by_label_and_reach_the_supervisor() {
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-141");
+        m.expect(
+            &["amt", "--json", "claim", "--agent"],
+            0,
+            r#"{"id":"AMT-141","title":"T","labels":["UI"]}"#,
+        );
+        let mut c = cfg();
+        c.timeouts = serde_json::from_str(
+            r#"{"idle_secs":600,"hard_secs":7200,"routes":[{"labels":["ui"],"hard_secs":14400}]}"#,
+        )
+        .unwrap();
+        m.arm_probe_calls(1);
+        let _ = run_fleet(&m, &c);
+        assert_eq!(
+            m.watches()[0],
+            (
+                Duration::from_secs(14_400),
+                Duration::from_secs(600),
+                Duration::from_secs(60)
+            )
+        );
+        // The probe run.rs hands the supervisor asks git about the worktree,
+        // without ever taking the index lock.
+        let rec = m.recorded();
+        assert!(
+            rec.iter().any(|c| c == "git rev-parse --show-toplevel"),
+            "{rec:?}"
+        );
+        assert!(
+            rec.iter()
+                .any(|c| c.starts_with("git --no-optional-locks") && c.contains("status")),
+            "{rec:?}"
+        );
+    }
+
+    // SIRF-41 #3: the release comment and NDJSON say WHICH limit fired.
+    #[test]
+    fn an_idle_kill_and_a_hard_kill_are_told_apart() {
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-142");
+        m.arm_agent_idle_timeout(0);
+        let (o, _led, nd) = run_fleet(&m, &cfg());
+        assert_eq!(o, IterationOutcome::Deadend);
+        let rel = release_comment(&m);
+        assert!(
+            rel.contains("agent idle for 1800s — no output, no file changes"),
+            "{rel}"
+        );
+        assert!(nd.contains("\"timeout_kind\":\"idle\""), "{nd}");
+        assert!(nd.contains("\"timed_out\":true"), "{nd}");
+
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-143");
+        m.arm_agent_timeout(0);
+        let (o, _led, nd) = run_fleet(&m, &cfg());
+        assert_eq!(o, IterationOutcome::Deadend);
+        let rel = release_comment(&m);
+        assert!(rel.contains("hit the hard cap of 10800s"), "{rel}");
+        assert!(nd.contains("\"timeout_kind\":\"hard\""), "{nd}");
+    }
+
+    // SIRF-52: the MSX-60 shape — exit 0, helpers killed, deliverable missing.
+    // That is an INCOMPLETE run: never advanced, and it says why.
+    #[test]
+    fn helpers_killed_by_the_cli_make_an_exit_0_run_incomplete() {
+        let m = MockRunner::new();
+        program_prefix(&m, "AMT-144");
+        m.on_phase_stdout(
+            "work",
+            "converted 3 of 6\nBackground tasks still running after 600s; terminating. \
+             Set CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 to wait indefinitely.\n",
+        );
+        let (o, _led, nd) = run_fleet(&m, &cfg());
+        assert!(matches!(o, IterationOutcome::Error(_)), "{o:?}");
+        assert!(released_with(&m, "todo"));
+        assert!(nd.contains("\"reason\":\"agent_bg_tasks_killed\""), "{nd}");
+        assert!(nd.contains("\"agent_ok\":false"), "{nd}");
+        let rel = release_comment(&m);
+        assert!(rel.contains("exited 0"), "{rel}");
+        assert!(rel.contains("agent_bg_tasks_killed"), "{rel}");
     }
 
     #[test]

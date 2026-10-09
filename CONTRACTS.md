@@ -144,7 +144,7 @@ sirius doctor --json        -> {"ok":bool,"checks":[{"name":str,"pass":bool,"det
                                # + gate_configured (GATING: fails while gate.test_cmd is null — SF-11).
                                # hayven_daemon_7777 compares the daemon's BUILD (/api/health "version")
                                # to the CLI's and fails on skew (SF-13). Advisory checks (plugin_handoff,
-                               # fleet_models, integration, plugin_version) never affect "ok".
+                               # fleet_models, integration, plugin_version, agent_timeouts) never affect "ok".
 
 sirius link AMT-7 --symbols a,b,c [--changed [--range <git-range>]] --json
    # --changed resolves files → entities by PATH (hayven affected-tests roots);
@@ -296,6 +296,11 @@ sirius run --workers N --agent-cmd "<cmd>" [--from todo] [--review-cmd "<cmd>"]
    #   setup re-runs (refused ⇒ the iteration aborts, as a lost lease does elsewhere).
    # review (SIRF-23, only with review.cmd): {"phase":"review","round":N,"result":"clean|blocking|error|tampered|skipped","confirmed":K,"notes":M}
    # fix:  {"phase":"fix","round":N,"agent_ok":bool,...}  (then a re-gate, as today)
+   # work/fix events (SIRF-41/52, additive): "timeout_kind":"idle"|"hard" when "timed_out":true
+   #   (idle = no output and no worktree change for timeouts.idle_secs; hard = timeouts.hard_secs);
+   #   "reason":"agent_bg_tasks_killed" when the agent's CLI killed its still-running background
+   #   tasks on exit ("Background tasks still running … terminating") — agent_ok is then false
+   #   whatever the exit code. The agent_timeout release event carries the same "timeout_kind".
    # release gains "review":"review: 2 rounds, 4 bugs fixed, 1 rebuttal accepted" when a review ran
 ```
 
@@ -318,6 +323,7 @@ every agent/reviewer process gets this environment (SIRF-22 #4/#5, SIRF-23):
 | `SIRIUS_REVIEW_FINDINGS` | (fix) this round's findings; (review, round > 1) the previous findings WITH the worker's responses |
 | `SIRIUS_FIX_OUT` | (fix) where the worker writes its responses |
 | `SIRIUS_LAST_GATE_TAIL` | (work, fix) set only on a RETRY after a failed gate: the previous attempt's gate output tail (last 15 lines, ≤2KB), or `<reason_code>: <reason>` when nothing ran (SIRF-48) |
+| `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` | always `0` (SIRF-52): headless `claude -p` waits for its background tasks instead of killing them after 600s — Sirius's idle watchdog and hard cap own the timeout |
 
 Sirius's own board writes (gate/review comments, decisions, forward stamps)
 pass `--author sirius/<tree>`; releases already pass `--agent`.
@@ -384,7 +390,22 @@ other stdout formats.
                                            //   from the root lockfile (bun.lock/bun.lockb, pnpm-lock.yaml,
                                            //   yarn.lock, package-lock.json, uv.lock); "" ⇒ no setup.
                                            //   `sirius init` pre-fills the detected command.
+  },
+  "timeouts": {                            // SIRF-41 — work/fix agents only (reviewer: review.timeout_secs,
+                                           //   integration: integration.timeout_secs — plain wall clocks)
+    "idle_secs": null,                     // null = 1800: kill after this long with no output (log growth)
+                                           //   and no worktree change (HEAD, porcelain status, size+mtime of
+                                           //   each dirty path; probed ≤ every 30s, and again before any kill)
+    "hard_secs": null,                     // null = 10800 (3h) — or a legacy agent_timeout_secs ≠ 1800
+    "routes": []                           // [{"labels": ["ui"], "idle_secs": …, "hard_secs": …}], first label
+                                           //   match wins (the models.routes rule); unset fields keep the base
   }
+  // agent_timeout_secs (LEGACY, no longer written by init): the hard cap when timeouts.hard_secs
+  // is null — except 1800, the old init default, which is ignored. Never sets idle.
+  // A kill due within 60s of a commit (HEAD moved) is deferred ONCE by 60s (SIRF-41 #4).
+  // Progress = ANY log growth or non-ignored file change: a hung agent whose background child
+  // keeps printing or writing tracked/untracked files is caught only by the hard cap.
+  // `sirius doctor` check agent_timeouts (advisory) warns on hard < 3600s or idle < 300s.
 }
 ```
 

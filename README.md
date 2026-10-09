@@ -256,7 +256,7 @@ sirius gate AMT-7 --tier safe --target-status in_review
 ```
 
 **`sirius run`** — the loop. Each iteration: claim an issue → map it to symbols
-→ lock them in Hayvenhurst → run your agent command (`sh -c`, wall-clock
+→ lock them in Hayvenhurst → run your agent command (`sh -c`, progress-aware
 timeout, lease heartbeats, output captured to a log) → gate → file the receipt
 → release. Claim order is enforced (issue first, symbols second, release in
 reverse); a lock collision releases the issue back with a comment naming the
@@ -268,6 +268,27 @@ sirius run --workers 3 --agent-cmd 'claude -p "fix the claimed issue"' --from to
 # {"event":"iteration","worker":"sirius/oak","phase":"gate","issue":"AMT-12",...}
 # {"event":"iteration","worker":"sirius/oak","phase":"release","issue":"AMT-12","status":"in_review","advanced":true}
 ```
+
+**Timeouts** (SIRF-41). An agent is killed only when it is *idle* — no
+output and no worktree change (no file write, no commit) for
+`timeouts.idle_secs` (default 1800) — or when it hits the hard cap
+`timeouts.hard_secs` (default 10800, 3 h). An agent that committed in the last
+minute before a kill gets one 60 s grace to finish. Big tickets can get more
+room by Ametrite label, first match wins:
+
+```json
+"timeouts": {"idle_secs": 1800, "hard_secs": 10800,
+             "routes": [{"labels": ["ui", "epic"], "hard_secs": 14400}]}
+```
+
+The old `agent_timeout_secs` still works as the hard cap, except the value
+`1800` that `sirius init` used to write, which is ignored. `sirius doctor`
+warns when a hard cap is under an hour or an idle window under 5 minutes. The
+work event and release comment say which limit fired (`timeout_kind`:
+`idle` | `hard`). Agents get `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`, so
+`claude -p` never kills a worker's helper agents after 600 s. An exit where it
+did ("Background tasks still running … terminating") counts as incomplete,
+whatever the exit code.
 
 **Review stage** (recommended): add `--review-cmd` (or `review.cmd` in
 `.sirius/config.json`) and every gated diff gets an unbiased fresh-eyes review

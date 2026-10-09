@@ -634,6 +634,10 @@ pub fn run_with_plugins_dir(
         env!("CARGO_PKG_VERSION"),
     ));
 
+    // 11. agent timeouts (SIRF-41 #5) — advisory: limits low enough to kill
+    //    a careful agent mid-ticket, and the legacy key's fate.
+    checks.push(agent_timeouts_check(&Config::load(&ws.config_path())));
+
     // Only GATING checks decide overall health; an advisory failure is a WARN.
     // `gate_configured` is gating, so an inert gate now flips `ok` — which is
     // what stops main.rs printing "all contract facts hold" and what makes the
@@ -744,6 +748,80 @@ pub fn models_check(ws: &Workspace) -> Check {
             "{describe} — no models.default: `sirius run` needs --model <id> (or --allow-default-model), else workers would run on {would}"
         ),
     )
+}
+
+/// Below this hard cap a careful agent on a big ticket gets killed mid-work
+/// (MainSpanX: two of three UI tickets died at 1800s, one of them finished).
+pub const MIN_SANE_HARD_SECS: u64 = 3600;
+/// Below this idle window a quiet stretch — a `claude -p` prints nothing
+/// until it is done; a test suite writes only ignored files — looks like a hang.
+pub const MIN_SANE_IDLE_SECS: u64 = 300;
+
+/// Check #11 (ADVISORY, SIRF-41 #5): the work/fix agent limits. WARNs when
+/// the effective hard cap (default or any `timeouts.routes` entry) is under
+/// [`MIN_SANE_HARD_SECS`] or the idle window under [`MIN_SANE_IDLE_SECS`],
+/// naming the knob that set it; notes what became of a legacy
+/// `agent_timeout_secs`. Never gates — short limits are a choice.
+pub fn agent_timeouts_check(cfg: &Result<Config, String>) -> Check {
+    const NAME: &str = "agent_timeouts";
+    let cfg = match cfg {
+        Ok(c) => c,
+        Err(e) => return Check::advisory(NAME, false, e.clone()),
+    };
+    let mut scopes = vec![("default".to_string(), cfg.agent_timeouts(&[]))];
+    // Each route's OWN values (base + its overrides) — resolving by its
+    // labels against all routes would show an earlier overlapping route's.
+    for r in cfg.timeouts.routes.iter().filter(|r| !r.labels.is_empty()) {
+        let mut solo = cfg.clone();
+        solo.timeouts.routes = vec![r.clone()];
+        scopes.push((
+            format!("[{}]", r.labels.join("|")),
+            solo.agent_timeouts(&r.labels),
+        ));
+    }
+    let mut warns = Vec::new();
+    for (scope, t) in &scopes {
+        if t.hard_secs < MIN_SANE_HARD_SECS {
+            warns.push(format!(
+                "{scope}: hard cap {}s < {MIN_SANE_HARD_SECS}s (set by {}) — big tickets take 30–60 min; raise it",
+                t.hard_secs, t.hard_from
+            ));
+        }
+        if t.idle_secs < MIN_SANE_IDLE_SECS {
+            warns.push(format!(
+                "{scope}: idle window {}s < {MIN_SANE_IDLE_SECS}s (set by {}) — a quiet build or test run would look hung; raise it",
+                t.idle_secs, t.idle_from
+            ));
+        }
+    }
+    let mut notes = Vec::new();
+    match (cfg.agent_timeout_secs, cfg.legacy_agent_timeout()) {
+        (Some(s), None) => notes.push(format!(
+            "agent_timeout_secs: {s} is the pre-SIRF-41 default `sirius init` wrote and is IGNORED — delete it; the knobs are timeouts.idle_secs / timeouts.hard_secs"
+        )),
+        (Some(_), Some(_)) if cfg.timeouts.hard_secs.is_some() => notes.push(
+            "agent_timeout_secs is IGNORED — timeouts.hard_secs wins; delete the legacy key"
+                .to_string(),
+        ),
+        (Some(s), Some(_)) => notes.push(format!(
+            "legacy agent_timeout_secs: {s} is the hard cap — move it to timeouts.hard_secs"
+        )),
+        _ => {}
+    }
+    let summary: Vec<String> = scopes
+        .iter()
+        .map(|(scope, t)| format!("{scope} idle {}s / hard {}s", t.idle_secs, t.hard_secs))
+        .collect();
+    let mut detail = format!(
+        "work/fix agents: {}; reviewer wall clock {}s",
+        summary.join(", "),
+        cfg.review.timeout_secs
+    );
+    for line in warns.iter().chain(&notes) {
+        detail.push_str("; ");
+        detail.push_str(line);
+    }
+    Check::advisory(NAME, warns.is_empty(), detail)
 }
 
 fn first_line(s: &str) -> String {
@@ -881,7 +959,7 @@ mod tests {
 
         let report = run_with_plugins_dir(&ws, &m, None);
         assert!(report.ok, "checks: {:?}", report.checks);
-        assert_eq!(report.checks.len(), 10);
+        assert_eq!(report.checks.len(), 11);
         // With no plugins dir the handoff check is an advisory PASS (skipped),
         // clearly labeled — a CI box is not an incomplete install.
         let ph = report
@@ -1607,5 +1685,80 @@ mod tests {
         assert!(c.pass && !c.gating);
         assert!(c.detail.contains("cannot be seen"), "{}", c.detail);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- agent timeouts (check #11, SIRF-41 #5) ----------------------------
+
+    fn timeouts_check(json: &str) -> Check {
+        agent_timeouts_check(&Ok(serde_json::from_str(json).unwrap()))
+    }
+
+    #[test]
+    fn default_timeouts_pass_and_say_what_they_are() {
+        let c = timeouts_check("{}");
+        assert!(c.pass && !c.gating, "{}", c.detail);
+        assert!(
+            c.detail.contains("idle 1800s / hard 10800s"),
+            "{}",
+            c.detail
+        );
+    }
+
+    // The ticket's ask: warn when the cap is too low for big tickets, NAMING
+    // the knob — and never gate.
+    #[test]
+    fn a_low_hard_cap_or_idle_window_warns_naming_the_knob() {
+        let c = timeouts_check(r#"{"agent_timeout_secs":1500}"#);
+        assert!(!c.pass && !c.gating, "{}", c.detail);
+        assert!(c.detail.contains("hard cap 1500s"), "{}", c.detail);
+        assert!(
+            c.detail.contains("agent_timeout_secs (legacy)"),
+            "{}",
+            c.detail
+        );
+
+        let c = timeouts_check(r#"{"timeouts":{"routes":[{"labels":["quick"],"idle_secs":120}]}}"#);
+        assert!(!c.pass && !c.gating, "{}", c.detail);
+        assert!(
+            c.detail.contains("[quick]: idle window 120s"),
+            "{}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("timeouts.routes[quick].idle_secs"),
+            "{}",
+            c.detail
+        );
+
+        // A later route overlapping an earlier one is judged on its OWN values.
+        let c = timeouts_check(
+            r#"{"timeouts":{"routes":[{"labels":["ui"],"hard_secs":14400},{"labels":["ui","quick"],"hard_secs":600}]}}"#,
+        );
+        assert!(!c.pass, "{}", c.detail);
+        assert!(
+            c.detail.contains("[ui|quick]: hard cap 600s"),
+            "{}",
+            c.detail
+        );
+    }
+
+    #[test]
+    fn the_legacy_key_is_explained_not_silently_dropped() {
+        // The old init default: ignored, and doctor says so (still a pass).
+        let c = timeouts_check(r#"{"agent_timeout_secs":1800}"#);
+        assert!(c.pass, "{}", c.detail);
+        assert!(c.detail.contains("IGNORED"), "{}", c.detail);
+        // Both set: timeouts.* wins.
+        let c = timeouts_check(r#"{"agent_timeout_secs":7200,"timeouts":{"hard_secs":9000}}"#);
+        assert!(c.detail.contains("timeouts.hard_secs wins"), "{}", c.detail);
+        // Legacy only (a real choice): it is the hard cap.
+        let c = timeouts_check(r#"{"agent_timeout_secs":7200}"#);
+        assert!(c.pass, "{}", c.detail);
+        assert!(c.detail.contains("hard 7200s"), "{}", c.detail);
+        assert!(
+            c.detail.contains("move it to timeouts.hard_secs"),
+            "{}",
+            c.detail
+        );
     }
 }
