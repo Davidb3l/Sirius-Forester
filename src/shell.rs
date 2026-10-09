@@ -143,7 +143,9 @@ pub struct ProgressWatch<'a> {
     pub probe_every: Duration,
     /// SIRF-41 #4: when a kill is due and `HEAD` moved within this window,
     /// the kill is deferred ONCE by this long — an agent that just committed
-    /// is finishing, not stuck.
+    /// is finishing, not stuck. "Moved" is timed from when a probe SAW it, so
+    /// a commit up to `grace + probe_every` old can still qualify (lenient
+    /// on purpose: a false grace costs one minute, a false kill a ticket).
     pub grace: Duration,
     /// Snapshot the worktree; `None` = could not tell (never counts as progress).
     pub probe: &'a mut dyn FnMut() -> Option<WorktreeProbe>,
@@ -436,6 +438,18 @@ impl RealRunner {
                         kill = false;
                     }
                 }
+                // The pre-kill probe can take a while on a big repo; an agent
+                // that exited meanwhile finished — never report it as killed.
+                if kill {
+                    if let Some(status) = child.try_wait()? {
+                        append_exit_trailer(opts.log_path.as_deref(), status.code());
+                        return Ok(AgentOutcome::Exited(CmdOutput {
+                            code: status.code(),
+                            stdout: String::new(),
+                            stderr: String::new(),
+                        }));
+                    }
+                }
                 if kill {
                     let kind = if hard_due {
                         TimeoutKind::Hard
@@ -547,15 +561,19 @@ pub const BG_WAIT_CEILING_ENV: &str = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS";
 /// SIRF-52: did the agent's CLI kill its background tasks on the way out?
 /// `claude -p` prints "Background tasks still running after 600s;
 /// terminating. …" and then exits — often with 0, so the run LOOKS like a
-/// success with the main deliverable missing. Judged on the last non-blank
-/// lines only (Sirius's own trailer excluded), so an agent that merely
-/// quotes the message mid-run does not trip it.
+/// success with the main deliverable missing. Judged on the last 3 non-blank
+/// lines only (Sirius's own trailer excluded), and only on a line that STARTS
+/// with the CLI's message — an agent that quotes it (a summary of a SIRF-52
+/// style fix, a printed log fixture) does not trip it.
 pub fn bg_tasks_killed(log: &str) -> bool {
     log.lines()
         .rev()
         .filter(|l| !l.trim().is_empty() && !l.starts_with("[sirius]"))
-        .take(20)
-        .any(|l| l.contains("Background tasks still running") && l.contains("terminating"))
+        .take(3)
+        .any(|l| {
+            let l = l.trim_start();
+            l.starts_with("Background tasks still running") && l.contains("terminating")
+        })
 }
 
 /// [`bg_tasks_killed`] over the last 64 KB of an agent log file. A missing
@@ -2115,6 +2133,10 @@ mod tests {
         }
         assert!(!bg_tasks_killed(&quoted));
         assert!(!bg_tasks_killed("all done\n[sirius] agent exit: 0\n"));
+        // A final summary QUOTING the message (mid-line) is not the CLI's exit.
+        assert!(!bg_tasks_killed(
+            "Done: sirius now detects 'Background tasks still running … terminating'.\n[sirius] agent exit: 0\n"
+        ));
         // From a file, via its tail; a missing file is simply "no".
         let p = std::env::temp_dir().join(format!("sirius-bg-{}.log", std::process::id()));
         std::fs::write(&p, format!("{}{killed}", "x".repeat(100_000))).unwrap();

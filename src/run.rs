@@ -2944,7 +2944,7 @@ pub fn run_review_stage(cx: &ReviewCtx, out: &mut dyn Write, fix_round: &FixRoun
                         (
                             rc.on_review_error,
                             format!(
-                                "the fix-mode worker timed out in round {round} (killed: idle past timeouts.idle_secs or over timeouts.hard_secs — the fix event's timeout_kind says which); reverted to the last reviewed state"
+                                "the fix-mode worker timed out in round {round} (killed by the agent timeout — idle or hard cap; the fix event's timeout_kind says which); reverted to the last reviewed state"
                             ),
                         )
                     } else if !work_ok {

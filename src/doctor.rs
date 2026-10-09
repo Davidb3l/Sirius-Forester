@@ -769,10 +769,14 @@ pub fn agent_timeouts_check(cfg: &Result<Config, String>) -> Check {
         Err(e) => return Check::advisory(NAME, false, e.clone()),
     };
     let mut scopes = vec![("default".to_string(), cfg.agent_timeouts(&[]))];
-    for r in &cfg.timeouts.routes {
+    // Each route's OWN values (base + its overrides) — resolving by its
+    // labels against all routes would show an earlier overlapping route's.
+    for r in cfg.timeouts.routes.iter().filter(|r| !r.labels.is_empty()) {
+        let mut solo = cfg.clone();
+        solo.timeouts.routes = vec![r.clone()];
         scopes.push((
             format!("[{}]", r.labels.join("|")),
-            cfg.agent_timeouts(&r.labels),
+            solo.agent_timeouts(&r.labels),
         ));
     }
     let mut warns = Vec::new();
@@ -1722,6 +1726,17 @@ mod tests {
         );
         assert!(
             c.detail.contains("timeouts.routes[quick].idle_secs"),
+            "{}",
+            c.detail
+        );
+
+        // A later route overlapping an earlier one is judged on its OWN values.
+        let c = timeouts_check(
+            r#"{"timeouts":{"routes":[{"labels":["ui"],"hard_secs":14400},{"labels":["ui","quick"],"hard_secs":600}]}}"#,
+        );
+        assert!(!c.pass, "{}", c.detail);
+        assert!(
+            c.detail.contains("[ui|quick]: hard cap 600s"),
             "{}",
             c.detail
         );

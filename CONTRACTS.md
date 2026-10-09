@@ -373,6 +373,8 @@ other stdout formats.
   // agent_timeout_secs (LEGACY, no longer written by init): the hard cap when timeouts.hard_secs
   // is null — except 1800, the old init default, which is ignored. Never sets idle.
   // A kill due within 60s of a commit (HEAD moved) is deferred ONCE by 60s (SIRF-41 #4).
+  // Progress = ANY log growth or non-ignored file change: a hung agent whose background child
+  // keeps printing or writing tracked/untracked files is caught only by the hard cap.
   // `sirius doctor` check agent_timeouts (advisory) warns on hard < 3600s or idle < 300s.
 }
 ```
