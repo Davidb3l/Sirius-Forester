@@ -278,9 +278,13 @@ sirius run --workers N --agent-cmd "<cmd>" [--from todo] [--review-cmd "<cmd>"]
    #   worktree is reset to (launch base when no base ref exists / it does not resolve)
    # SIRF-41: before ANY non-advancing release (timeout, agent failure, usage limit, gate deadend,
    #   review release, failed stamp; and a lost lease, which does not release) the worktree's
-   #   new work is committed ("sirius: wip <issue>", --no-verify) and pinned; the release
-   #   event (lease_lost included) gains "wip_ref":{"ref","sha","diffstat"} — or "wip_error":str
-   #   when pinning failed — and the release comment ends "— work preserved at <ref> (<sha12>, <diffstat>)".
+   #   new work is committed ("sirius: wip <issue>", no hooks) and pinned (compare-and-swap); the
+   #   release event (lease_lost included) gains "wip_ref":{"ref","sha","diffstat"[,"partial"]} —
+   #   "partial" when only the committed part could be pinned — or "wip_error":str when pinning
+   #   failed; the release comment ends "— work preserved at <ref> (<sha12>, <diffstat>)".
+   #   An agent that itself failed counts as interrupted (wip), even if the gate then failed;
+   #   resumed wip work that is then judged moves to wip-failed. A fix round's discarded
+   #   attempt is parked at wip-superseded before the revert.
    #   Refs (issue key = 4th segment, so `sirius link --changed` counts them as the issue's own):
    #   refs/sirius/wip/<issue>        interrupted work — merged back on the next claim
    #                                  (SIRIUS_RESUMED_FROM / SIRIUS_RESUME_REF), removed once stamped

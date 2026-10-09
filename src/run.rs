@@ -737,12 +737,14 @@ pub fn run_iteration(
     // The worktree itself stays detached for the sibling-worktree reason
     // above.
     //
-    // The leading bare `checkout --detach` (HEAD stays put) makes sure the
-    // `reset --hard` that follows can never drag a branch some earlier
-    // process left checked out here back to the base.
+    // The leading plumbing detach (HEAD := base, no branch moved, index and
+    // files untouched) makes sure the `reset --hard` that follows can never
+    // drag a branch some earlier process left checked out here back to the
+    // base — and, unlike `checkout --detach`, it works on an unborn branch
+    // and with an unmerged index, so such a leftover cannot wedge the worker.
     if let Some(base) = isolate_base {
         for args in [
-            &["checkout", "--detach"][..],
+            &["update-ref", "--no-deref", "HEAD", base][..],
             &["reset", "--hard", base][..],
             &["clean", "-fd"][..],
             &["checkout", "--detach", base][..],
@@ -1088,12 +1090,12 @@ pub fn run_iteration(
         // tree is — and the next reset would wipe it. Pin it, and say where
         // on the board (whoever holds the issue now resumes it next claim).
         let wip = preserve(WipKind::Resume);
-        if let Ok(Some(w)) = &wip {
+        if !matches!(wip, Ok(None)) {
             let _ = amt.comment_as(
                 &issue,
                 &format!(
                     "sirius: lost the lease before {when} ({reason}){}",
-                    w.suffix()
+                    wip_note(&wip)
                 ),
                 worker,
             );
@@ -1131,7 +1133,7 @@ pub fn run_iteration(
         // partial work is resumed on the next claim (SIRF-41).
         let wip = release_back(
             &format!(
-                "sirius: fleet paused — a fleet-wide stop (\"{line}\"). {issue} is back in todo untouched; restart the fleet once the limit resets."
+                "sirius: fleet paused — a fleet-wide stop (\"{line}\"). {issue} is back in todo (not advanced, no deadend filed); restart the fleet once the limit resets."
             ),
             WipKind::Resume,
         );
@@ -1332,7 +1334,8 @@ pub fn run_iteration(
             // next reset. Pin its commit and detach — first thing, before any
             // commit sirius makes could land on the agent's branch.
             if isolate_base.is_some() {
-                if let Some(g) = guard_branch(runner, &issue) {
+                let floor = work_floor.as_deref().or(isolate_base).unwrap_or_default();
+                if let Some(g) = guard_branch(runner, &issue, floor) {
                     let ev = json!({"event": "branch_guard", "worker": worker, "issue": issue.as_str(),
                                     "phase": phase, "branch": g.branch, "sha": g.sha,
                                     "ref": g.keep_ref, "detached": g.detached});
@@ -1780,11 +1783,35 @@ pub fn run_iteration(
     // (agent failure, a stamp that could not be made) is resumed on the next
     // claim; work the gate or the review JUDGED and failed is only offered
     // to the next agent (SIRIUS_PRIOR_WORK) — merging it back automatically
-    // would restart every attempt from the same failing state.
+    // would restart every attempt from the same failing state. An agent
+    // that itself FAILED was interrupted, whatever the gate then said about
+    // its partial tree (the ticket's "agent failure" → resume).
+    let judged = review_released || (work_ok && gate_result == "fail");
     let wip: WipResult = if advanced || held_marked {
         Ok(None)
-    } else if gate_result == "fail" || review_released {
-        preserve(WipKind::Failed)
+    } else if judged {
+        // Preserved work this iteration resumed was part of what was judged:
+        // it moves to wip-failed WITH the new work and stops being merged
+        // back automatically.
+        let resumed_wips: Vec<(String, String)> = resume
+            .drop_on_stamp
+            .iter()
+            .filter(|(r, _)| *r == wip_ref(&issue, WipKind::Resume))
+            .cloned()
+            .collect();
+        let mut w = preserve(WipKind::Failed);
+        if let (Ok(None), false, Some(base)) = (&w, resumed_wips.is_empty(), isolate_base) {
+            // Nothing new on top: the judged work IS the resumed work.
+            w = preserve_wip(runner, &issue, base, base, WipKind::Failed);
+        }
+        if let Ok(Some(f)) = &w {
+            for (r, sha) in &resumed_wips {
+                if is_ancestor(runner, sha, &f.sha) {
+                    let _ = crate::gitrange::run_git(runner, &["update-ref", "-d", r, sha]);
+                }
+            }
+        }
+        w
     } else {
         preserve(WipKind::Resume)
     };
@@ -2278,20 +2305,32 @@ pub struct WipRef {
     pub sha: String,
     /// `git diff --shortstat` of the work against the iteration base.
     pub diffstat: String,
+    /// The uncommitted rest could NOT be committed (why): only the
+    /// committed work is pinned.
+    pub partial: Option<String>,
 }
 
 impl WipRef {
     fn json(&self) -> Value {
-        json!({"ref": self.ref_name, "sha": self.sha, "diffstat": self.diffstat})
+        let mut v = json!({"ref": self.ref_name, "sha": self.sha, "diffstat": self.diffstat});
+        if let Some(p) = &self.partial {
+            v["partial"] = json!(p);
+        }
+        v
     }
 
     /// The release comment's tail.
     fn suffix(&self) -> String {
         format!(
-            " — work preserved at {} ({}, {})",
+            " — work preserved at {} ({}, {}){}",
             self.ref_name,
             short_sha(&self.sha),
-            self.diffstat
+            self.diffstat,
+            match &self.partial {
+                Some(p) =>
+                    format!(" — committed work only: the uncommitted rest could NOT be saved ({p})"),
+                None => String::new(),
+            }
         )
     }
 }
@@ -2364,6 +2403,108 @@ fn tree_differs(runner: &dyn Runner, floor: &str) -> Result<bool, String> {
     }
 }
 
+/// Commit everything in the worktree (`add -A`) as sirius's own wip commit,
+/// with NO repo hooks (`--no-verify` + an empty hooks path: a failing lint
+/// hook, or a commit-msg rewrite, must not cost or alter the work). Retries
+/// once under sirius's own identity with signing off (a machine without a
+/// git identity), after clearing an `index.lock` left by the killed agent —
+/// the worktree is this worker's alone and the agent is gone. `Err` when the
+/// tree is still dirty.
+fn commit_all(runner: &dyn Runner, msg: &str) -> Result<(), String> {
+    let clean = || {
+        crate::gitrange::run_git(runner, &["status", "--porcelain"])
+            .map(|o| o.stdout.trim().is_empty())
+            .unwrap_or(false)
+    };
+    let attempt = |extra: &[&str]| {
+        let _ = crate::gitrange::run_git(runner, &["add", "-A"]);
+        let mut args: Vec<&str> = vec!["-c", "core.hooksPath=/dev/null"];
+        args.extend(extra);
+        args.extend(["commit", "--no-verify", "-q", "-m", msg]);
+        let _ = crate::gitrange::run_git(runner, &args);
+    };
+    attempt(&[]);
+    if clean() {
+        return Ok(());
+    }
+    if let Ok(o) = crate::gitrange::run_git(
+        runner,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "index.lock",
+        ],
+    ) {
+        let lock = std::path::PathBuf::from(o.stdout.trim());
+        if lock.is_absolute() && lock.exists() {
+            eprintln!(
+                "sirius: removing a stale {} left by the agent",
+                lock.display()
+            );
+            let _ = std::fs::remove_file(&lock);
+        }
+    }
+    attempt(&[
+        "-c",
+        "user.name=sirius",
+        "-c",
+        "user.email=sirius@localhost",
+        "-c",
+        "commit.gpgsign=false",
+    ]);
+    if clean() {
+        Ok(())
+    } else {
+        Err("the worktree is still dirty after the wip commit".into())
+    }
+}
+
+/// Point `target` at `sha` with a compare-and-swap, so two writers (a
+/// worker that lost its lease and the issue's new holder) can never
+/// silently overwrite each other: an older value `sha` does not contain is
+/// parked at `refs/sirius/wip-superseded/<issue>/<sha12>` first, and a value
+/// that changed under us is re-read and re-judged.
+fn pin_ref(runner: &dyn Runner, issue: &str, target: &str, sha: &str) -> Result<(), String> {
+    let mut last = String::new();
+    for _ in 0..3 {
+        let old = ref_sha(runner, target);
+        if let Some(old) = &old {
+            if old != sha && !is_ancestor(runner, old, sha) {
+                park_superseded(runner, issue, old);
+            }
+        }
+        // An empty old value = "must not exist yet".
+        let expect = old.unwrap_or_default();
+        match crate::gitrange::run_git(runner, &["update-ref", target, sha, &expect]) {
+            Ok(_) => return Ok(()),
+            Err(e) => last = e,
+        }
+    }
+    Err(format!("cannot point {target} at {sha}: {last}"))
+}
+
+/// Park work that is about to be DISCARDED on purpose (a fix round reverted
+/// to its last reviewed checkpoint `head`): committed and pinned at
+/// `refs/sirius/wip-superseded/<issue>/<sha12>` — never merged back, but
+/// never unreferenced either. `None` when there is nothing past `head`.
+fn park_attempt(runner: &dyn Runner, issue: &str, head: &str) -> Option<String> {
+    let dirty = worktree_dirty(runner).unwrap_or(true);
+    if !dirty && !tree_differs(runner, head).unwrap_or(true) {
+        return None;
+    }
+    if dirty {
+        let _ = commit_all(runner, &format!("sirius: discarded attempt {issue}"));
+    }
+    let sha = crate::gitrange::head_rev(runner).ok()?;
+    if sha == head {
+        return None;
+    }
+    let parked = park_superseded(runner, issue, &sha);
+    eprintln!("sirius: {issue}: the discarded attempt is parked at {parked}");
+    Some(parked)
+}
+
 /// SIRF-41: pin the worktree's work before a non-advancing release, so a
 /// killed agent's finished commit is never left dangling on a detached HEAD
 /// (MSX-80: a whole implementation recoverable only by `git fsck`).
@@ -2388,46 +2529,20 @@ fn preserve_wip(
         if !dirty && !tree_differs(runner, floor)? {
             return Ok(None);
         }
-        if dirty {
-            let msg = format!("sirius: wip {issue}");
-            let _ = crate::gitrange::run_git(runner, &["add", "-A"]);
-            let _ = crate::gitrange::run_git(runner, &["commit", "--no-verify", "-m", &msg]);
-            let clean = |r: &dyn Runner| {
-                crate::gitrange::run_git(r, &["status", "--porcelain"])
-                    .map(|o| o.stdout.trim().is_empty())
-                    .unwrap_or(false)
-            };
-            if !clean(runner) {
-                // A missing identity or a signing setup must not cost the
-                // work: a sirius commit, under sirius's own identity.
-                let _ = crate::gitrange::run_git(
-                    runner,
-                    &[
-                        "-c",
-                        "user.name=sirius",
-                        "-c",
-                        "user.email=sirius@localhost",
-                        "-c",
-                        "commit.gpgsign=false",
-                        "commit",
-                        "--no-verify",
-                        "-m",
-                        &msg,
-                    ],
-                );
-                if !clean(runner) {
-                    return Err("the worktree is still dirty after the wip commit".into());
-                }
-            }
+        // Commit what is uncommitted. If that fails, the agent's COMMITTED
+        // work is still pinned below — a stuck index must never cost the
+        // commits too (the MSX-80 case this exists for).
+        let partial = if dirty {
+            commit_all(runner, &format!("sirius: wip {issue}")).err()
+        } else {
+            None
+        };
+        if partial.is_some() && !tree_differs(runner, floor)? {
+            return Err(partial.unwrap_or_default());
         }
         let sha = crate::gitrange::head_rev(runner)?;
         let target = wip_ref(issue, kind);
-        if let Some(old) = ref_sha(runner, &target) {
-            if old != sha && !is_ancestor(runner, &old, &sha) {
-                park_superseded(runner, issue, &old);
-            }
-        }
-        crate::gitrange::run_git(runner, &["update-ref", &target, &sha])?;
+        pin_ref(runner, issue, &target, &sha)?;
         let diffstat = crate::gitrange::run_git(runner, &["diff", "--shortstat", base, &sha])
             .map(|o| o.stdout.trim().to_string())
             .ok()
@@ -2437,6 +2552,7 @@ fn preserve_wip(
             ref_name: target,
             sha,
             diffstat,
+            partial,
         }))
     })();
     match &r {
@@ -2629,8 +2745,10 @@ fn ref_segment(s: &str) -> String {
 /// `refs/sirius/keep/<issue>/<branch>` and detach HEAD in place (plumbing
 /// `update-ref --no-deref`, which works with any index state and runs no
 /// hooks — `checkout --detach` refuses mid-merge). The branch itself is
-/// never touched or deleted.
-fn guard_branch(runner: &dyn Runner, issue: &str) -> Option<BranchGuard> {
+/// never touched or deleted. An UNBORN branch (`switch --orphan`) has no
+/// commit to pin: HEAD is detached at `fallback` (the iteration's floor), so
+/// sirius's own commits can never land as root commits on the orphan.
+fn guard_branch(runner: &dyn Runner, issue: &str, fallback: &str) -> Option<BranchGuard> {
     let full = crate::gitrange::run_git(runner, &["symbolic-ref", "-q", "HEAD"])
         .ok()?
         .stdout
@@ -2645,7 +2763,6 @@ fn guard_branch(runner: &dyn Runner, issue: &str) -> Option<BranchGuard> {
         .to_string();
     let sha = crate::gitrange::head_rev(runner).ok();
     let mut keep_ref = None;
-    let mut detached = false;
     if let Some(sha) = &sha {
         let mut keep = format!(
             "refs/sirius/keep/{}/{}",
@@ -2662,9 +2779,10 @@ fn guard_branch(runner: &dyn Runner, issue: &str) -> Option<BranchGuard> {
         if crate::gitrange::run_git(runner, &["update-ref", &keep, sha]).is_ok() {
             keep_ref = Some(keep);
         }
-        detached =
-            crate::gitrange::run_git(runner, &["update-ref", "--no-deref", "HEAD", sha]).is_ok();
     }
+    let at = sha.as_deref().unwrap_or(fallback);
+    let detached =
+        crate::gitrange::run_git(runner, &["update-ref", "--no-deref", "HEAD", at]).is_ok();
     eprintln!(
         "sirius: WARNING {issue}: the agent left branch `{branch}` checked out in its worktree — {}{}",
         match &keep_ref {
@@ -3511,6 +3629,15 @@ pub fn run_review_stage(cx: &ReviewCtx, out: &mut dyn Write, fix_round: &FixRoun
                 if !work_ok || gate_result == "fail" {
                     // Never trade gate-passing work for a broken fix: put the
                     // last reviewed (and gated) state back, then escalate.
+                    // The discarded attempt is parked first (SIRF-41: a
+                    // killed fix agent may have finished, too).
+                    if let Some(parked) = park_attempt(cx.runner, issue, &head) {
+                        let _ = cx.amt.comment_as(
+                            issue,
+                            &format!("sirius: fix round {round} did not hold — its work is parked at {parked}; reverted to the last reviewed state"),
+                            worker,
+                        );
+                    }
                     revert_to(cx, &head);
                     let paused = cx.fleet.paused();
                     if let Some(line) = &paused {
@@ -7774,6 +7901,157 @@ mod tests {
             "the worktree is detached again"
         );
         assert_eq!(w.ref_at("refs/heads/sirius/amt-8"), Some(tip));
+    }
+
+    fn index_lock(w: &GitWorld) -> std::path::PathBuf {
+        std::path::PathBuf::from(git_at(
+            &w.wt,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "index.lock",
+            ],
+        ))
+    }
+
+    /// Review B1: an uncommittable rest must never cost the agent's COMMITTED
+    /// work — HEAD is pinned anyway, and the partial loss is said. A plain
+    /// stale `index.lock` left by the killed agent is cleared and costs
+    /// nothing at all.
+    #[test]
+    fn preserve_wip_pins_committed_work_when_the_rest_cannot_be_committed() {
+        let w = GitWorld::new("partial");
+        let base = w.base.clone();
+        // A stale lock FILE: cleared, everything committed.
+        commit_file(&w.wt, "a.txt");
+        std::fs::write(w.wt.join("b.txt"), "b").unwrap();
+        std::fs::write(index_lock(&w), "").unwrap();
+        let got = preserve_wip(&w.git, "AMT-6", &base, &base, WipKind::Resume)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.partial, None);
+        assert_eq!(
+            tree_files(&w.repo, &got.sha),
+            vec!["a.txt", "b.txt", "base.txt"]
+        );
+        // An index that cannot be locked at all (a DIRECTORY in the way).
+        let committed = commit_file(&w.wt, "c.txt");
+        std::fs::write(w.wt.join("d.txt"), "d").unwrap();
+        std::fs::create_dir_all(index_lock(&w)).unwrap();
+        let got = preserve_wip(&w.git, "AMT-6", &base, &base, WipKind::Resume);
+        std::fs::remove_dir_all(index_lock(&w)).unwrap();
+        let got = got.unwrap().expect("the committed work is pinned anyway");
+        assert_eq!(got.sha, committed);
+        assert!(got.partial.is_some());
+        assert!(
+            got.suffix().contains("could NOT be saved"),
+            "{}",
+            got.suffix()
+        );
+        assert!(got.json()["partial"].is_string());
+        assert_eq!(w.ref_at("refs/sirius/wip/amt-6"), Some(committed));
+    }
+
+    /// Review B2: a worktree left on an UNBORN branch (or an unmerged index)
+    /// must not wedge the worker at the next prep; and the guard detaches an
+    /// agent's orphan checkout.
+    #[test]
+    fn an_orphan_checkout_never_wedges_the_worker() {
+        let w = GitWorld::new("orphan");
+        git_at(&w.wt, &["switch", "-q", "--orphan", "left-behind"]);
+        w.agent(|wt| {
+            git_at(wt, &["switch", "-q", "--orphan", "agent-orphan"]);
+        });
+        w.mock
+            .push(MockResponse::new(&["sh", "-c", "true"], 1, "", "no"));
+        let (o, evs) = w.iterate("AMT-13", &cfg());
+        assert!(
+            !evs.iter().any(|e| e["reason"] == "worktree_prep_failed"),
+            "{evs:?}"
+        );
+        assert!(
+            matches!(o, IterationOutcome::Error(ref e) if e.contains("agent")),
+            "{o:?}"
+        );
+        let g = evs
+            .iter()
+            .find(|e| e["event"] == "branch_guard")
+            .expect("guarded");
+        assert_eq!(g["branch"], "agent-orphan");
+        assert_eq!(g["detached"], true);
+        assert!(g["sha"].is_null());
+        assert!(crate::gitrange::run_git(&w.git, &["symbolic-ref", "-q", "HEAD"]).is_err());
+    }
+
+    /// Review B3: preserved work that was resumed and then JUDGED (here: the
+    /// gate fails with nothing new on top) moves to wip-failed and stops
+    /// being merged back automatically.
+    #[test]
+    fn resumed_work_that_then_fails_the_gate_is_no_longer_auto_resumed() {
+        let w = GitWorld::new("rejudged");
+        w.agent(|wt| {
+            commit_file(wt, "a.txt");
+        });
+        w.mock.arm_agent_timeout(0);
+        w.iterate("AMT-14", &cfg());
+        let wip = w.ref_at("refs/sirius/wip/amt-14").expect("pinned");
+        // Iteration 2 resumes it; the agent adds nothing; the gate fails.
+        w.mock
+            .expect(&["sh", "-c", "run-suite"], 1, "test result: FAILED");
+        let mut c = cfg();
+        c.retry_budget = 1;
+        let (o, evs) = w.iterate("AMT-14", &c);
+        assert_eq!(o, IterationOutcome::Deadend);
+        assert_eq!(w.ref_at("refs/sirius/wip/amt-14"), None, "retired");
+        let failed = w.ref_at("refs/sirius/wip-failed/amt-14").expect("kept");
+        assert!(is_ancestor(&w.git, &wip, &failed));
+        assert_eq!(event(&evs, "release")["wip_ref"]["sha"], json!(failed));
+        // Iteration 3: offered, not merged.
+        w.mock
+            .push(MockResponse::new(&["sh", "-c", "true"], 1, "", "no"));
+        w.iterate("AMT-14", &c);
+        let env = &w.mock.agent_envs()[2];
+        assert_eq!(env_of(env, "SIRIUS_RESUMED_FROM"), None);
+        assert_eq!(
+            env_of(env, "SIRIUS_PRIOR_WORK").as_deref(),
+            Some("refs/sirius/wip-failed/amt-14")
+        );
+    }
+
+    /// An agent that itself FAILED was interrupted — its partial tree is
+    /// resumed next claim even though the gate then failed over it.
+    #[test]
+    fn a_failed_agents_partial_work_is_resumable_even_if_the_gate_failed() {
+        let w = GitWorld::new("agentfail");
+        w.agent(|wt| std::fs::write(wt.join("p.txt"), "p").unwrap());
+        w.mock
+            .push(MockResponse::new(&["sh", "-c", "true"], 1, "", "crash"));
+        w.mock
+            .expect(&["sh", "-c", "run-suite"], 1, "test result: FAILED");
+        let mut c = cfg();
+        c.retry_budget = 1;
+        let (_o, evs) = w.iterate("AMT-15", &c);
+        let wip = w.ref_at("refs/sirius/wip/amt-15").expect("resumable");
+        assert_eq!(w.ref_at("refs/sirius/wip-failed/amt-15"), None);
+        assert_eq!(event(&evs, "release")["wip_ref"]["sha"], json!(wip));
+    }
+
+    /// A fix round's discarded attempt is parked before the revert.
+    #[test]
+    fn park_attempt_keeps_a_discarded_attempt_reachable() {
+        let w = GitWorld::new("park");
+        let head = w.base.clone();
+        assert_eq!(park_attempt(&w.git, "AMT-16", &head), None);
+        commit_file(&w.wt, "fix1.txt");
+        std::fs::write(w.wt.join("fix2.txt"), "f").unwrap();
+        let parked = park_attempt(&w.git, "AMT-16", &head).expect("parked");
+        assert!(parked.starts_with("refs/sirius/wip-superseded/amt-16/"));
+        let sha = w.ref_at(&parked).unwrap();
+        assert_eq!(
+            tree_files(&w.repo, &sha),
+            vec!["base.txt", "fix1.txt", "fix2.txt"]
+        );
     }
 
     #[test]
