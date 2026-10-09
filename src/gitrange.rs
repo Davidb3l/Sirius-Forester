@@ -227,8 +227,8 @@ const MAX_RESUME_DEPTH: usize = 8;
 /// Held work resumed from an earlier hold is the one second parent that IS
 /// this issue's: `resume_held` merges it before the agent runs, so that merge
 /// sits at the BOTTOM of the line. Follow it — but only a real resume merge:
-/// at the first level the one `$SIRIUS_RESUMED_FROM` names; deeper (a resume
-/// of a resume) one carrying resume_held's `Merge commit '<sha>'` subject
+/// the one `$SIRIUS_RESUMED_FROM` names, or one carrying resume_held's
+/// `Merge commit '<sha>'` subject
 /// (git's default for `merge --no-edit <sha>`). A
 /// worker that opens with its own `git merge main` also leaves a merge at the
 /// bottom, and following that would stamp the whole base onto the issue.
@@ -236,7 +236,7 @@ fn fleet_line_files(runner: &dyn Runner, f: FleetBase<'_>) -> Result<Vec<String>
     let mut files: Vec<String> = Vec::new();
     let mut tip = "HEAD".to_string();
     let mut expect_parent = f.resumed_from.map(str::trim).filter(|r| !r.is_empty());
-    for depth in 0..=MAX_RESUME_DEPTH {
+    for _ in 0..=MAX_RESUME_DEPTH {
         let range = format!("{}..{tip}", f.base);
         let log = run_git(
             runner,
@@ -267,9 +267,14 @@ fn fleet_line_files(runner: &dyn Runner, f: FleetBase<'_>) -> Result<Vec<String>
         let Some(second) = parents.get(2) else {
             break; // the bottom is an ordinary commit: the line ends here
         };
-        let is_resume = if depth == 0 {
-            expect_parent.is_some_and(|r| second.starts_with(r) || r.starts_with(second.as_str()))
-        } else {
+        // A resume merge is the one `$SIRIUS_RESUMED_FROM` names, OR any merge
+        // carrying resume_held's signature — at EVERY depth: when this run's
+        // resume fast-forwarded (main had not moved since the hold), the line's
+        // bottom is an OLDER cross-run resume merge whose second parent is an
+        // earlier held sha, not $SIRIUS_RESUMED_FROM.
+        let named =
+            expect_parent.is_some_and(|r| second.starts_with(r) || r.starts_with(second.as_str()));
+        let is_resume = named || {
             let subject = run_git(runner, &["log", "-1", "--format=%s", &bottom])?;
             // `Merge commit '<sha>'`, plus ` into HEAD` on a detached
             // worktree (or ` into <branch>`).
@@ -277,6 +282,7 @@ fn fleet_line_files(runner: &dyn Runner, f: FleetBase<'_>) -> Result<Vec<String>
                 .stdout
                 .trim()
                 .starts_with(&format!("Merge commit '{second}'"))
+                && !landed_on_a_branch(runner, second)?
         };
         if !is_resume {
             break;
@@ -285,6 +291,26 @@ fn fleet_line_files(runner: &dyn Runner, f: FleetBase<'_>) -> Result<Vec<String>
         tip = second.clone();
     }
     Ok(files)
+}
+
+/// Whether `sha` is on any local branch other than sirius's own `sirius/*`.
+/// Held and wip work has never landed, so this tells a resume merge apart from
+/// a worker merging the base BY SHA — both get git's `Merge commit '<sha>'`
+/// subject, but the base is on `main` (or whatever branch the fleet tracks).
+fn landed_on_a_branch(runner: &dyn Runner, sha: &str) -> Result<bool, String> {
+    let refs = run_git(
+        runner,
+        &[
+            "for-each-ref",
+            "--contains",
+            sha,
+            "--format=%(refname)",
+            "refs/heads/",
+        ],
+    )?;
+    Ok(stdout_lines(&refs)
+        .iter()
+        .any(|r| !r.starts_with("refs/heads/sirius/")))
 }
 
 /// Whether `base` names a commit HEAD descends from. Anything else — a stale
@@ -871,6 +897,53 @@ mod tests {
         r.git(&["merge", "-q", "--no-edit", &h1]); // run 3 resumes h1
         r.file("w2.txt");
         assert_eq!(r.line(&b3, Some(&h1)), vec!["h0.txt", "w.txt", "w2.txt"]);
+        r.drop();
+    }
+
+    /// This run's resume FAST-FORWARDS (main has not moved since the last
+    /// hold), so the line's bottom is the OLDER cross-run resume merge — its
+    /// second parent is h0, not $SIRIUS_RESUMED_FROM. h0's work still counts.
+    #[test]
+    fn fleet_line_follows_an_older_resume_under_a_fast_forward_resume() {
+        let r = Repo::new("ffresume");
+        let b1 = r.file("base.txt");
+        r.git(&["switch", "-q", "--detach", &b1]);
+        let h0 = r.file("h0.txt");
+        r.git(&["switch", "-q", "main"]);
+        r.file("landed1.txt");
+        let b2 = r.git(&["rev-parse", "HEAD"]);
+        r.git(&["switch", "-q", "--detach", &b2]);
+        r.git(&["merge", "-q", "--no-edit", &h0]); // run 2 resumes h0 (non-ff)
+        let h1 = r.file("w.txt");
+        // Run 3, main unmoved at b2: resuming h1 fast-forwards.
+        r.git(&["switch", "-q", "--detach", &b2]);
+        r.git(&["merge", "-q", "--no-edit", &h1]);
+        assert_eq!(
+            r.git(&["rev-parse", "HEAD"]),
+            h1,
+            "the resume fast-forwarded"
+        );
+        r.file("w2.txt");
+        assert_eq!(r.line(&b2, Some(&h1)), vec!["h0.txt", "w.txt", "w2.txt"]);
+        r.drop();
+    }
+
+    /// The same opening merge done BY SHA gets resume_held's exact subject
+    /// (`Merge commit '<sha>'`). With main advanced linearly, following it
+    /// would stamp main's own commits — it must be told apart by having
+    /// landed on a branch.
+    #[test]
+    fn fleet_line_does_not_follow_an_opening_merge_of_the_base_by_sha() {
+        let r = Repo::new("bysha");
+        let base = r.file("base.txt");
+        r.git(&["switch", "-q", "main"]);
+        let main_tip = r.file("other.txt"); // linear: no merge commit on main
+        r.git(&["switch", "-q", "--detach", &base]);
+        r.file("mine0.txt");
+        r.git(&["reset", "-q", "--hard", &base]);
+        r.git(&["merge", "-q", "--no-ff", "--no-edit", &main_tip]);
+        r.file("mine.txt");
+        assert_eq!(r.line(&base, None), vec!["mine.txt"]);
         r.drop();
     }
 
