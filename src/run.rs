@@ -27,7 +27,10 @@ pub const PHASES: &[&str] = &[
 /// resets, no per-issue branches, and no review stage.
 #[derive(Debug, Clone)]
 pub struct Fleet {
-    /// The launch base commit every worktree was reset to.
+    /// The launch base commit every worktree was created from. SIRF-42: an
+    /// iteration resets to the FRESH tip of the fleet's base ref instead
+    /// ([`iteration_base`]) and falls back to this only when no base ref
+    /// exists or it does not resolve.
     pub base: String,
     /// The branch HEAD pointed to at launch — the default `review.base_ref`
     /// for `current-base-merge`. `None` when launched on a detached HEAD.
@@ -600,7 +603,7 @@ pub fn run_iteration(
     out: &mut dyn Write,
     spine: Option<&crate::spine::Spine>,
     // When Some: `runner` is scoped to this worker's PRIVATE git worktree,
-    // and the iteration may safely hard-reset it to `fleet.base` and put each
+    // and the iteration may safely hard-reset it to its base and put each
     // issue's work on its own branch. NEVER pass Some for a runner that
     // targets the user's own checkout — the reset would destroy their work.
     fleet: Option<&Fleet>,
@@ -609,7 +612,6 @@ pub fn run_iteration(
         fleet,
         worker: worker.to_string(),
     };
-    let isolate_base: Option<&str> = fleet.map(|f| f.base.as_str());
     ledger_warn("upsert_worker", ledger.upsert_worker(worker, "working"));
 
     // Suite spine (§2): past-tense job/gate/receipt facts to <root>/.suite/.
@@ -688,13 +690,29 @@ pub fn run_iteration(
     .unwrap_or(-1);
     let iter_ref = (iter_id >= 0).then_some(iter_id);
     let start = std::time::Instant::now();
-    emit_event(
-        out,
-        worker,
-        Some(&issue),
-        "claim",
-        json!({"claimed": true, "title": title, "model": model_work, "review_model": model_review}),
-    );
+    // The branch this fleet lands on (the review's base ref, else the branch
+    // launched from) — exported as SIRIUS_BASE_REF below, and the ref this
+    // iteration's base is resolved from.
+    let base_ref: Option<String> = config
+        .review
+        .base_ref
+        .clone()
+        .or_else(|| fleet.and_then(|f| f.base_ref.clone()));
+    // SIRF-42: the base THIS iteration builds on is the base ref's tip NOW,
+    // not the commit snapshotted at launch — in a serial blocker chain every
+    // later ticket must see its merged predecessors. Resolved once here and
+    // used for everything this iteration used the launch base for: the
+    // worktree reset, the gate baseline / SIRIUS_BASE, preserved-work
+    // containment, and the review's diff ranges.
+    let iter_base: Option<String> =
+        fleet.map(|f| iteration_base(runner, base_ref.as_deref(), &f.base));
+    let isolate_base: Option<&str> = iter_base.as_deref();
+    let mut claim_ev =
+        json!({"claimed": true, "title": title, "model": model_work, "review_model": model_review});
+    if let Some(b) = isolate_base {
+        claim_ev["base_sha"] = json!(b);
+    }
+    emit_event(out, worker, Some(&issue), "claim", claim_ev);
     // Durable: the Ametrite claim + ledger.start_iteration above.
     emit_job("job.dispatched", &issue);
 
@@ -709,8 +727,24 @@ pub fn run_iteration(
     // start_iteration + the claim event so even a prep failure leaves the
     // documented one-iterations-row-per-pass audit trail and a visible
     // release on the NDJSON stream.
+    //
+    // SIRF-41 asked for "a named branch from the start; never a detached
+    // HEAD" so a killed agent's commits are never left dangling. The INTENT
+    // — no work is ever unreferenced — is met with refs instead: every
+    // non-advancing exit pins the worktree's work at refs/sirius/wip*/<issue>
+    // BEFORE the issue is released ([`preserve_wip`]), and a branch an agent
+    // checks out is pinned and detached after it exits ([`guard_branch`]).
+    // The worktree itself stays detached for the sibling-worktree reason
+    // above.
+    //
+    // The leading plumbing detach (HEAD := base, no branch moved, index and
+    // files untouched) makes sure the `reset --hard` that follows can never
+    // drag a branch some earlier process left checked out here back to the
+    // base — and, unlike `checkout --detach`, it works on an unborn branch
+    // and with an unmerged index, so such a leftover cannot wedge the worker.
     if let Some(base) = isolate_base {
         for args in [
+            &["update-ref", "--no-deref", "HEAD", base][..],
             &["reset", "--hard", base][..],
             &["clean", "-fd"][..],
             &["checkout", "--detach", base][..],
@@ -718,6 +752,9 @@ pub fn run_iteration(
             if let Err(detail) = crate::gitrange::run_git(runner, args) {
                 // A worktree we cannot reset is a workspace we cannot trust —
                 // fail the iteration rather than gate over an unknown baseline.
+                // Nothing to preserve (SIRF-41): no work for THIS issue has
+                // started, and whatever the tree still holds was preserved
+                // (or stamped) when its own iteration released.
                 release_issue_checked(
                     amt,
                     ledger,
@@ -757,9 +794,44 @@ pub fn run_iteration(
     }
     // SIRF-32: work a red frontier held back is RESUMED, not redone: merge
     // the exact held commit (if its branch still points there) onto the base.
-    let resumed: Option<String> = match isolate_base {
-        Some(_) => resume_held(amt, runner, &issue, worker),
-        None => None,
+    // SIRF-41: so is work an interrupted iteration preserved (refs/sirius/wip);
+    // work that was judged and failed is only pointed at (SIRIUS_PRIOR_WORK).
+    let resume: Resume = match isolate_base {
+        Some(base) => resume_work(amt, runner, &issue, worker, base),
+        None => Resume::default(),
+    };
+    let resumed: Option<String> = resume.resumed.clone();
+    // What this iteration starts from: the base plus anything resumed. Work
+    // is "new" (worth preserving) only past this point — resumed work is
+    // still referenced by the ref it came from.
+    let work_floor: Option<String> = isolate_base.map(|base| match &resumed {
+        Some(_) => crate::gitrange::head_rev(runner).unwrap_or_else(|_| base.to_string()),
+        None => base.to_string(),
+    });
+    // SIRF-41: preserve the worktree's work BEFORE any non-advancing release
+    // — another worker may claim the issue the instant it is released, and
+    // this worker's next reset wipes the tree. Fleet-only (a user's own
+    // checkout is never committed to); a no-op when nothing new exists.
+    let preserve = |kind: WipKind| -> WipResult {
+        match (isolate_base, &work_floor) {
+            (Some(base), Some(floor)) => preserve_wip(runner, &issue, floor, base, kind),
+            _ => Ok(None),
+        }
+    };
+    // Every release back to `todo` short of the final one goes through here,
+    // so no release path can skip the preserve step. The comment names where
+    // the work went; the caller adds `wip_ref` to its release event.
+    let release_back = |comment: &str, kind: WipKind| -> WipResult {
+        let wip = preserve(kind);
+        release_issue_checked(
+            amt,
+            ledger,
+            &issue,
+            worker,
+            Some("todo"),
+            Some(&format!("{comment}{}", wip_note(&wip))),
+        );
+        wip
     };
 
     // 2. MAP issue → symbols (Hayvenhurst query + impact for blast radius).
@@ -811,22 +883,19 @@ pub fn run_iteration(
                 // Release any acquired entity claims (reverse), then release the
                 // issue with a comment naming the blocker (claim-order law).
                 release_entities(hv, ledger, &issue, &acquired);
-                release_issue_checked(
-                    amt,
-                    ledger,
-                    &issue,
-                    worker,
-                    Some("todo"),
-                    Some(&format!(
-                        "sirius: released — entity claim blocked by {blocker}"
-                    )),
+                let wip = release_back(
+                    &format!("sirius: released — entity claim blocked by {blocker}"),
+                    WipKind::Resume,
                 );
                 emit_event(
                     out,
                     worker,
                     Some(&issue),
                     "release",
-                    json!({"reason": "entity_overlap", "blocker": blocker}),
+                    with_wip(
+                        json!({"reason": "entity_overlap", "blocker": blocker}),
+                        &wip,
+                    ),
                 );
                 ledger_warn(
                     "finish_iteration",
@@ -847,22 +916,16 @@ pub fn run_iteration(
             }
             LockResult::OracleBackoff { detail, acquired } => {
                 release_entities(hv, ledger, &issue, &acquired);
-                release_issue_checked(
-                    amt,
-                    ledger,
-                    &issue,
-                    worker,
-                    Some("todo"),
-                    Some(&format!(
-                        "sirius: released — oracle/claim backoff: {detail}"
-                    )),
+                let wip = release_back(
+                    &format!("sirius: released — oracle/claim backoff: {detail}"),
+                    WipKind::Resume,
                 );
                 emit_event(
                     out,
                     worker,
                     Some(&issue),
                     "release",
-                    json!({"reason": "oracle_backoff", "detail": detail}),
+                    with_wip(json!({"reason": "oracle_backoff", "detail": detail}), &wip),
                 );
                 ledger_warn(
                     "finish_iteration",
@@ -889,20 +952,16 @@ pub fn run_iteration(
                 // applies (a wrong-project daemon must not masquerade as
                 // contention and retry forever).
                 release_entities(hv, ledger, &issue, &acquired);
-                release_issue_checked(
-                    amt,
-                    ledger,
-                    &issue,
-                    worker,
-                    Some("todo"),
-                    Some(&format!("sirius: released — hayven claim error: {detail}")),
+                let wip = release_back(
+                    &format!("sirius: released — hayven claim error: {detail}"),
+                    WipKind::Resume,
                 );
                 emit_event(
                     out,
                     worker,
                     Some(&issue),
                     "release",
-                    json!({"reason": "claim_error", "detail": detail}),
+                    with_wip(json!({"reason": "claim_error", "detail": detail}), &wip),
                 );
                 ledger_warn(
                     "finish_iteration",
@@ -1027,12 +1086,26 @@ pub fn run_iteration(
     // pre-spawn check (work/fix) and the pre-review check (SIRF-23).
     let lease_lost = |out: &mut dyn Write, reason: &str, when: &str| -> IterationOutcome {
         release_entities(hv, ledger, &issue, &claim_ids);
+        // SIRF-41: the issue is not ours to release, but the work in this
+        // tree is — and the next reset would wipe it. Pin it, and say where
+        // on the board (whoever holds the issue now resumes it next claim).
+        let wip = preserve(WipKind::Resume);
+        if !matches!(wip, Ok(None)) {
+            let _ = amt.comment_as(
+                &issue,
+                &format!(
+                    "sirius: lost the lease before {when} ({reason}){}",
+                    wip_note(&wip)
+                ),
+                worker,
+            );
+        }
         emit_event(
             out,
             worker,
             Some(&issue),
             "release",
-            json!({"reason": "lease_lost", "detail": reason}),
+            with_wip(json!({"reason": "lease_lost", "detail": reason}), &wip),
         );
         ledger_warn(
             "finish_iteration",
@@ -1056,22 +1129,23 @@ pub fn run_iteration(
     // stop — the worker loop sees `Paused` and the fleet stops claiming.
     let usage_paused = |out: &mut dyn Write, line: &str| -> IterationOutcome {
         release_entities(hv, ledger, &issue, &claim_ids);
-        release_issue_checked(
-            amt,
-            ledger,
-            &issue,
-            worker,
-            Some("todo"),
-            Some(&format!(
-                "sirius: fleet paused — a fleet-wide stop (\"{line}\"). {issue} is back in todo untouched; restart the fleet once the limit resets."
-            )),
+        // The agent may have worked for a while before the limit hit: that
+        // partial work is resumed on the next claim (SIRF-41).
+        let wip = release_back(
+            &format!(
+                "sirius: fleet paused — a fleet-wide stop (\"{line}\"). {issue} is back in todo (not advanced, no deadend filed); restart the fleet once the limit resets."
+            ),
+            WipKind::Resume,
         );
         emit_event(
             out,
             worker,
             Some(&issue),
             "release",
-            json!({"reason": "usage_limit", "detail": line, "advanced": false}),
+            with_wip(
+                json!({"reason": "usage_limit", "detail": line, "advanced": false}),
+                &wip,
+            ),
         );
         ledger_warn(
             "finish_iteration",
@@ -1134,15 +1208,19 @@ pub fn run_iteration(
     if let Some(sha) = &resumed {
         base_env.push(kv("SIRIUS_RESUMED_FROM", sha.as_str()));
     }
+    // SIRF-41: which ref the resumed work came from, and earlier work that
+    // was judged and failed (gate deadend / review release) — not merged,
+    // but there for the agent to look at.
+    if let Some(r) = &resume.resume_ref {
+        base_env.push(kv("SIRIUS_RESUME_REF", r.as_str()));
+    }
+    if let Some((r, _)) = &resume.prior_work {
+        base_env.push(kv("SIRIUS_PRIOR_WORK", r.as_str()));
+    }
     // The branch this fleet lands on (the review's base ref, else the branch
     // launched from): `sirius link --changed` never stamps commits already on
-    // it as this issue's work.
-    if let Some(r) = config
-        .review
-        .base_ref
-        .clone()
-        .or_else(|| fleet.and_then(|f| f.base_ref.clone()))
-    {
+    // it as this issue's work. The SAME ref this iteration's base came from.
+    if let Some(r) = base_ref.clone() {
         base_env.push(kv("SIRIUS_BASE_REF", r));
     }
     // WORK⇄GATE as a reusable unit: the initial work pass (phase `work`) and
@@ -1276,6 +1354,19 @@ pub fn run_iteration(
                 &mut watch,
                 &mut heartbeat,
             );
+            // SIRF-49: an agent that checked out a named branch would have
+            // it parked here (blocking sibling worktrees) and wiped by the
+            // next reset. Pin its commit and detach — first thing, before any
+            // commit sirius makes could land on the agent's branch.
+            if isolate_base.is_some() {
+                let floor = work_floor.as_deref().or(isolate_base).unwrap_or_default();
+                if let Some(g) = guard_branch(runner, &issue, floor) {
+                    let ev = json!({"event": "branch_guard", "worker": worker, "issue": issue.as_str(),
+                                    "phase": phase, "branch": g.branch, "sha": g.sha,
+                                    "ref": g.keep_ref, "detached": g.detached});
+                    let _ = out.write_all(format!("{ev}\n").as_bytes());
+                }
+            }
             let timed_out = work.as_ref().map(AgentOutcome::timed_out).unwrap_or(false);
             let timeout_kind = work.as_ref().ok().and_then(AgentOutcome::timeout_kind);
             work_ok = work.as_ref().map(AgentOutcome::success).unwrap_or(false);
@@ -1372,25 +1463,26 @@ pub fn run_iteration(
             }
             if timed_out {
                 release_entities(hv, ledger, &issue, &claim_ids);
-                release_issue_checked(
-                    amt,
-                    ledger,
-                    &issue,
-                    worker,
-                    Some("todo"),
-                    Some(&format!(
+                // SIRF-41: a killed agent may have FINISHED — its work is
+                // pinned at refs/sirius/wip/<issue> and resumed next claim.
+                let wip = release_back(
+                    &format!(
                         "sirius: released — agent timed out: {} (killed)",
                         timeout_kind
                             .unwrap_or(crate::shell::TimeoutKind::Hard)
                             .describe(limits.idle_secs, limits.hard_secs)
-                    )),
+                    ),
+                    WipKind::Resume,
                 );
                 emit_event(
                     out,
                     worker,
                     Some(&issue),
                     "release",
-                    json!({"reason": "agent_timeout", "advanced": false, "timeout_kind": timeout_kind.map(crate::shell::TimeoutKind::as_str)}),
+                    with_wip(
+                        json!({"reason": "agent_timeout", "advanced": false, "timeout_kind": timeout_kind.map(crate::shell::TimeoutKind::as_str)}),
+                        &wip,
+                    ),
                 );
                 ledger_warn(
                     "finish_iteration",
@@ -1629,6 +1721,7 @@ pub fn run_iteration(
                     worker,
                     issue: &issue,
                     fleet: f,
+                    base: isolate_base.unwrap_or(f.base.as_str()),
                     iter_ref,
                     base_env: &base_env,
                     spine,
@@ -1772,12 +1865,10 @@ pub fn run_iteration(
                 held_marked =
                     crate::gitrange::run_git(runner, &["update-ref", &held_ref, "HEAD"]).is_ok();
             }
-            // Completed work that resumed the held commit contains it: the
-            // marker has done its job. (Removed only now — an iteration that
-            // ends earlier keeps it for the next claim.)
-            Ok(()) if resumed.is_some() => {
-                let _ = crate::gitrange::run_git(runner, &["update-ref", "-d", &held_ref]);
-            }
+            // Completed work that resumed the held (or wip) commit contains
+            // it: the marker has done its job. (Removed only now — an
+            // iteration that ends earlier keeps it for the next claim.)
+            Ok(()) => retire_resumed(runner, &issue, &resume),
             _ => {}
         }
         if let Err(e) = stamp {
@@ -1788,12 +1879,49 @@ pub fn run_iteration(
             );
             let _ = amt.comment_as(
                 &issue,
-                &format!("sirius: gate passed but preserving the work failed ({e}) — released without advancing"),
+                &format!("sirius: gate passed but stamping the work on its branch failed ({e}) — released without advancing"),
                 worker,
             );
             advanced = false;
         }
     }
+    // SIRF-41: anything not advanced and not held is preserved before the
+    // release below hands the issue to the next claimer. Interrupted work
+    // (agent failure, a stamp that could not be made) is resumed on the next
+    // claim; work the gate or the review JUDGED and failed is only offered
+    // to the next agent (SIRIUS_PRIOR_WORK) — merging it back automatically
+    // would restart every attempt from the same failing state. An agent
+    // that itself FAILED was interrupted, whatever the gate then said about
+    // its partial tree (the ticket's "agent failure" → resume).
+    let judged = review_released || (work_ok && gate_result == "fail");
+    let wip: WipResult = if advanced || held_marked {
+        Ok(None)
+    } else if judged {
+        // Preserved work this iteration resumed was part of what was judged:
+        // it moves to wip-failed WITH the new work and stops being merged
+        // back automatically.
+        let resumed_wips: Vec<(String, String)> = resume
+            .drop_on_stamp
+            .iter()
+            .filter(|(r, _)| *r == wip_ref(&issue, WipKind::Resume))
+            .cloned()
+            .collect();
+        let mut w = preserve(WipKind::Failed);
+        if let (Ok(None), false, Some(base)) = (&w, resumed_wips.is_empty(), isolate_base) {
+            // Nothing new on top: the judged work IS the resumed work.
+            w = preserve_wip(runner, &issue, base, base, WipKind::Failed);
+        }
+        if let Ok(Some(f)) = &w {
+            for (r, sha) in &resumed_wips {
+                if is_ancestor(runner, sha, &f.sha) {
+                    let _ = crate::gitrange::run_git(runner, &["update-ref", "-d", r, sha]);
+                }
+            }
+        }
+        w
+    } else {
+        preserve(WipKind::Resume)
+    };
     // Say what ACTUALLY held the issue back (SIRF-22 #8): "gate did not
     // pass" used to be posted even when the agent itself had exited 1.
     let held_back = if advanced {
@@ -1830,8 +1958,12 @@ pub fn run_iteration(
     } else if gate_result == "fail" {
         Some("sirius: released without advancing — gate did not pass".to_string())
     } else {
-        Some("sirius: released without advancing — the work could not be preserved".to_string())
+        Some(
+            "sirius: released without advancing — the work could not be stamped on its branch"
+                .to_string(),
+        )
     };
+    let held_back = held_back.map(|c| format!("{c}{}", wip_note(&wip)));
     let release_status: &str = if advanced {
         config.target_status.as_str()
     } else {
@@ -1845,7 +1977,10 @@ pub fn run_iteration(
         Some(release_status),
         held_back.as_deref(),
     );
-    let mut release_ev = json!({"status": release_status, "advanced": advanced});
+    let mut release_ev = with_wip(
+        json!({"status": release_status, "advanced": advanced}),
+        &wip,
+    );
     if let Some(sum) = review_summary {
         release_ev["review"] = json!(sum.line());
     }
@@ -1959,6 +2094,10 @@ pub struct ReviewCtx<'a, 'r> {
     pub worker: &'a str,
     pub issue: &'a str,
     pub fleet: &'a Fleet,
+    /// The commit THIS iteration's worktree was reset to (SIRF-42: the base
+    /// ref's tip at claim time, else `fleet.base`) — every review diff range
+    /// starts here, never at the launch snapshot.
+    pub base: &'a str,
     pub iter_ref: Option<i64>,
     pub base_env: &'a [(String, String)],
     pub spine: Option<&'a crate::spine::Spine>,
@@ -2140,45 +2279,639 @@ fn held_ref(issue: &str) -> String {
 /// retried) and the issue starts fresh.
 fn resume_held(amt: &Amt, runner: &dyn Runner, issue: &str, worker: &str) -> Option<String> {
     let held = held_ref(issue);
-    let sha = crate::gitrange::run_git(runner, &["show-ref", "--verify", "--hash", &held])
-        .ok()
-        .map(|o| o.stdout.trim().to_string())
-        .filter(|s| !s.is_empty())?;
-    let landed = crate::gitrange::run_git(runner, &["merge-base", "--is-ancestor", &sha, "HEAD"]);
-    if landed.is_ok() {
-        let _ = crate::gitrange::run_git(runner, &["update-ref", "-d", &held]);
-        return None; // already on the base — nothing to resume
+    let sha = ref_sha(runner, &held)?;
+    let conflicted = format!("refs/sirius/held-conflicted/{}", issue.to_lowercase());
+    match resume_ref(
+        amt,
+        runner,
+        issue,
+        worker,
+        &held,
+        &sha,
+        &conflicted,
+        "held",
+        None,
+    ) {
+        ResumeOutcome::Merged(sha) => Some(sha),
+        _ => None,
     }
-    if crate::gitrange::run_git(runner, &["merge", "--no-edit", &sha]).is_ok() {
+}
+
+/// How one resume attempt ended ([`resume_ref`]).
+#[derive(Debug, PartialEq)]
+enum ResumeOutcome {
+    /// Merged onto the worktree; carries the merged sha.
+    Merged(String),
+    /// Already on the base: the ref was removed, nothing to resume.
+    Landed,
+    /// Already in what an earlier resume merged this iteration: kept until
+    /// the stamp (the stamped work contains it).
+    Contained,
+    /// Did not merge: parked at the conflicted ref (a conflict) or left in
+    /// place for the next claim (any other merge failure).
+    NotMerged,
+}
+
+/// Merge `sha` (what `live` points at) into the freshly reset worktree — a
+/// REAL merge in the issue's history (the repo's identity and hooks). Shared
+/// by held (SIRF-32) and preserved (SIRF-41) work; `label` names it on the
+/// board ("held" / "preserved"). `base` is `Some(iteration base)` when an
+/// earlier resume already moved HEAD off the base, so "already in HEAD" can
+/// tell landed work (ref removed) from work merely contained in that resume.
+#[allow(clippy::too_many_arguments)]
+fn resume_ref(
+    amt: &Amt,
+    runner: &dyn Runner,
+    issue: &str,
+    worker: &str,
+    live: &str,
+    sha: &str,
+    conflicted: &str,
+    label: &str,
+    base: Option<&str>,
+) -> ResumeOutcome {
+    if is_ancestor(runner, sha, "HEAD") {
+        if base.is_some_and(|b| !is_ancestor(runner, sha, b)) {
+            return ResumeOutcome::Contained;
+        }
+        let _ = crate::gitrange::run_git(runner, &["update-ref", "-d", live]);
+        return ResumeOutcome::Landed; // already on the base — nothing to resume
+    }
+    if crate::gitrange::run_git(runner, &["merge", "--no-edit", sha]).is_ok() {
         let _ = amt.comment_as(
             issue,
-            &format!("sirius: resuming the work held at {held} ({sha})"),
+            &format!("sirius: resuming the work {label} at {live} ({sha})"),
             worker,
         );
-        return Some(sha);
+        return ResumeOutcome::Merged(sha.to_string());
     }
-    let conflicted = crate::gitrange::run_git(runner, &["diff", "--name-only", "--diff-filter=U"])
-        .map(|o| !o.stdout.trim().is_empty())
-        .unwrap_or(false);
+    let had_conflicts =
+        crate::gitrange::run_git(runner, &["diff", "--name-only", "--diff-filter=U"])
+            .map(|o| !o.stdout.trim().is_empty())
+            .unwrap_or(false);
     let _ = crate::gitrange::run_git(runner, &["merge", "--abort"]);
     let _ = crate::gitrange::run_git(runner, &["reset", "-q", "--hard", "HEAD"]);
-    if conflicted {
-        let parked = format!("refs/sirius/held-conflicted/{}", issue.to_lowercase());
-        let _ = crate::gitrange::run_git(runner, &["update-ref", &parked, &sha]);
-        let _ = crate::gitrange::run_git(runner, &["update-ref", "-d", &held]);
+    if had_conflicts {
+        let _ = crate::gitrange::run_git(runner, &["update-ref", conflicted, sha]);
+        let _ = crate::gitrange::run_git(runner, &["update-ref", "-d", live]);
         let _ = amt.comment_as(
             issue,
-            &format!("sirius: the held work ({sha}) no longer merges onto the base — starting fresh; the held commits are kept at {parked}"),
+            &format!("sirius: the {label} work ({sha}) no longer merges onto the base — starting fresh; the {label} commits are kept at {conflicted}"),
             worker,
         );
     } else {
         let _ = amt.comment_as(
             issue,
-            &format!("sirius: could not merge the held work ({sha}) — starting fresh this time; it stays at {held} and is retried on the next claim"),
+            &format!("sirius: could not merge the {label} work ({sha}) — starting fresh this time; it stays at {live} and is retried on the next claim"),
             worker,
         );
     }
-    None
+    ResumeOutcome::NotMerged
+}
+
+// ── SIRF-41: never lose work; resume it ────────────────────────────────────
+
+/// Where a non-advancing iteration's work is pinned — and so whether the
+/// next claim merges it back by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WipKind {
+    /// INTERRUPTED work (agent timeout/kill/failure, a usage limit, a lost
+    /// lease, a stamp that failed): `refs/sirius/wip/<issue>`, merged back
+    /// automatically on the next claim (`SIRIUS_RESUMED_FROM`).
+    Resume,
+    /// Work that was JUDGED and failed (gate deadend, review release):
+    /// `refs/sirius/wip-failed/<issue>`, kept and offered to the next agent
+    /// as `SIRIUS_PRIOR_WORK`, never merged automatically.
+    Failed,
+}
+
+/// `refs/sirius/<kind>/<issue>`: the issue key is the 4th path segment,
+/// which is how `sirius link --changed` (`gitrange::issue_refs`) knows these
+/// commits are this issue's own work.
+fn wip_ref(issue: &str, kind: WipKind) -> String {
+    let ns = match kind {
+        WipKind::Resume => "wip",
+        WipKind::Failed => "wip-failed",
+    };
+    format!("refs/sirius/{ns}/{}", issue.to_lowercase())
+}
+
+/// Park an older preserved commit a new one does not contain — never
+/// overwritten into oblivion (mirrors `held-superseded`).
+fn park_superseded(runner: &dyn Runner, issue: &str, sha: &str) -> String {
+    let parked = format!(
+        "refs/sirius/wip-superseded/{}/{}",
+        issue.to_lowercase(),
+        short_sha(sha)
+    );
+    let _ = crate::gitrange::run_git(runner, &["update-ref", &parked, sha]);
+    parked
+}
+
+/// Work pinned by [`preserve_wip`]: the release comment and the NDJSON
+/// `release` event's `wip_ref` carry it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WipRef {
+    pub ref_name: String,
+    pub sha: String,
+    /// `git diff --shortstat` of the work against the iteration base.
+    pub diffstat: String,
+    /// The uncommitted rest could NOT be committed (why): only the
+    /// committed work is pinned.
+    pub partial: Option<String>,
+}
+
+impl WipRef {
+    fn json(&self) -> Value {
+        let mut v = json!({"ref": self.ref_name, "sha": self.sha, "diffstat": self.diffstat});
+        if let Some(p) = &self.partial {
+            v["partial"] = json!(p);
+        }
+        v
+    }
+
+    /// The release comment's tail.
+    fn suffix(&self) -> String {
+        format!(
+            " — work preserved at {} ({}, {}){}",
+            self.ref_name,
+            short_sha(&self.sha),
+            self.diffstat,
+            match &self.partial {
+                Some(p) =>
+                    format!(" — committed work only: the uncommitted rest could NOT be saved ({p})"),
+                None => String::new(),
+            }
+        )
+    }
+}
+
+/// `Ok(None)`: nothing new to preserve. `Err`: there was work and pinning it
+/// FAILED — said loudly, never silently dropped.
+type WipResult = Result<Option<WipRef>, String>;
+
+/// The release comment's tail for a preserve attempt.
+fn wip_note(w: &WipResult) -> String {
+    match w {
+        Ok(Some(w)) => w.suffix(),
+        Ok(None) => String::new(),
+        Err(e) => {
+            format!(" — preserving the work FAILED ({e}); it is lost at this worker's next reset")
+        }
+    }
+}
+
+/// Add `wip_ref` (or `wip_error`) to a release event — additive only.
+fn with_wip(mut ev: Value, w: &WipResult) -> Value {
+    match w {
+        Ok(Some(w)) => ev["wip_ref"] = w.json(),
+        Err(e) => ev["wip_error"] = json!(e),
+        Ok(None) => {}
+    }
+    ev
+}
+
+fn short_sha(sha: &str) -> &str {
+    &sha[..sha.len().min(12)]
+}
+
+/// What `r` points at, if it exists.
+fn ref_sha(runner: &dyn Runner, r: &str) -> Option<String> {
+    crate::gitrange::run_git(runner, &["show-ref", "--verify", "--hash", r])
+        .ok()
+        .map(|o| o.stdout.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn is_ancestor(runner: &dyn Runner, a: &str, b: &str) -> bool {
+    crate::gitrange::run_git(runner, &["merge-base", "--is-ancestor", a, b]).is_ok()
+}
+
+/// Does the tree hold uncommitted work? Suite-owned telemetry (hook-written
+/// `.suite/` events and the like) alone is not work.
+fn worktree_dirty(runner: &dyn Runner) -> Result<bool, String> {
+    let mut args = vec!["status", "--porcelain", "--", "."];
+    args.extend(FINGERPRINT_EXCLUDES);
+    crate::gitrange::run_git(runner, &args).map(|o| !o.stdout.trim().is_empty())
+}
+
+/// Does HEAD's tree differ from `floor`'s? (Commits that net to nothing are
+/// not work.) Exit 1 = differs; anything but 0/1 is an error.
+fn tree_differs(runner: &dyn Runner, floor: &str) -> Result<bool, String> {
+    let out = runner
+        .run(
+            "git",
+            &["diff", "--no-ext-diff", "--quiet", floor, "HEAD", "--"],
+        )
+        .map_err(|e| e.to_string())?;
+    match out.code {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => Err(format!(
+            "git diff {floor} HEAD failed: {}",
+            out.stderr.trim()
+        )),
+    }
+}
+
+/// Commit everything in the worktree (`add -A`) as sirius's own wip commit,
+/// with NO repo hooks (`--no-verify` + an empty hooks path: a failing lint
+/// hook, or a commit-msg rewrite, must not cost or alter the work). Retries
+/// once under sirius's own identity with signing off (a machine without a
+/// git identity), after clearing an `index.lock` left by the killed agent —
+/// the worktree is this worker's alone and the agent is gone. `Err` when the
+/// tree is still dirty.
+fn commit_all(runner: &dyn Runner, msg: &str) -> Result<(), String> {
+    let clean = || {
+        crate::gitrange::run_git(runner, &["status", "--porcelain"])
+            .map(|o| o.stdout.trim().is_empty())
+            .unwrap_or(false)
+    };
+    let attempt = |extra: &[&str]| {
+        let _ = crate::gitrange::run_git(runner, &["add", "-A"]);
+        let mut args: Vec<&str> = vec!["-c", "core.hooksPath=/dev/null"];
+        args.extend(extra);
+        args.extend(["commit", "--no-verify", "-q", "-m", msg]);
+        let _ = crate::gitrange::run_git(runner, &args);
+    };
+    attempt(&[]);
+    if clean() {
+        return Ok(());
+    }
+    if let Ok(o) = crate::gitrange::run_git(
+        runner,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "index.lock",
+        ],
+    ) {
+        let lock = std::path::PathBuf::from(o.stdout.trim());
+        if lock.is_absolute() && lock.exists() {
+            eprintln!(
+                "sirius: removing a stale {} left by the agent",
+                lock.display()
+            );
+            let _ = std::fs::remove_file(&lock);
+        }
+    }
+    attempt(&[
+        "-c",
+        "user.name=sirius",
+        "-c",
+        "user.email=sirius@localhost",
+        "-c",
+        "commit.gpgsign=false",
+    ]);
+    if clean() {
+        Ok(())
+    } else {
+        Err("the worktree is still dirty after the wip commit".into())
+    }
+}
+
+/// Point `target` at `sha` with a compare-and-swap, so two writers (a
+/// worker that lost its lease and the issue's new holder) can never
+/// silently overwrite each other: an older value `sha` does not contain is
+/// parked at `refs/sirius/wip-superseded/<issue>/<sha12>` first, and a value
+/// that changed under us is re-read and re-judged.
+fn pin_ref(runner: &dyn Runner, issue: &str, target: &str, sha: &str) -> Result<(), String> {
+    let mut last = String::new();
+    for _ in 0..3 {
+        let old = ref_sha(runner, target);
+        if let Some(old) = &old {
+            if old != sha && !is_ancestor(runner, old, sha) {
+                park_superseded(runner, issue, old);
+            }
+        }
+        // An empty old value = "must not exist yet".
+        let expect = old.unwrap_or_default();
+        match crate::gitrange::run_git(runner, &["update-ref", target, sha, &expect]) {
+            Ok(_) => return Ok(()),
+            Err(e) => last = e,
+        }
+    }
+    Err(format!("cannot point {target} at {sha}: {last}"))
+}
+
+/// Park work that is about to be DISCARDED on purpose (a fix round reverted
+/// to its last reviewed checkpoint `head`): committed and pinned at
+/// `refs/sirius/wip-superseded/<issue>/<sha12>` — never merged back, but
+/// never unreferenced either. `None` when there is nothing past `head`.
+fn park_attempt(runner: &dyn Runner, issue: &str, head: &str) -> Option<String> {
+    let dirty = worktree_dirty(runner).unwrap_or(true);
+    if !dirty && !tree_differs(runner, head).unwrap_or(true) {
+        return None;
+    }
+    if dirty {
+        let _ = commit_all(runner, &format!("sirius: discarded attempt {issue}"));
+    }
+    let sha = crate::gitrange::head_rev(runner).ok()?;
+    if sha == head {
+        return None;
+    }
+    let parked = park_superseded(runner, issue, &sha);
+    eprintln!("sirius: {issue}: the discarded attempt is parked at {parked}");
+    Some(parked)
+}
+
+/// SIRF-41: pin the worktree's work before a non-advancing release, so a
+/// killed agent's finished commit is never left dangling on a detached HEAD
+/// (MSX-80: a whole implementation recoverable only by `git fsck`).
+///
+/// `floor` is what the iteration started from (the base plus any resumed
+/// work): with a clean tree and HEAD's content still at the floor there is
+/// nothing new — `Ok(None)`. Otherwise everything is committed (`add -A`,
+/// untracked non-ignored files included) as `sirius: wip <issue>` and the
+/// result pinned at `refs/sirius/wip[-failed]/<issue>`. The wip commit skips
+/// repo hooks (`--no-verify`): a failing lint hook must not cost the work.
+/// A previous ref of the same kind that HEAD does not contain is parked at
+/// `refs/sirius/wip-superseded/<issue>/<sha12>` first.
+fn preserve_wip(
+    runner: &dyn Runner,
+    issue: &str,
+    floor: &str,
+    base: &str,
+    kind: WipKind,
+) -> WipResult {
+    let r = (|| -> WipResult {
+        let dirty = worktree_dirty(runner)?;
+        if !dirty && !tree_differs(runner, floor)? {
+            return Ok(None);
+        }
+        // Commit what is uncommitted. If that fails, the agent's COMMITTED
+        // work is still pinned below — a stuck index must never cost the
+        // commits too (the MSX-80 case this exists for).
+        let partial = if dirty {
+            commit_all(runner, &format!("sirius: wip {issue}")).err()
+        } else {
+            None
+        };
+        if partial.is_some() && !tree_differs(runner, floor)? {
+            return Err(partial.unwrap_or_default());
+        }
+        let sha = crate::gitrange::head_rev(runner)?;
+        let target = wip_ref(issue, kind);
+        pin_ref(runner, issue, &target, &sha)?;
+        let diffstat = crate::gitrange::run_git(runner, &["diff", "--shortstat", base, &sha])
+            .map(|o| o.stdout.trim().to_string())
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "no change against the base".into());
+        Ok(Some(WipRef {
+            ref_name: target,
+            sha,
+            diffstat,
+            partial,
+        }))
+    })();
+    match &r {
+        Ok(Some(w)) => eprintln!("sirius: {issue}:{}", w.suffix()),
+        Err(e) => eprintln!("sirius: {issue}: FAILED to preserve the worktree's work: {e}"),
+        Ok(None) => {}
+    }
+    r
+}
+
+/// What a fleet iteration resumed at claim time ([`resume_work`]).
+#[derive(Debug, Default)]
+struct Resume {
+    /// The LAST sha merged in (`SIRIUS_RESUMED_FROM`).
+    resumed: Option<String>,
+    /// The ref it came from (`SIRIUS_RESUME_REF`).
+    resume_ref: Option<String>,
+    /// Refs (with the sha seen) the stamped work will contain: removed only
+    /// once the work is stamped at completion.
+    drop_on_stamp: Vec<(String, String)>,
+    /// Judged-and-failed earlier work (ref, sha): `SIRIUS_PRIOR_WORK`.
+    prior_work: Option<(String, String)>,
+}
+
+/// Resume an issue's held (SIRF-32) and preserved (SIRF-41) work onto the
+/// freshly reset worktree, and find judged-and-failed earlier work.
+///
+/// Preserved work that already CONTAINS the held commit (held work resumed,
+/// then interrupted) supersedes it: merging both would stack the wip merge
+/// above the held one, and `sirius link --changed` follows only the resume
+/// merge at the bottom of the line — the wip commits would never be stamped.
+/// So the held merge is skipped then (and tried as a fallback if the wip
+/// does not merge).
+fn resume_work(amt: &Amt, runner: &dyn Runner, issue: &str, worker: &str, base: &str) -> Resume {
+    let mut r = Resume::default();
+    let held = held_ref(issue);
+    let wip = wip_ref(issue, WipKind::Resume);
+    let wip_sha = ref_sha(runner, &wip);
+    let held_sha = wip_sha.as_ref().and_then(|_| ref_sha(runner, &held));
+    let held_in_wip = match (&held_sha, &wip_sha) {
+        (Some(h), Some(w)) => is_ancestor(runner, h, w),
+        _ => false,
+    };
+    let resume_held_into = |r: &mut Resume| {
+        if let Some(sha) = resume_held(amt, runner, issue, worker) {
+            r.drop_on_stamp.push((held.clone(), sha.clone()));
+            r.resumed = Some(sha);
+            r.resume_ref = Some(held.clone());
+        }
+    };
+    if !held_in_wip {
+        resume_held_into(&mut r);
+    }
+    if let Some(sha) = &wip_sha {
+        let conflicted = format!("refs/sirius/wip-conflicted/{}", issue.to_lowercase());
+        let moved = r.resumed.is_some().then_some(base);
+        match resume_ref(
+            amt,
+            runner,
+            issue,
+            worker,
+            &wip,
+            sha,
+            &conflicted,
+            "preserved",
+            moved,
+        ) {
+            ResumeOutcome::Merged(sha) => {
+                r.drop_on_stamp.push((wip.clone(), sha.clone()));
+                if let (true, Some(h)) = (held_in_wip, &held_sha) {
+                    r.drop_on_stamp.push((held.clone(), h.clone()));
+                }
+                r.resumed = Some(sha);
+                r.resume_ref = Some(wip.clone());
+            }
+            ResumeOutcome::Contained => r.drop_on_stamp.push((wip.clone(), sha.clone())),
+            ResumeOutcome::Landed | ResumeOutcome::NotMerged => {
+                if held_in_wip {
+                    resume_held_into(&mut r);
+                }
+            }
+        }
+    }
+    let failed = wip_ref(issue, WipKind::Failed);
+    if let Some(sha) = ref_sha(runner, &failed) {
+        if is_ancestor(runner, &sha, base) {
+            let _ = crate::gitrange::run_git(runner, &["update-ref", "-d", &failed, &sha]);
+        } else if is_ancestor(runner, &sha, "HEAD") {
+            r.drop_on_stamp.push((failed, sha));
+        } else {
+            let _ = amt.comment_as(
+                issue,
+                &format!("sirius: an earlier attempt's work failed its gate or review — kept at {failed} ({}), offered to the agent as SIRIUS_PRIOR_WORK (not merged)", short_sha(&sha)),
+                worker,
+            );
+            r.prior_work = Some((failed, sha));
+        }
+    }
+    r
+}
+
+/// The work is stamped (completion): retire the markers it contains. The
+/// held ref keeps its SIRF-32 form; wip refs are removed only if they still
+/// point where this iteration saw them (a lost-lease sibling may have pinned
+/// newer work meanwhile). Prior failed work the completed work does not
+/// contain is parked — the issue is done; it must not be offered again.
+fn retire_resumed(runner: &dyn Runner, issue: &str, resume: &Resume) {
+    let held = held_ref(issue);
+    for (r, sha) in &resume.drop_on_stamp {
+        if *r == held {
+            let _ = crate::gitrange::run_git(runner, &["update-ref", "-d", r]);
+        } else {
+            let _ = crate::gitrange::run_git(runner, &["update-ref", "-d", r, sha]);
+        }
+    }
+    if let Some((r, sha)) = &resume.prior_work {
+        if !is_ancestor(runner, sha, "HEAD") {
+            park_superseded(runner, issue, sha);
+        }
+        let _ = crate::gitrange::run_git(runner, &["update-ref", "-d", r, sha]);
+    }
+}
+
+// ── SIRF-42: a fresh base per iteration ────────────────────────────────────
+
+/// The commit this iteration's worktree is reset to: the base ref's tip
+/// right now (`git rev-parse --verify <ref>^{commit}`), falling back to the
+/// launch base when the fleet has no base ref or it does not resolve.
+fn iteration_base(runner: &dyn Runner, base_ref: Option<&str>, launch: &str) -> String {
+    static NOTED_DETACHED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    let Some(r) = base_ref else {
+        if !NOTED_DETACHED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "sirius: no base ref (detached launch, no review.base_ref) — every iteration builds on the launch base {}",
+                short_sha(launch)
+            );
+        }
+        return launch.to_string();
+    };
+    match crate::gitrange::run_git(
+        runner,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{r}^{{commit}}"),
+        ],
+    ) {
+        Ok(o) if !o.stdout.trim().is_empty() => o.stdout.trim().to_string(),
+        _ => {
+            eprintln!(
+                "sirius: base ref `{r}` does not resolve to a commit — this iteration builds on the launch base {}",
+                short_sha(launch)
+            );
+            launch.to_string()
+        }
+    }
+}
+
+// ── SIRF-49: the built-in branch guard ─────────────────────────────────────
+
+/// What [`guard_branch`] found and did.
+struct BranchGuard {
+    branch: String,
+    sha: Option<String>,
+    /// Where the branch's commit is pinned (None: unborn, or the pin failed).
+    keep_ref: Option<String>,
+    detached: bool,
+}
+
+/// A ref path segment: lowercase (macOS refs are case-insensitive files —
+/// `sirius/LYD-54` and `sirius/lyd-54` collide), `[a-z0-9_-]` only.
+fn ref_segment(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// SIRF-49: an agent left a named branch checked out in its worktree. Parked
+/// there it blocks sibling worktrees from checking it out, and the next
+/// iteration's reset would wipe it (Lydgr: on macOS `sirius/LYD-54` IS the
+/// file `sirius/lyd-54` sirius stamps). Pin its commit at
+/// `refs/sirius/keep/<issue>/<branch>` and detach HEAD in place (plumbing
+/// `update-ref --no-deref`, which works with any index state and runs no
+/// hooks — `checkout --detach` refuses mid-merge). The branch itself is
+/// never touched or deleted. An UNBORN branch (`switch --orphan`) has no
+/// commit to pin: HEAD is detached at `fallback` (the iteration's floor), so
+/// sirius's own commits can never land as root commits on the orphan.
+fn guard_branch(runner: &dyn Runner, issue: &str, fallback: &str) -> Option<BranchGuard> {
+    let full = crate::gitrange::run_git(runner, &["symbolic-ref", "-q", "HEAD"])
+        .ok()?
+        .stdout
+        .trim()
+        .to_string();
+    if full.is_empty() {
+        return None; // detached — as it should be
+    }
+    let branch = full
+        .strip_prefix("refs/heads/")
+        .unwrap_or(&full)
+        .to_string();
+    let sha = crate::gitrange::head_rev(runner).ok();
+    let mut keep_ref = None;
+    if let Some(sha) = &sha {
+        let mut keep = format!(
+            "refs/sirius/keep/{}/{}",
+            issue.to_lowercase(),
+            ref_segment(&branch)
+        );
+        // An earlier pin of a same-named branch this commit does not contain
+        // is kept, not overwritten.
+        if let Some(old) = ref_sha(runner, &keep) {
+            if old != *sha && !is_ancestor(runner, &old, sha) {
+                keep = format!("{keep}-{}", short_sha(sha));
+            }
+        }
+        if crate::gitrange::run_git(runner, &["update-ref", &keep, sha]).is_ok() {
+            keep_ref = Some(keep);
+        }
+    }
+    let at = sha.as_deref().unwrap_or(fallback);
+    let detached =
+        crate::gitrange::run_git(runner, &["update-ref", "--no-deref", "HEAD", at]).is_ok();
+    eprintln!(
+        "sirius: WARNING {issue}: the agent left branch `{branch}` checked out in its worktree — {}{}",
+        match &keep_ref {
+            Some(k) => format!("pinned at {k}"),
+            None => "could NOT pin it".into(),
+        },
+        if detached {
+            "; HEAD detached (the branch itself is untouched)"
+        } else {
+            "; detaching FAILED"
+        }
+    );
+    Some(BranchGuard {
+        branch,
+        sha,
+        keep_ref,
+        detached,
+    })
 }
 
 /// Blocking `conflict` findings: the work does not merge onto `r` at `cur`.
@@ -2268,8 +3001,9 @@ fn review_once(
 
     // Which tree to review: the worker's own, or a throwaway merge of the
     // work onto the CURRENT base tip (catches clashes with work merged since
-    // launch). Falls back to the launch base when there is nothing newer.
-    let mut diff_range = format!("{}..HEAD", fleet.base);
+    // this iteration began). Falls back to the iteration base when there is
+    // nothing newer.
+    let mut diff_range = format!("{}..HEAD", cx.base);
     // The merge tree, when the review is against a moved base.
     let mut tmp: Option<std::path::PathBuf> = None;
     let base_ref = rc.base_ref.clone().or_else(|| fleet.base_ref.clone());
@@ -2283,7 +3017,7 @@ fn review_once(
         .filter(|c| !c.is_empty())
     });
     // SIRF-30/31: the in-flight siblings, and the facts no reviewer decides.
-    let tip = cur.clone().unwrap_or_else(|| fleet.base.clone());
+    let tip = cur.clone().unwrap_or_else(|| cx.base.to_string());
     let frontier_mode = rc.against == crate::config::ReviewAgainst::Frontier;
     fleet.register_inflight(cx.worker, cx.issue, &head);
     let (sibs, sibs_complete) = if frontier_mode || !rc.sequences.is_empty() {
@@ -2310,7 +3044,7 @@ fn review_once(
     let (mut auto, seq_complete) = crate::frontier::sequence_collisions(
         cx.runner,
         &rc.sequences,
-        &fleet.base,
+        cx.base,
         &head,
         &tip,
         &seq_sibs,
@@ -2344,7 +3078,7 @@ fn review_once(
             } => {
                 let ours = crate::gitrange::changed_files(
                     cx.runner,
-                    Some(&format!("{}..{head}", fleet.base)),
+                    Some(&format!("{}..{head}", cx.base)),
                 )
                 .unwrap_or_default();
                 let branches: Vec<&str> = merged.iter().map(|s| s.branch.as_str()).collect();
@@ -2370,7 +3104,7 @@ fn review_once(
                 sibling_conflicts,
             } => {
                 remove_review_tree(cx, &t);
-                let label = base_ref.as_deref().unwrap_or("the launch base");
+                let label = base_ref.as_deref().unwrap_or("the iteration base");
                 let mut findings = base_conflict_findings(round, label, &tip, &files);
                 findings.extend(sibling_conflicts);
                 findings.append(&mut auto);
@@ -2390,7 +3124,7 @@ fn review_once(
         }
     } else if rc.against == crate::config::ReviewAgainst::CurrentBaseMerge {
         match (base_ref, cur) {
-            (Some(r), Some(cur)) if cur != fleet.base => {
+            (Some(r), Some(cur)) if cur != cx.base => {
                 let t = match add_review_tree(cx, &cur) {
                     Ok(t) => t,
                     Err(detail) => {
@@ -2440,10 +3174,10 @@ fn review_once(
                 tmp = Some(t);
             }
             (None, _) => eprintln!(
-                "sirius: review.against=current-base-merge but no base_ref (detached launch) — reviewing against the launch base"
+                "sirius: review.against=current-base-merge but no base_ref (detached launch) — reviewing against the iteration base"
             ),
             (Some(r), None) => eprintln!(
-                "sirius: review base_ref `{r}` does not resolve to a commit — reviewing against the launch base instead"
+                "sirius: review base_ref `{r}` does not resolve to a commit — reviewing against the iteration base instead"
             ),
             _ => {} // the base has not moved: the plain diff IS the merge
         }
@@ -2729,7 +3463,7 @@ pub fn run_review_stage(cx: &ReviewCtx, out: &mut dyn Write, fix_round: &FixRoun
     let worker = cx.worker;
 
     // A diff touching only `skip_paths` (docs, say) is not worth a review.
-    if let Ok(files) = crate::gitrange::changed_since(cx.runner, Some(&cx.fleet.base), &[]) {
+    if let Ok(files) = crate::gitrange::changed_since(cx.runner, Some(cx.base), &[]) {
         // Nothing changed (the gate was "skipped") or only skip_paths did.
         if files.is_empty() || crate::review::all_skippable(&files, &rc.skip_paths) {
             emit_event(
@@ -2988,7 +3722,7 @@ pub fn run_review_stage(cx: &ReviewCtx, out: &mut dyn Write, fix_round: &FixRoun
         let env = vec![
             kv("SIRIUS_ROUND", round.to_string()),
             kv("SIRIUS_REVIEW_DIR", cx.fleet.worktree.display().to_string()),
-            kv("SIRIUS_DIFF_RANGE", format!("{}..HEAD", cx.fleet.base)),
+            kv("SIRIUS_DIFF_RANGE", format!("{}..HEAD", cx.base)),
             kv(
                 "SIRIUS_REVIEW_FINDINGS",
                 findings_path.display().to_string(),
@@ -3006,6 +3740,15 @@ pub fn run_review_stage(cx: &ReviewCtx, out: &mut dyn Write, fix_round: &FixRoun
                 if !work_ok || gate_result == "fail" {
                     // Never trade gate-passing work for a broken fix: put the
                     // last reviewed (and gated) state back, then escalate.
+                    // The discarded attempt is parked first (SIRF-41: a
+                    // killed fix agent may have finished, too).
+                    if let Some(parked) = park_attempt(cx.runner, issue, &head) {
+                        let _ = cx.amt.comment_as(
+                            issue,
+                            &format!("sirius: fix round {round} did not hold — its work is parked at {parked}; reverted to the last reviewed state"),
+                            worker,
+                        );
+                    }
                     revert_to(cx, &head);
                     let paused = cx.fleet.paused();
                     if let Some(line) = &paused {
@@ -5709,6 +6452,12 @@ mod tests {
         let m = MockRunner::new();
         program_review_iteration(&m, "AMT-85");
         checkpoint_heads(&m, &["ck1"]);
+        // SIRF-42: the iteration base, resolved at claim (main had not moved yet).
+        m.expect(
+            &["git", "rev-parse", "--verify", "--quiet", "main^{commit}"],
+            0,
+            "base999\n",
+        );
         m.expect(&["git", "rev-parse", "--verify"], 0, "cur777\n");
         m.push(MockResponse::new(
             &["git", "-C"],
@@ -6280,6 +7029,12 @@ mod tests {
         let m = MockRunner::new();
         program_review_iteration(&m, "AMT-63");
         checkpoint_heads(&m, &["ck1", "ck2"]);
+        // SIRF-42: the iteration base, resolved at claim (main had not moved yet).
+        m.expect(
+            &["git", "rev-parse", "--verify", "--quiet", "main^{commit}"],
+            0,
+            "base999\n",
+        );
         m.expect(&["git", "rev-parse", "--verify"], 0, "cur777\n"); // round 1
         m.expect(&["git", "rev-parse", "--verify"], 0, "cur777\n"); // round 2
         m.push(MockResponse::new(
@@ -7177,5 +7932,723 @@ mod tests {
         let tail = gates[0]["error_tail"].as_str().unwrap();
         assert!(tail.ends_with("does not exist"), "{tail}");
         assert_eq!(tail.lines().count(), crate::gate::ERROR_TAIL_LINES);
+    }
+
+    // ---- SIRF-41 / SIRF-42 / SIRF-49 against REAL git ---------------------
+
+    /// One git call in `at` with a fixed identity, panicking with context.
+    fn git_at(at: &std::path::Path, args: &[&str]) -> String {
+        let r = crate::shell::RealRunner {
+            cwd: Some(at.to_path_buf()),
+        };
+        let mut full = vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+        ];
+        full.extend(args);
+        crate::gitrange::run_git(&r, &full)
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"))
+            .stdout
+            .trim()
+            .to_string()
+    }
+
+    /// Write `name` in `at` and commit it there; returns the new HEAD.
+    fn commit_file(at: &std::path::Path, name: &str) -> String {
+        std::fs::write(at.join(name), name).unwrap();
+        git_at(at, &["add", "-A"]);
+        git_at(at, &["commit", "-q", "-m", name]);
+        git_at(at, &["rev-parse", "HEAD"])
+    }
+
+    /// The files in commit `sha`'s tree.
+    fn tree_files(at: &std::path::Path, sha: &str) -> Vec<String> {
+        let mut v: Vec<String> = git_at(at, &["ls-tree", "-r", "--name-only", sha])
+            .lines()
+            .map(String::from)
+            .collect();
+        v.sort();
+        v
+    }
+
+    type AgentAction = Box<dyn Fn(&std::path::Path) + Send>;
+
+    /// A fleet worker over a REAL repo: git runs for real in the worker's
+    /// worktree; amt, hayven and the gate's test command go to the mock; an
+    /// agent spawn first plays its scripted action in the worktree, then the
+    /// mock decides how it ends (exit code / timeout). Every call is logged
+    /// in order, git included.
+    struct GitWorld {
+        dir: std::path::PathBuf,
+        repo: std::path::PathBuf,
+        wt: std::path::PathBuf,
+        base: String,
+        fleet: Fleet,
+        mock: MockRunner,
+        git: crate::shell::RealRunner,
+        log: std::sync::Mutex<Vec<String>>,
+        agents: std::sync::Mutex<std::collections::VecDeque<AgentAction>>,
+    }
+
+    impl crate::shell::Runner for GitWorld {
+        fn run(&self, program: &str, args: &[&str]) -> std::io::Result<crate::shell::CmdOutput> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{program} {}", args.join(" ")));
+            if program == "git" {
+                self.git.run(program, args)
+            } else {
+                self.mock.run(program, args)
+            }
+        }
+
+        fn run_agent(
+            &self,
+            program: &str,
+            args: &[&str],
+            opts: &AgentRunOpts,
+            heartbeat: &mut dyn FnMut(),
+        ) -> std::io::Result<AgentOutcome> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("AGENT {program} {}", args.join(" ")));
+            let act = self.agents.lock().unwrap().pop_front();
+            if let Some(act) = act {
+                act(&self.wt);
+            }
+            self.mock.run_agent(program, args, opts, heartbeat)
+        }
+    }
+
+    impl GitWorld {
+        /// A repo with `base.txt` on `main`, and a worker worktree detached at
+        /// it — what `sirius run` builds at launch.
+        fn new(tag: &str) -> GitWorld {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let dir =
+                std::env::temp_dir().join(format!("sirius-wip-{tag}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let repo = dir.join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            git_at(&repo, &["init", "-q", "-b", "main"]);
+            // Repo-local identity: the worker's own commits (completion,
+            // resume merges) must not depend on the machine's git config.
+            git_at(&repo, &["config", "user.name", "t"]);
+            git_at(&repo, &["config", "user.email", "t@t"]);
+            git_at(&repo, &["config", "commit.gpgsign", "false"]);
+            let base = commit_file(&repo, "base.txt");
+            let wt = dir.join("wt");
+            let wt_str = crate::gitrange::git_path(&wt);
+            git_at(
+                &repo,
+                &["worktree", "add", "-q", "--detach", &wt_str, &base],
+            );
+            let fleet = Fleet {
+                base_ref: Some("main".into()),
+                worktree: wt.clone(),
+                ..test_fleet(&base)
+            };
+            GitWorld {
+                git: crate::shell::RealRunner {
+                    cwd: Some(wt.clone()),
+                },
+                dir,
+                repo,
+                wt,
+                base,
+                fleet,
+                mock: MockRunner::new(),
+                log: Default::default(),
+                agents: Default::default(),
+            }
+        }
+
+        fn agent(&self, f: impl Fn(&std::path::Path) + Send + 'static) {
+            self.agents.lock().unwrap().push_back(Box::new(f));
+        }
+
+        /// One fleet iteration claiming `issue`; returns the outcome and the
+        /// NDJSON events.
+        fn iterate(&self, issue: &str, c: &Config) -> (IterationOutcome, Vec<Value>) {
+            self.mock.expect(
+                &["amt", "--json", "claim", "--agent"],
+                0,
+                &format!(r#"{{"id":"{issue}","title":"T"}}"#),
+            );
+            let (amt, hv) = (Amt::new(self), Hayven::new(self));
+            let led = Ledger::open_in_memory().unwrap();
+            let mut out = Vec::new();
+            let o = run_iteration(
+                &amt,
+                &hv,
+                &led,
+                c,
+                self,
+                "sirius/oak",
+                Some("todo"),
+                "true",
+                &mut out,
+                None,
+                Some(&self.fleet),
+            );
+            let evs = String::from_utf8(out)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            (o, evs)
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+
+        fn ref_at(&self, r: &str) -> Option<String> {
+            ref_sha(&self.git, r)
+        }
+    }
+
+    impl Drop for GitWorld {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+            let _ = std::fs::remove_dir_all(&self.fleet.sirius_dir);
+        }
+    }
+
+    fn event<'v>(evs: &'v [Value], phase: &str) -> &'v Value {
+        evs.iter()
+            .rev()
+            .find(|e| e["phase"] == phase)
+            .unwrap_or_else(|| panic!("no {phase} event in {evs:?}"))
+    }
+
+    fn link_files(w: &GitWorld, base: &str, resumed: &str, issue: &str) -> Vec<String> {
+        let hm = MockRunner::new();
+        hm.expect(&["hayven", "affected-tests"], 0, r#"{"roots":[]}"#);
+        let got = crate::gitrange::changed_symbols(
+            &w.git,
+            &Hayven::new(&hm),
+            None,
+            Some(crate::gitrange::FleetBase {
+                base,
+                resumed_from: Some(resumed),
+                issue: Some(issue),
+                base_ref: Some("main"),
+            }),
+        )
+        .unwrap();
+        let mut files = got.files;
+        files.sort();
+        files
+    }
+
+    /// SIRF-41 "done when" + SIRF-42, end to end: a killed agent's commit
+    /// (and its uncommitted file) end up at refs/sirius/wip/<issue> BEFORE
+    /// the release; the re-claim builds on the base ref's CURRENT tip, merges
+    /// the preserved work back, and `sirius link --changed`'s resolution of
+    /// the completed line includes the resumed work — never main's commit.
+    #[test]
+    fn timed_out_work_is_preserved_then_resumed_on_the_fresh_base_and_stamped() {
+        let w = GitWorld::new("timeout");
+        let base = w.base.clone();
+        // Iteration 1: the agent commits a.txt, leaves b.txt uncommitted, and
+        // is killed by the timeout.
+        w.agent(|wt| {
+            commit_file(wt, "a.txt");
+            std::fs::write(wt.join("b.txt"), "b").unwrap();
+        });
+        w.mock.arm_agent_timeout(0);
+        let (o, evs) = w.iterate("AMT-7", &cfg());
+        assert_eq!(o, IterationOutcome::Deadend);
+        assert_eq!(event(&evs, "claim")["base_sha"], json!(base));
+        let wip = w
+            .ref_at("refs/sirius/wip/amt-7")
+            .expect("the killed agent's work is pinned");
+        assert_eq!(
+            tree_files(&w.repo, &wip),
+            vec!["a.txt", "b.txt", "base.txt"]
+        );
+        let rel = event(&evs, "release");
+        assert_eq!(rel["reason"], "agent_timeout");
+        assert_eq!(rel["wip_ref"]["ref"], "refs/sirius/wip/amt-7");
+        assert_eq!(rel["wip_ref"]["sha"], json!(wip));
+        assert!(
+            rel["wip_ref"]["diffstat"]
+                .as_str()
+                .unwrap()
+                .contains("2 files changed"),
+            "{rel}"
+        );
+        let calls = w.calls();
+        let pinned = calls
+            .iter()
+            .position(|c| c.starts_with("git update-ref refs/sirius/wip/amt-7"))
+            .expect("pinned");
+        let released = calls
+            .iter()
+            .position(|c| c.starts_with("amt --json release AMT-7"))
+            .expect("released");
+        assert!(pinned < released, "preserved BEFORE the release: {calls:?}");
+        assert!(
+            calls[released].contains("work preserved at refs/sirius/wip/amt-7"),
+            "{}",
+            calls[released]
+        );
+
+        // A predecessor lands on main meanwhile.
+        let main = commit_file(&w.repo, "landed.txt");
+        assert_ne!(main, base);
+
+        // Iteration 2: re-claim — fresh base, resumed work, agent finishes.
+        w.agent(|wt| {
+            assert!(wt.join("a.txt").exists() && wt.join("b.txt").exists());
+            assert!(wt.join("landed.txt").exists(), "built on the fresh main");
+            commit_file(wt, "c.txt");
+        });
+        w.mock
+            .expect(&["sh", "-c", "run-suite"], 0, "test result: ok");
+        let (o, evs) = w.iterate("AMT-7", &cfg());
+        assert_eq!(o, IterationOutcome::Completed, "{evs:?}");
+        assert_eq!(event(&evs, "claim")["base_sha"], json!(main));
+        let env = &w.mock.agent_envs()[1];
+        assert_eq!(env_of(env, "SIRIUS_BASE"), Some(main.clone()));
+        assert_eq!(env_of(env, "SIRIUS_BASE_REF").as_deref(), Some("main"));
+        assert_eq!(env_of(env, "SIRIUS_RESUMED_FROM"), Some(wip.clone()));
+        assert_eq!(
+            env_of(env, "SIRIUS_RESUME_REF").as_deref(),
+            Some("refs/sirius/wip/amt-7")
+        );
+        let stamped = w.ref_at("refs/heads/sirius/amt-7").expect("stamped");
+        assert_eq!(
+            tree_files(&w.repo, &stamped),
+            vec!["a.txt", "b.txt", "base.txt", "c.txt", "landed.txt"]
+        );
+        assert_eq!(
+            w.ref_at("refs/sirius/wip/amt-7"),
+            None,
+            "retired once stamped"
+        );
+        // What `sirius link --changed` stamps for the completed line.
+        assert_eq!(
+            link_files(&w, &main, &wip, "AMT-7"),
+            vec!["a.txt", "b.txt", "c.txt"]
+        );
+    }
+
+    /// SIRF-42: every iteration resets to the base ref's tip at ITS claim,
+    /// and falls back to the launch base when the ref does not resolve.
+    #[test]
+    fn each_iteration_resets_to_the_base_refs_current_tip() {
+        let w = GitWorld::new("freshbase");
+        let launch = w.base.clone();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let main = commit_file(&w.repo, "landed.txt");
+        for _ in 0..2 {
+            let s = seen.clone();
+            w.agent(move |wt| s.lock().unwrap().push(git_at(wt, &["rev-parse", "HEAD"])));
+        }
+        // An agent that does nothing and fails: nothing to preserve.
+        w.mock
+            .push(MockResponse::new(&["sh", "-c", "true"], 1, "", "no"));
+        let (o, evs) = w.iterate("AMT-12", &cfg());
+        assert!(matches!(o, IterationOutcome::Error(_)), "{o:?}");
+        assert_eq!(event(&evs, "claim")["base_sha"], json!(main));
+        assert!(event(&evs, "release").get("wip_ref").is_none());
+        assert_eq!(w.ref_at("refs/sirius/wip/amt-12"), None);
+        // A base ref that does not resolve: the launch base.
+        let mut c = cfg();
+        c.review.base_ref = Some("no-such-branch".into());
+        w.mock
+            .push(MockResponse::new(&["sh", "-c", "true"], 1, "", "no"));
+        let (_o, evs) = w.iterate("AMT-12", &c);
+        assert_eq!(event(&evs, "claim")["base_sha"], json!(launch));
+        assert_eq!(*seen.lock().unwrap(), vec![main, launch]);
+    }
+
+    /// SIRF-41 policy: work a failing gate JUDGED is kept at wip-failed and
+    /// offered as SIRIUS_PRIOR_WORK — never merged back by itself. Once the
+    /// issue completes without it, it is parked, not offered again.
+    #[test]
+    fn gate_failed_work_is_offered_not_resumed_and_parked_at_completion() {
+        let w = GitWorld::new("failed");
+        w.agent(|wt| {
+            commit_file(wt, "bad.txt");
+        });
+        w.mock
+            .expect(&["sh", "-c", "run-suite"], 1, "test result: FAILED");
+        let mut c = cfg();
+        c.retry_budget = 1;
+        let (o, evs) = w.iterate("AMT-9", &c);
+        assert_eq!(o, IterationOutcome::Deadend);
+        let failed = w.ref_at("refs/sirius/wip-failed/amt-9").expect("kept");
+        assert_eq!(w.ref_at("refs/sirius/wip/amt-9"), None);
+        assert_eq!(event(&evs, "release")["wip_ref"]["sha"], json!(failed));
+
+        w.agent(|wt| {
+            assert!(!wt.join("bad.txt").exists(), "never merged back by itself");
+            commit_file(wt, "good.txt");
+        });
+        w.mock
+            .expect(&["sh", "-c", "run-suite"], 0, "test result: ok");
+        let (o, _evs) = w.iterate("AMT-9", &c);
+        assert_eq!(o, IterationOutcome::Completed);
+        let env = &w.mock.agent_envs()[1];
+        assert_eq!(
+            env_of(env, "SIRIUS_PRIOR_WORK").as_deref(),
+            Some("refs/sirius/wip-failed/amt-9")
+        );
+        assert_eq!(env_of(env, "SIRIUS_RESUMED_FROM"), None);
+        assert_eq!(w.ref_at("refs/sirius/wip-failed/amt-9"), None);
+        assert_eq!(
+            w.ref_at(&format!(
+                "refs/sirius/wip-superseded/amt-9/{}",
+                short_sha(&failed)
+            )),
+            Some(failed),
+            "the unused attempt stays reachable"
+        );
+    }
+
+    /// SIRF-41: a lease refused at a RETRY's pre-spawn check — after the
+    /// first attempt worked — must not take the work with it. The issue is
+    /// not released (not ours), but the work is pinned and named.
+    #[test]
+    fn a_lost_lease_after_work_started_preserves_the_work() {
+        let w = GitWorld::new("lease");
+        w.agent(|wt| {
+            commit_file(wt, "try1.txt");
+        });
+        w.mock.expect(
+            &["amt", "--json", "claim", "--issue"],
+            0,
+            r#"{"id":"AMT-10"}"#,
+        );
+        w.mock.expect(
+            &["amt", "--json", "claim", "--issue"],
+            0,
+            r#"{"claimed":false,"reason":"lease held by sirius/rowan"}"#,
+        );
+        w.mock
+            .expect(&["sh", "-c", "run-suite"], 1, "test result: FAILED");
+        let mut c = cfg();
+        c.retry_budget = 2;
+        let (o, evs) = w.iterate("AMT-10", &c);
+        assert!(
+            matches!(o, IterationOutcome::Error(ref e) if e.contains("lease")),
+            "{o:?}"
+        );
+        let wip = w.ref_at("refs/sirius/wip/amt-10").expect("pinned");
+        assert!(tree_files(&w.repo, &wip).contains(&"try1.txt".to_string()));
+        let rel = event(&evs, "release");
+        assert_eq!(rel["reason"], "lease_lost");
+        assert_eq!(rel["wip_ref"]["sha"], json!(wip));
+        let calls = w.calls();
+        assert!(!calls.iter().any(|c| c.starts_with("amt --json release")));
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("amt --json issue comment AMT-10")
+                    && c.contains("lost the lease")
+                    && c.contains("refs/sirius/wip/amt-10")),
+            "{calls:?}"
+        );
+    }
+
+    /// Preserved work that already contains the held commit supersedes it:
+    /// ONE resume merge (the wip), both markers retired at the stamp, and
+    /// the link resolution still sees the held, wip and new work.
+    #[test]
+    fn wip_that_contains_the_held_work_is_resumed_alone() {
+        let w = GitWorld::new("heldwip");
+        let base = w.base.clone();
+        let held = commit_file(&w.wt, "h.txt");
+        let wip = commit_file(&w.wt, "w.txt");
+        git_at(&w.repo, &["update-ref", "refs/sirius/held/amt-11", &held]);
+        git_at(&w.repo, &["update-ref", "refs/sirius/wip/amt-11", &wip]);
+        git_at(&w.wt, &["checkout", "-q", "--detach", &base]);
+        let main = commit_file(&w.repo, "landed.txt");
+        w.agent(|wt| {
+            commit_file(wt, "mine.txt");
+        });
+        w.mock
+            .expect(&["sh", "-c", "run-suite"], 0, "test result: ok");
+        let (o, _evs) = w.iterate("AMT-11", &cfg());
+        assert_eq!(o, IterationOutcome::Completed);
+        let calls = w.calls();
+        let merges: Vec<&String> = calls
+            .iter()
+            .filter(|c| c.starts_with("git merge --no-edit"))
+            .collect();
+        assert_eq!(merges, vec![&format!("git merge --no-edit {wip}")]);
+        let env = &w.mock.agent_envs()[0];
+        assert_eq!(env_of(env, "SIRIUS_RESUMED_FROM"), Some(wip.clone()));
+        assert_eq!(w.ref_at("refs/sirius/wip/amt-11"), None);
+        assert_eq!(w.ref_at("refs/sirius/held/amt-11"), None);
+        assert_eq!(
+            link_files(&w, &main, &wip, "AMT-11"),
+            vec!["h.txt", "mine.txt", "w.txt"]
+        );
+    }
+
+    /// preserve_wip in isolation: nothing new is a no-op (suite telemetry
+    /// is not work); untracked files are work; an older pin the new work does
+    /// not contain is parked, never overwritten into oblivion.
+    #[test]
+    fn preserve_wip_pins_only_new_work_and_parks_what_it_supersedes() {
+        let w = GitWorld::new("unit");
+        let base = w.base.clone();
+        let r = &w.git;
+        assert_eq!(
+            preserve_wip(r, "AMT-5", &base, &base, WipKind::Resume),
+            Ok(None)
+        );
+        std::fs::create_dir_all(w.wt.join(".suite")).unwrap();
+        std::fs::write(w.wt.join(".suite/events.ndjson"), "{}").unwrap();
+        assert_eq!(
+            preserve_wip(r, "AMT-5", &base, &base, WipKind::Resume),
+            Ok(None)
+        );
+        std::fs::write(w.wt.join("new.txt"), "n").unwrap();
+        let first = preserve_wip(r, "AMT-5", &base, &base, WipKind::Resume)
+            .unwrap()
+            .expect("untracked work is work");
+        assert_eq!(first.ref_name, "refs/sirius/wip/amt-5");
+        assert!(tree_files(&w.repo, &first.sha).contains(&"new.txt".to_string()));
+        assert_eq!(git_at(&w.wt, &["status", "--porcelain"]), "");
+        // A different line of work for the same issue, not containing it.
+        git_at(&w.wt, &["checkout", "-q", "--detach", &base]);
+        std::fs::write(w.wt.join("other.txt"), "o").unwrap();
+        let second = preserve_wip(r, "AMT-5", &base, &base, WipKind::Resume)
+            .unwrap()
+            .unwrap();
+        assert_eq!(w.ref_at("refs/sirius/wip/amt-5"), Some(second.sha.clone()));
+        assert_eq!(
+            w.ref_at(&format!(
+                "refs/sirius/wip-superseded/amt-5/{}",
+                short_sha(&first.sha)
+            )),
+            Some(first.sha)
+        );
+        // Nothing past the floor any more.
+        assert_eq!(
+            preserve_wip(r, "AMT-5", &second.sha, &base, WipKind::Resume),
+            Ok(None)
+        );
+    }
+
+    /// SIRF-49: an agent that checks out (and commits on) a named branch is
+    /// pinned at refs/sirius/keep/<issue>/<branch> and detached; its branch
+    /// is left alone; completion still stamps sirius/<issue>.
+    #[test]
+    fn a_branch_the_agent_checked_out_is_pinned_and_detached() {
+        let w = GitWorld::new("guard");
+        w.agent(|wt| {
+            git_at(wt, &["switch", "-q", "-c", "Feature/X"]);
+            commit_file(wt, "x.txt");
+        });
+        w.mock
+            .expect(&["sh", "-c", "run-suite"], 0, "test result: ok");
+        let (o, evs) = w.iterate("AMT-8", &cfg());
+        assert_eq!(o, IterationOutcome::Completed, "{evs:?}");
+        let tip = w
+            .ref_at("refs/heads/Feature/X")
+            .expect("the branch is untouched");
+        assert_eq!(
+            w.ref_at("refs/sirius/keep/amt-8/feature-x"),
+            Some(tip.clone())
+        );
+        let g = evs
+            .iter()
+            .find(|e| e["event"] == "branch_guard")
+            .expect("branch_guard event");
+        assert_eq!(g["branch"], "Feature/X");
+        assert_eq!(g["sha"], json!(tip));
+        assert_eq!(g["detached"], true);
+        assert!(
+            crate::gitrange::run_git(&w.git, &["symbolic-ref", "-q", "HEAD"]).is_err(),
+            "the worktree is detached again"
+        );
+        assert_eq!(w.ref_at("refs/heads/sirius/amt-8"), Some(tip));
+    }
+
+    fn index_lock(w: &GitWorld) -> std::path::PathBuf {
+        std::path::PathBuf::from(git_at(
+            &w.wt,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "index.lock",
+            ],
+        ))
+    }
+
+    /// Review B1: an uncommittable rest must never cost the agent's COMMITTED
+    /// work — HEAD is pinned anyway, and the partial loss is said. A plain
+    /// stale `index.lock` left by the killed agent is cleared and costs
+    /// nothing at all.
+    #[test]
+    fn preserve_wip_pins_committed_work_when_the_rest_cannot_be_committed() {
+        let w = GitWorld::new("partial");
+        let base = w.base.clone();
+        // A stale lock FILE: cleared, everything committed.
+        commit_file(&w.wt, "a.txt");
+        std::fs::write(w.wt.join("b.txt"), "b").unwrap();
+        std::fs::write(index_lock(&w), "").unwrap();
+        let got = preserve_wip(&w.git, "AMT-6", &base, &base, WipKind::Resume)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.partial, None);
+        assert_eq!(
+            tree_files(&w.repo, &got.sha),
+            vec!["a.txt", "b.txt", "base.txt"]
+        );
+        // An index that cannot be locked at all (a DIRECTORY in the way).
+        let committed = commit_file(&w.wt, "c.txt");
+        std::fs::write(w.wt.join("d.txt"), "d").unwrap();
+        std::fs::create_dir_all(index_lock(&w)).unwrap();
+        let got = preserve_wip(&w.git, "AMT-6", &base, &base, WipKind::Resume);
+        std::fs::remove_dir_all(index_lock(&w)).unwrap();
+        let got = got.unwrap().expect("the committed work is pinned anyway");
+        assert_eq!(got.sha, committed);
+        assert!(got.partial.is_some());
+        assert!(
+            got.suffix().contains("could NOT be saved"),
+            "{}",
+            got.suffix()
+        );
+        assert!(got.json()["partial"].is_string());
+        assert_eq!(w.ref_at("refs/sirius/wip/amt-6"), Some(committed));
+    }
+
+    /// Review B2: a worktree left on an UNBORN branch (or an unmerged index)
+    /// must not wedge the worker at the next prep; and the guard detaches an
+    /// agent's orphan checkout.
+    #[test]
+    fn an_orphan_checkout_never_wedges_the_worker() {
+        let w = GitWorld::new("orphan");
+        git_at(&w.wt, &["switch", "-q", "--orphan", "left-behind"]);
+        w.agent(|wt| {
+            git_at(wt, &["switch", "-q", "--orphan", "agent-orphan"]);
+        });
+        w.mock
+            .push(MockResponse::new(&["sh", "-c", "true"], 1, "", "no"));
+        let (o, evs) = w.iterate("AMT-13", &cfg());
+        assert!(
+            !evs.iter().any(|e| e["reason"] == "worktree_prep_failed"),
+            "{evs:?}"
+        );
+        assert!(
+            matches!(o, IterationOutcome::Error(ref e) if e.contains("agent")),
+            "{o:?}"
+        );
+        let g = evs
+            .iter()
+            .find(|e| e["event"] == "branch_guard")
+            .expect("guarded");
+        assert_eq!(g["branch"], "agent-orphan");
+        assert_eq!(g["detached"], true);
+        assert!(g["sha"].is_null());
+        assert!(crate::gitrange::run_git(&w.git, &["symbolic-ref", "-q", "HEAD"]).is_err());
+    }
+
+    /// Review B3: preserved work that was resumed and then JUDGED (here: the
+    /// gate fails with nothing new on top) moves to wip-failed and stops
+    /// being merged back automatically.
+    #[test]
+    fn resumed_work_that_then_fails_the_gate_is_no_longer_auto_resumed() {
+        let w = GitWorld::new("rejudged");
+        w.agent(|wt| {
+            commit_file(wt, "a.txt");
+        });
+        w.mock.arm_agent_timeout(0);
+        w.iterate("AMT-14", &cfg());
+        let wip = w.ref_at("refs/sirius/wip/amt-14").expect("pinned");
+        // Iteration 2 resumes it; the agent adds nothing; the gate fails.
+        w.mock
+            .expect(&["sh", "-c", "run-suite"], 1, "test result: FAILED");
+        let mut c = cfg();
+        c.retry_budget = 1;
+        let (o, evs) = w.iterate("AMT-14", &c);
+        assert_eq!(o, IterationOutcome::Deadend);
+        assert_eq!(w.ref_at("refs/sirius/wip/amt-14"), None, "retired");
+        let failed = w.ref_at("refs/sirius/wip-failed/amt-14").expect("kept");
+        assert!(is_ancestor(&w.git, &wip, &failed));
+        assert_eq!(event(&evs, "release")["wip_ref"]["sha"], json!(failed));
+        // Iteration 3: offered, not merged.
+        w.mock
+            .push(MockResponse::new(&["sh", "-c", "true"], 1, "", "no"));
+        w.iterate("AMT-14", &c);
+        let env = &w.mock.agent_envs()[2];
+        assert_eq!(env_of(env, "SIRIUS_RESUMED_FROM"), None);
+        assert_eq!(
+            env_of(env, "SIRIUS_PRIOR_WORK").as_deref(),
+            Some("refs/sirius/wip-failed/amt-14")
+        );
+    }
+
+    /// An agent that itself FAILED was interrupted — its partial tree is
+    /// resumed next claim even though the gate then failed over it.
+    #[test]
+    fn a_failed_agents_partial_work_is_resumable_even_if_the_gate_failed() {
+        let w = GitWorld::new("agentfail");
+        w.agent(|wt| std::fs::write(wt.join("p.txt"), "p").unwrap());
+        w.mock
+            .push(MockResponse::new(&["sh", "-c", "true"], 1, "", "crash"));
+        w.mock
+            .expect(&["sh", "-c", "run-suite"], 1, "test result: FAILED");
+        let mut c = cfg();
+        c.retry_budget = 1;
+        let (_o, evs) = w.iterate("AMT-15", &c);
+        let wip = w.ref_at("refs/sirius/wip/amt-15").expect("resumable");
+        assert_eq!(w.ref_at("refs/sirius/wip-failed/amt-15"), None);
+        assert_eq!(event(&evs, "release")["wip_ref"]["sha"], json!(wip));
+    }
+
+    /// A fix round's discarded attempt is parked before the revert.
+    #[test]
+    fn park_attempt_keeps_a_discarded_attempt_reachable() {
+        let w = GitWorld::new("park");
+        let head = w.base.clone();
+        assert_eq!(park_attempt(&w.git, "AMT-16", &head), None);
+        commit_file(&w.wt, "fix1.txt");
+        std::fs::write(w.wt.join("fix2.txt"), "f").unwrap();
+        let parked = park_attempt(&w.git, "AMT-16", &head).expect("parked");
+        assert!(parked.starts_with("refs/sirius/wip-superseded/amt-16/"));
+        let sha = w.ref_at(&parked).unwrap();
+        assert_eq!(
+            tree_files(&w.repo, &sha),
+            vec!["base.txt", "fix1.txt", "fix2.txt"]
+        );
+    }
+
+    #[test]
+    fn ref_segments_are_lowercase_and_ref_safe() {
+        assert_eq!(ref_segment("sirius/LYD-54"), "sirius-lyd-54");
+        assert_eq!(ref_segment("a.b..lock"), "a-b--lock");
+    }
+
+    /// Mock-level: the iteration base comes from the given ref, and is
+    /// never queried in a detached launch.
+    #[test]
+    fn iteration_base_resolution_order() {
+        let m = MockRunner::new();
+        assert_eq!(iteration_base(&m, None, "launch"), "launch");
+        assert!(m.recorded().is_empty());
+        m.expect(&["git", "rev-parse"], 0, "tip1\n");
+        assert_eq!(iteration_base(&m, Some("main"), "launch"), "tip1");
+        assert_eq!(
+            m.recorded(),
+            vec!["git rev-parse --verify --quiet main^{commit}"]
+        );
+        m.push(MockResponse::new(&["git", "rev-parse"], 1, "", ""));
+        assert_eq!(iteration_base(&m, Some("gone"), "launch"), "launch");
     }
 }
