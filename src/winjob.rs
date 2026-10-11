@@ -15,6 +15,16 @@
 //! The FFI is a handful of `kernel32` calls, declared by hand so the crate set
 //! stays as small as AGENTS.md requires (no `windows-sys`).
 //!
+//! # Breakaway is deliberately NOT allowed
+//!
+//! The job does not set `JOB_OBJECT_LIMIT_BREAKAWAY_OK`. A process in the
+//! agent's tree that calls `CreateProcess` with `CREATE_BREAKAWAY_FROM_JOB`
+//! therefore gets `ERROR_ACCESS_DENIED` (outside a job that flag is simply
+//! ignored). That is a behaviour change for the rare tool that insists on
+//! escaping its job (some service launchers and installers), accepted on
+//! purpose: allowing breakaway would let exactly the processes this module
+//! exists to kill walk out of it.
+//!
 //! # The one remaining race
 //!
 //! `std::process::Command` cannot spawn suspended and hand back the primary
@@ -24,8 +34,12 @@
 //! command line and call `CreateProcess` — would be outside the job. If the
 //! assignment itself fails (the root already ran in a job that forbids nesting,
 //! pre-Windows 8) [`kill_tree`] falls back to `taskkill /T /F`, a snapshot-based
-//! walk with its own (larger) race. Neither path ever fails a run: tree-kill is
-//! best-effort and the root is always also killed with `Child::kill()`.
+//! walk with its own (larger) race. On the kill path `taskkill /T` also runs
+//! BEFORE `TerminateJobObject` even when the job is fine, as a backstop for a
+//! process that slipped through the spawn-to-assign window (it can only walk
+//! from a root that is still alive, hence the order). Neither path ever fails a
+//! run: tree-kill is best-effort and the root is always also killed with
+//! `Child::kill()`.
 
 use std::ffi::c_void;
 use std::mem::size_of;
@@ -156,15 +170,32 @@ impl Drop for TreeJob {
     }
 }
 
-/// Kill `child` and everything beneath it. Prefers the job (race-free);
-/// without one, `taskkill /T /F` walks the tree from `child`'s pid. The caller
-/// still calls `Child::kill()` afterwards to reap the root.
+/// Kill `child` and everything beneath it, on the timeout path only.
+///
+/// Two steps, in this order: `taskkill /T /F` first, walking the tree from the
+/// still-live root (one extra spawn; it also catches a process that escaped the
+/// spawn-to-assign window, which the job cannot see), then `TerminateJobObject`
+/// for every member of the job — including anything started while `taskkill`
+/// ran. Without a job only the first step happens. The caller still calls
+/// `Child::kill()` afterwards to reap the root.
 pub fn kill_tree(child: &Child, job: Option<&TreeJob>) {
-    if job.is_some_and(TreeJob::terminate) {
-        return;
+    taskkill_tree(child.id());
+    if let Some(job) = job {
+        job.terminate();
     }
-    let _ = Command::new("taskkill")
-        .args(["/T", "/F", "/PID", &child.id().to_string()])
+}
+
+/// `taskkill /T /F /PID pid`, best-effort. Run by absolute path under
+/// `%SystemRoot%\System32`: Rust's own lookup of a bare name searches the
+/// executable's directory first, so a `taskkill.exe` planted beside
+/// `sirius.exe` would otherwise run.
+fn taskkill_tree(pid: u32) {
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    let exe = std::path::Path::new(&root)
+        .join("System32")
+        .join("taskkill.exe");
+    let _ = Command::new(exe)
+        .args(["/T", "/F", "/PID", &pid.to_string()])
         .output();
 }
 

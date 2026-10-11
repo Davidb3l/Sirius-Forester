@@ -1689,6 +1689,7 @@ mod tests {
     #[cfg(windows)]
     mod wintree {
         use super::*;
+        use std::cell::Cell;
 
         mod ffi {
             use std::ffi::c_void;
@@ -1696,15 +1697,18 @@ mod tests {
             extern "system" {
                 pub fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
                 pub fn WaitForSingleObject(h: *mut c_void, ms: u32) -> u32;
+                pub fn TerminateProcess(h: *mut c_void, code: u32) -> i32;
                 pub fn CloseHandle(h: *mut c_void) -> i32;
             }
         }
 
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        const PROCESS_TERMINATE: u32 = 0x0001;
+        const WAIT_TIMEOUT: u32 = 258;
+
         /// Is `pid` still a running process? (`OpenProcess` fails for a pid that
         /// is gone; a handle to an exited-but-referenced process is signalled.)
         pub fn pid_alive(pid: u32) -> bool {
-            const SYNCHRONIZE: u32 = 0x0010_0000;
-            const WAIT_TIMEOUT: u32 = 258;
             // SAFETY: plain Win32 calls on a handle we open and close here.
             unsafe {
                 let h = ffi::OpenProcess(SYNCHRONIZE, 0, pid);
@@ -1719,12 +1723,19 @@ mod tests {
             }
         }
 
-        /// A scratch dir + pid file for one test's grandchild. On drop — pass
-        /// or FAIL — the grandchild is killed by pid, so a red run never leaves
-        /// a 90-second `ping` behind.
+        /// A scratch dir + pid file for one test's grandchild.
+        ///
+        /// [`Grandchild::up`] opens a HANDLE to the grandchild the first time it
+        /// sees the pid file, while the process certainly exists; liveness and
+        /// the cleanup kill then go through that handle, so neither can ever hit
+        /// an unrelated process that was handed the pid after the grandchild
+        /// died. On drop — pass or FAIL — the grandchild is terminated, so a red
+        /// run never leaves a 90-second `ping` behind.
         pub struct Grandchild {
             dir: PathBuf,
             pub pidfile: PathBuf,
+            pid: Cell<u32>,
+            handle: Cell<usize>,
         }
 
         impl Grandchild {
@@ -1736,13 +1747,47 @@ mod tests {
                 Grandchild {
                     pidfile: dir.join("grandchild.pid"),
                     dir,
+                    pid: Cell::new(0),
+                    handle: Cell::new(0),
                 }
             }
 
-            pub fn pid(&self) -> Option<u32> {
-                std::fs::read_to_string(&self.pidfile)
+            /// Has the grandchild announced itself? Cheap enough to call from a
+            /// probe or heartbeat closure on every tick.
+            pub fn up(&self) -> bool {
+                if self.pid.get() != 0 {
+                    return true;
+                }
+                let Some(pid) = std::fs::read_to_string(&self.pidfile)
                     .ok()
-                    .and_then(|s| s.trim().parse().ok())
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                else {
+                    return false;
+                };
+                self.pid.set(pid);
+                // SAFETY: a plain OpenProcess; the handle is closed in Drop.
+                let h = unsafe { ffi::OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
+                self.handle.set(h as usize);
+                true
+            }
+
+            fn alive(&self) -> bool {
+                match self.handle.get() {
+                    // SAFETY: a handle we opened and have not closed.
+                    h if h != 0 => unsafe {
+                        ffi::WaitForSingleObject(h as *mut _, 0) == WAIT_TIMEOUT
+                    },
+                    _ => pid_alive(self.pid.get()),
+                }
+            }
+
+            /// Wait (bounded) for the grandchild to come up.
+            pub fn wait_up(&self, secs: u64) {
+                let deadline = Instant::now() + Duration::from_secs(secs);
+                while !self.up() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                assert!(self.up(), "the grandchild never started (no pid file)");
             }
 
             pub fn opts(&self, hard_ms: u64) -> AgentRunOpts {
@@ -1755,29 +1800,50 @@ mod tests {
                 }
             }
 
+            /// Is the grandchild still running? (After [`Grandchild::up`].)
+            pub fn is_running(&self) -> bool {
+                assert!(self.up(), "the grandchild never started (no pid file)");
+                self.alive()
+            }
+
             /// Poll (bounded) for the grandchild to die after the kill.
             pub fn assert_dead_within(&self, secs: u64, what: &str) {
-                let pid = self
-                    .pid()
-                    .expect("the grandchild never started (no pid file): test setup too slow");
+                assert!(
+                    self.up(),
+                    "the grandchild never started (no pid file): test setup too slow"
+                );
                 let deadline = Instant::now() + Duration::from_secs(secs);
-                while pid_alive(pid) && Instant::now() < deadline {
+                while self.alive() && Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 assert!(
-                    !pid_alive(pid),
-                    "grandchild ping.exe (pid {pid}) survived {what}: only the root was killed"
+                    !self.alive(),
+                    "grandchild ping.exe (pid {}) survived {what}: only the root was killed",
+                    self.pid.get()
                 );
             }
         }
 
         impl Drop for Grandchild {
             fn drop(&mut self) {
-                if let Some(pid) = self.pid() {
-                    if pid_alive(pid) {
-                        let _ = Command::new("taskkill")
-                            .args(["/F", "/PID", &pid.to_string()])
-                            .output();
+                // Pick the pid up even if no probe ever did (a failed run).
+                if self.up() && self.alive() {
+                    match self.handle.get() {
+                        // SAFETY: a handle we opened and have not closed.
+                        h if h != 0 => unsafe {
+                            ffi::TerminateProcess(h as *mut _, 1);
+                        },
+                        _ => {
+                            let _ = Command::new("taskkill")
+                                .args(["/F", "/PID", &self.pid.get().to_string()])
+                                .output();
+                        }
+                    }
+                }
+                if self.handle.get() != 0 {
+                    // SAFETY: closed exactly once, here.
+                    unsafe {
+                        ffi::CloseHandle(self.handle.get() as *mut _);
                     }
                 }
                 let _ = std::fs::remove_dir_all(&self.dir);
@@ -1811,10 +1877,25 @@ mod tests {
                 ],
             )
         }
+
+        /// Spawn the PowerShell root directly (no supervisor), for the tests
+        /// that drive `winjob` themselves.
+        pub fn spawn_root(g: &Grandchild) -> std::process::Child {
+            let (program, args) = via_powershell();
+            Command::new(program)
+                .args(args)
+                .env("SIRIUS_TEST_PIDFILE", &g.pidfile)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        }
     }
 
     // The wall clock (reviewer / integration / canary runs and the work agent's
-    // hard cap): the cap is generous because the grandchild must exist first.
+    // hard cap). The cap is wall time from spawn, so it is generous: the
+    // grandchild must exist before it fires.
     #[test]
     #[cfg(windows)]
     fn a_hard_cap_kill_takes_the_whole_tree_on_windows() {
@@ -1822,25 +1903,38 @@ mod tests {
         let (program, args) = wintree::via_cmd();
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let out = RealRunner::default()
-            .run_agent(&program, &args, &g.opts(8000), &mut || {})
+            // The heartbeat doubles as the poller that grabs the grandchild's
+            // handle the moment it appears.
+            .run_agent(&program, &args, &g.opts(15_000), &mut || {
+                g.up();
+            })
             .unwrap();
         assert_eq!(out.timeout_kind(), Some(TimeoutKind::Hard), "{out:?}");
         g.assert_dead_within(10, "a hard-cap kill");
     }
 
-    // The idle watchdog. The probe holds the snapshot steady only once the
-    // grandchild is up, so the idle window can never expire before it exists.
+    // The idle watchdog. The idle clock starts at spawn, so until the
+    // grandchild is up every probe reports a DIFFERENT snapshot (progress); the
+    // snapshot only holds steady once it exists. However slow the cmd ->
+    // powershell start-up is on a loaded machine, the idle window therefore
+    // effectively begins when the grandchild does.
     #[test]
     #[cfg(windows)]
     fn an_idle_kill_takes_the_whole_tree_on_windows() {
         let g = wintree::Grandchild::new("idle");
         let (program, args) = wintree::via_powershell();
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let pidfile = g.pidfile.clone();
+        let mut waiting = 0u64;
         let mut probe = || {
+            let tree = if g.up() {
+                u64::MAX
+            } else {
+                waiting += 1;
+                waiting
+            };
             Some(WorktreeProbe {
                 head: "h".into(),
-                tree: u64::from(pidfile.exists()),
+                tree,
             })
         };
         let mut watch = ProgressWatch {
@@ -1850,7 +1944,7 @@ mod tests {
             probe: &mut probe,
         };
         let out = RealRunner::default()
-            .run_agent_watched(&program, &args, &g.opts(60_000), &mut watch, &mut || {})
+            .run_agent_watched(&program, &args, &g.opts(120_000), &mut watch, &mut || {})
             .unwrap();
         assert_eq!(out.timeout_kind(), Some(TimeoutKind::Idle), "{out:?}");
         g.assert_dead_within(10, "an idle kill");
@@ -1859,22 +1953,29 @@ mod tests {
     // The finish grace defers a due kill ONCE; the kill that follows must still
     // take the tree. A HEAD move (faked by the probe once the grandchild is up)
     // earns the grace; the agent then stays silent and is killed at its end.
+    // As above, the probe keeps reporting progress until the grandchild exists.
     #[test]
     #[cfg(windows)]
     fn a_kill_after_the_finish_grace_takes_the_whole_tree_on_windows() {
         let g = wintree::Grandchild::new("grace");
         let (program, args) = wintree::via_cmd();
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let pidfile = g.pidfile.clone();
+        let mut waiting = 0u64;
         let mut up_at: Option<Instant> = None;
         let mut probe = || {
-            let up = pidfile.exists();
+            let up = g.up();
             if up && up_at.is_none() {
                 up_at = Some(Instant::now());
             }
+            let tree = if up {
+                0
+            } else {
+                waiting += 1;
+                waiting
+            };
             Some(WorktreeProbe {
                 head: if up { "moved" } else { "h" }.into(),
-                tree: 0,
+                tree,
             })
         };
         let mut watch = ProgressWatch {
@@ -1884,7 +1985,7 @@ mod tests {
             probe: &mut probe,
         };
         let out = RealRunner::default()
-            .run_agent_watched(&program, &args, &g.opts(60_000), &mut watch, &mut || {})
+            .run_agent_watched(&program, &args, &g.opts(120_000), &mut watch, &mut || {})
             .unwrap();
         // Idle (1s) alone would kill ~1s after the grandchild came up; the
         // grace (1.5s) pushes it to ~2.5s.
@@ -1908,39 +2009,49 @@ mod tests {
         args[last] = args[last].replace("Start-Sleep -Seconds 90", "exit 0");
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let out = RealRunner::default()
-            .run_agent(&program, &args, &g.opts(30_000), &mut || {})
+            .run_agent(&program, &args, &g.opts(60_000), &mut || {
+                g.up();
+            })
             .unwrap();
         assert!(out.success(), "{out:?}");
-        let pid = g.pid().expect("the grandchild never started");
+        g.wait_up(5);
         std::thread::sleep(Duration::from_millis(500));
         assert!(
-            wintree::pid_alive(pid),
+            g.is_running(),
             "a normal exit must not kill what the agent left running"
         );
     }
 
-    // The two `winjob` paths the supervised tests do not reach on a healthy
-    // machine: the `taskkill /T` fallback (no job), and the armed job's
-    // kill-on-close backstop (supervision abandoned without a kill).
+    // SIRF-56 review #2: the explicit `TerminateJobObject` is what the timeout
+    // path relies on, but the supervised tests above would still pass without
+    // it (dropping the armed job at `supervise`'s return kills the tree too). So
+    // call it directly and check the grandchild is dead while the job is STILL
+    // OPEN.
+    #[test]
+    #[cfg(windows)]
+    fn terminate_job_object_alone_kills_the_tree_while_the_job_is_open() {
+        let g = wintree::Grandchild::new("terminate");
+        let mut child = wintree::spawn_root(&g);
+        let job = crate::winjob::TreeJob::adopt(&child).expect("job");
+        g.wait_up(60);
+        assert!(g.is_running());
+        assert!(job.terminate(), "TerminateJobObject failed");
+        g.assert_dead_within(10, "TerminateJobObject (job still open)");
+        let _ = child.wait();
+        drop(job);
+    }
+
+    // The two other `winjob` paths the supervised tests do not isolate: the
+    // `taskkill /T` fallback (no job), and the armed job's kill-on-close backstop
+    // (supervision abandoned without a kill).
     #[test]
     #[cfg(windows)]
     fn the_taskkill_fallback_and_the_job_backstop_take_the_tree() {
         for armed_drop in [false, true] {
             let g = wintree::Grandchild::new(if armed_drop { "drop" } else { "taskkill" });
-            let (program, args) = wintree::via_powershell();
-            let mut child = Command::new(&program)
-                .args(&args)
-                .env("SIRIUS_TEST_PIDFILE", &g.pidfile)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .unwrap();
+            let mut child = wintree::spawn_root(&g);
             let job = crate::winjob::TreeJob::adopt(&child).expect("job");
-            let deadline = Instant::now() + Duration::from_secs(20);
-            while g.pid().is_none() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(50));
-            }
+            g.wait_up(60);
             if armed_drop {
                 drop(job); // armed: closing the handle kills the tree
             } else {
