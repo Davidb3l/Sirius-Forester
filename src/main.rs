@@ -620,7 +620,11 @@ fn cmd_gate(
                 // failure and tells the operator nothing actionable. The one
                 // case a human cannot act on without help gets the remedy
                 // spelled out. stderr, so stdout consumers are unaffected.
-                if o.reason_code == gate::reason_code::UNCONFIGURED_TEST_CMD {
+                // SF-17: likewise a timeout, whose reason names the limit
+                // that fired and the key that raises it.
+                if o.reason_code == gate::reason_code::UNCONFIGURED_TEST_CMD
+                    || o.reason_code == gate::reason_code::TIMED_OUT
+                {
                     eprintln!("{}", o.reason);
                 }
             }

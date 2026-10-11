@@ -8,6 +8,9 @@ release moves them under its version (see AGENTS.md → "Releases are batched").
 ### Added
 - `gate.timeout_secs` (default 3600) and `gate.idle_secs` (default off) bound a `gate.test_cmd` run; a limit kills the whole process tree and fails the gate with the new `timed_out` reason code (`sirius gate --json`), naming the limit and the key to raise. A suite's leftover processes are killed when it exits, and the fleet renews the amt lease and entity claims while the suite runs. (SF-17)
 
+### Changed
+- `sirius gate` (the CLI, not only the fleet) now fails a suite that runs past `gate.timeout_secs` — one hour by default, where it had no limit before; raise the key for a longer suite. (SF-17)
+
 ### Fixed
 - The gate hung forever when `gate.test_cmd` deadlocked, or when it exited but a grandchild (test server, watcher) kept its stdout pipe open: the suite was the one long-running child sirius did not supervise. It now runs under the same supervisor as agents, streaming to `.sirius/logs/gate-<worker|issue>.log`. (SF-17)
 - Windows: an idle, hard-cap or integration/review/canary timeout killed only the root `cmd.exe`/`sh`, leaving the real agent running in a worktree sirius was already preserving or resetting (SIRF-56). The whole process tree is now killed through a Job Object (`taskkill /T /F` as fallback), and real-process tests guard it on the Windows CI job.

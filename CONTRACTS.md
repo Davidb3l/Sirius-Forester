@@ -184,9 +184,13 @@ sirius gate AMT-7 [--tier safe] [--target-status in_review] [--range <git-range>
    # gate.timeout_secs (default 3600) caps the run, gate.idle_secs (default: off) kills a
    # silent one; either kills the WHOLE process tree and yields gate "fail", reason_code
    # "timed_out", structural:false, ran_tests:true (never an env fault: no setup re-run),
-   # with the limit that fired and the key to raise in "reason". Whatever a suite leaves
-   # running after it exits (a test server) is killed too — on unix the suite runs in its own
-   # process group, so it does not receive the terminal's Ctrl-C. In the fleet the amt lease
+   # with the limit that fired and the key to raise in the fail comment, the ledger event's
+   # "reason" and (plain-text CLI) stderr — the --json envelope has no "reason" field.
+   # Whatever a suite leaves running after it exits (a test server) is killed too — on unix the
+   # suite runs in its own process group, so it does not receive the terminal's Ctrl-C. That
+   # includes a build daemon the suite STARTED (gradle, MSBuild node reuse, sccache, kotlin):
+   # it dies with the run, even if another worker's build has since attached to it — disable
+   # such daemons in test_cmd for a multi-worker fleet. In the fleet the amt lease
    # and entity claims are renewed while the suite runs; a refused renewal aborts the
    # iteration (lease_lost) instead of recording the verdict.
    # SIRF-48: a fail comment carries the runner's output tail (last 15 non-empty lines,

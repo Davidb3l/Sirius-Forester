@@ -1686,9 +1686,20 @@ pub fn run_iteration(
                             }),
                         };
                         let installed_from = crate::gate::setup_fingerprint(runner);
-                        match crate::gate::run_setup(runner, &sh, cmd, &opts, &mut || {
-                            let _ = renew_checked();
-                        }) {
+                        // The setup's heartbeat records a refusal just like
+                        // the gate's: a lease lost during a long install must
+                        // not be followed by a re-gate and a recorded verdict.
+                        let setup = crate::gate::run_setup(
+                            runner,
+                            &sh,
+                            cmd,
+                            &opts,
+                            &mut gate_heartbeat(),
+                        );
+                        if let Some(reason) = gate_lease_refused.take() {
+                            return WorkGate::Exit(lease_lost(out, &reason, "env-fault re-gate"));
+                        }
+                        match setup {
                             Ok(()) => {
                                 crate::gate::write_setup_stamp(runner, &installed_from);
                                 setup_repaired = true;

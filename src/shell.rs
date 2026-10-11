@@ -703,12 +703,20 @@ impl ChildTree {
     /// process still in it. Only the job can do that now — the root is gone,
     /// so a `taskkill /T` from its pid has nothing to walk.
     fn finish(&self, kill_leftovers: bool) {
-        if let Some(job) = &self.0 {
-            if kill_leftovers {
+        match &self.0 {
+            // A failed terminate leaves the job armed: closing its handle
+            // (when this ChildTree drops) still kills the tree.
+            Some(job) if kill_leftovers => {
                 job.terminate();
-            } else {
-                job.release();
             }
+            Some(job) => job.release(),
+            // No job (it could not be made or assigned): whatever the run
+            // left behind is out of reach now. Say so rather than pretend.
+            None if kill_leftovers => eprintln!(
+                "sirius: could not put the gate's test run in a Job Object, so any \
+                 process it left running (a test server, a watcher) was NOT killed"
+            ),
+            None => {}
         }
     }
 

@@ -449,9 +449,15 @@ fn run_cmd(
     // server, a watcher) still held its stdout pipe, blocked the gate forever.
     // Output streams to a LOG FILE (no pipe to hold open; the root's exit is
     // what ends the run), and what a suite leaves running is killed.
+    //
+    // The verdict is read back from that file, so it must be THIS run's: a
+    // configured log that cannot be truncated (read-only, a directory in the
+    // way, disk full) would otherwise hand back the PREVIOUS gate's output —
+    // a stale `Cannot find module` line even triggered a SIRF-50 setup re-run.
+    // Open it here first; if that fails, stream to a scratch log instead.
     let (log_path, temp_log) = match &run.log_path {
-        Some(p) => (p.clone(), false),
-        None => (temp_log_path(), true),
+        Some(p) if truncate_log(p) => (p.clone(), false),
+        _ => (temp_log_path(), true),
     };
     let ropts = AgentRunOpts {
         timeout: run.timeout,
@@ -579,6 +585,16 @@ fn timeout_sentence(kind: TimeoutKind, run: &GateRunOpts) -> String {
     }
 }
 
+/// Create (or truncate) the gate log at `path`, parent dirs included. False
+/// when it cannot be opened for writing — the caller then must not read it
+/// back, since whatever is there is not this run's output.
+fn truncate_log(path: &Path) -> bool {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::File::create(path).is_ok()
+}
+
 /// A scratch log for a gate run with no configured log path (the serial CLI
 /// outside a workspace, tests). Removed once the verdict is built.
 fn temp_log_path() -> PathBuf {
@@ -608,7 +624,8 @@ fn read_log_tail(path: &Path) -> String {
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
     let _ = f.seek(SeekFrom::Start(len.saturating_sub(LOG_TAIL_BYTES)));
     let mut buf = Vec::new();
-    if f.read_to_end(&mut buf).is_err() {
+    // `take`: a leftover still writing must not grow the read past the cap.
+    if f.take(LOG_TAIL_BYTES).read_to_end(&mut buf).is_err() {
         return String::new();
     }
     String::from_utf8_lossy(&buf)
@@ -2513,30 +2530,61 @@ mod tests {
             }
         }
 
-        #[test]
-        fn output_is_read_back_from_the_log_when_the_runner_returns_none() {
-            // The real supervisor streams to the log and returns no output.
-            let dir = std::env::temp_dir().join(format!("sirius-gate-log-{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&dir);
-            let log = dir.join("gate.log");
-            std::fs::write(
-                &log,
-                "running 3 tests\nError: Cannot find module 'react'\n\n[sirius] agent exit: 1\n",
-            )
-            .unwrap();
-            let m = MockRunner::new();
-            m.push(MockResponse::new(&["sh", "-c"], 1, "", ""));
+        /// A runner that behaves like the real supervisor: the suite's output
+        /// goes to `opts.log_path` DURING the run, and nothing is returned in
+        /// memory.
+        struct WritesLog(&'static str);
+        impl Runner for WritesLog {
+            fn run(&self, _: &str, _: &[&str]) -> std::io::Result<CmdOutput> {
+                unreachable!("the gate's suite is supervised")
+            }
+            fn run_agent(
+                &self,
+                _: &str,
+                _: &[&str],
+                opts: &crate::shell::AgentRunOpts,
+                _: &mut dyn FnMut(),
+            ) -> std::io::Result<crate::shell::AgentOutcome> {
+                if let Some(p) = &opts.log_path {
+                    let _ = std::fs::write(p, self.0);
+                }
+                Ok(crate::shell::AgentOutcome::Exited(CmdOutput {
+                    code: Some(1),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }))
+            }
+        }
+
+        fn gate_with_log(runner: &dyn Runner, log: PathBuf) -> GateVerdict {
             let run = GateRunOpts {
                 log_path: Some(log),
                 ..GateRunOpts::default()
             };
-            let v = crate::gate::execute_plan(
-                &m,
+            crate::gate::execute_plan(
+                runner,
                 &test_shell(),
                 Some("bun test"),
                 GatePlan::Full("doubt".into()),
                 &run,
                 &mut || {},
+            )
+        }
+
+        #[test]
+        fn output_is_read_back_from_the_log_when_the_runner_returns_none() {
+            // The real supervisor streams to the log and returns no output.
+            let dir = std::env::temp_dir().join(format!("sirius-gate-log-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            let v = gate_with_log(
+                &WritesLog(
+                    "running 3 tests
+Error: Cannot find module 'react'
+
+[sirius] agent exit: 1
+",
+                ),
+                dir.join("gate.log"),
             );
             assert_eq!(v.reason_code, reason_code::TESTS_FAILED, "{v:?}");
             assert!(v.detail.contains("running 3 tests"), "{}", v.detail);
@@ -2547,6 +2595,49 @@ mod tests {
                 Some("Error: Cannot find module 'react'")
             );
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // A configured log that cannot be truncated must never be read back:
+        // it holds the PREVIOUS gate's output — here a stale missing-module
+        // line that would have triggered a SIRF-50 setup re-run on its own.
+        #[test]
+        fn a_log_that_cannot_be_truncated_is_never_read_back_as_this_runs_output() {
+            let dir =
+                std::env::temp_dir().join(format!("sirius-gate-stale-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let log = dir.join("gate.log");
+            std::fs::write(
+                &log,
+                "Error: Cannot find module 'react'
+",
+            )
+            .unwrap();
+            let mut perms = std::fs::metadata(&log).unwrap().permissions();
+            perms.set_readonly(true);
+            std::fs::set_permissions(&log, perms.clone()).unwrap();
+            let v = gate_with_log(
+                &WritesLog(
+                    "REAL_OUTPUT_FROM_THIS_RUN
+",
+                ),
+                log.clone(),
+            );
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(&log, perms);
+            let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(v.reason_code, reason_code::TESTS_FAILED, "{v:?}");
+            assert!(
+                v.detail.contains("REAL_OUTPUT_FROM_THIS_RUN"),
+                "this run's output was lost: {}",
+                v.detail
+            );
+            assert!(!v.detail.contains("Cannot find module"), "{}", v.detail);
+            assert_eq!(
+                v.env_fault, None,
+                "a stale line must not look like an env fault"
+            );
         }
 
         #[test]
@@ -2775,7 +2866,13 @@ mod tests {
             }
             impl Drop for Scratch {
                 fn drop(&mut self) {
-                    // A red run must not leave its `sleep 300` behind.
+                    // A red run must not leave its `sleep 300` behind. Only a
+                    // red one: a green run already proved that pid dead, and
+                    // by now it may belong to an unrelated process.
+                    if !std::thread::panicking() {
+                        let _ = std::fs::remove_dir_all(&self.0);
+                        return;
+                    }
                     if let Some(pid) = self.pid() {
                         let _ = std::process::Command::new("kill")
                             .args(["-KILL", &pid])
