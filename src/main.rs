@@ -22,6 +22,8 @@ mod review;
 mod run;
 mod shell;
 mod spine;
+#[cfg(windows)]
+mod winjob;
 mod workspace;
 
 use amt::Amt;

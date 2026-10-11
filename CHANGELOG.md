@@ -5,6 +5,9 @@ release moves them under its version (see AGENTS.md → "Releases are batched").
 
 ## Unreleased
 
+### Fixed
+- Windows: an idle, hard-cap or integration/review/canary timeout killed only the root `cmd.exe`/`sh`, leaving the real agent running in a worktree sirius was already preserving or resetting (SIRF-56). The whole process tree is now killed through a Job Object (`taskkill /T /F` as fallback), and real-process tests guard it on the Windows CI job.
+
 ## 0.1.7 — 2026-10-09
 
 ### Plugin 0.2.6 (terminal and the Claude app alike)
