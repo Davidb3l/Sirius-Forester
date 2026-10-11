@@ -23,8 +23,13 @@ use crate::amt::Amt;
 use crate::config::{GateConfig, GateFallback};
 use crate::hayven::Hayven;
 use crate::ledger::Ledger;
-use crate::shell::{resolve_shell, run_in_shell, Runner, ShellCmd};
+use crate::shell::{
+    resolve_shell, shell_spawn_message, AgentOutcome, AgentRunOpts, CmdOutput, ProgressWatch,
+    Runner, ShellCmd, TimeoutKind,
+};
 use serde_json::Value;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Stable machine-readable verdict codes (SF-11).
 ///
@@ -47,6 +52,54 @@ pub mod reason_code {
     pub const UNCONFIGURED_TEST_CMD: &str = "unconfigured_test_cmd";
     /// The shell itself could not be spawned (SF-15). Also not about the code.
     pub const SHELL_SPAWN_FAILED: &str = "shell_spawn_failed";
+    /// SF-17: `gate.test_cmd` hit `gate.timeout_secs` (or `gate.idle_secs`) and
+    /// its process tree was killed. A FAIL — a hung or too-slow suite — but not
+    /// structural, and never an environment fault (no setup re-run can help).
+    pub const TIMED_OUT: &str = "timed_out";
+}
+
+/// How `gate.test_cmd` is supervised (SF-17): the same wall clock / idle
+/// watchdog / heartbeat / log-file machinery every other long-running child
+/// gets, instead of a bare blocking `.output()`.
+#[derive(Debug, Clone)]
+pub struct GateRunOpts {
+    /// Hard cap (`gate.timeout_secs`).
+    pub timeout: Duration,
+    /// Idle watchdog (`gate.idle_secs`); `None` = off, the default.
+    pub idle: Option<Duration>,
+    /// How often the heartbeat closure fires while the suite runs.
+    pub heartbeat_interval: Duration,
+    /// Where the suite's combined output streams; the verdict's detail, tail
+    /// and env-fault line are read back from it. `None` = a temp file.
+    pub log_path: Option<PathBuf>,
+}
+
+impl Default for GateRunOpts {
+    fn default() -> Self {
+        GateRunOpts {
+            timeout: Duration::from_secs(crate::config::DEFAULT_GATE_TIMEOUT_SECS),
+            idle: None,
+            heartbeat_interval: Duration::from_secs(10),
+            log_path: None,
+        }
+    }
+}
+
+impl GateRunOpts {
+    /// The limits from `gate` config, with the caller's heartbeat cadence and
+    /// log location.
+    pub fn from_config(
+        gate: &GateConfig,
+        heartbeat_interval: Duration,
+        log_path: Option<PathBuf>,
+    ) -> Self {
+        GateRunOpts {
+            timeout: gate.timeout(),
+            idle: gate.idle(),
+            heartbeat_interval,
+            log_path,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -298,6 +351,8 @@ pub fn execute_plan(
     shell: &ShellCmd,
     test_cmd: Option<&str>,
     plan: GatePlan,
+    run: &GateRunOpts,
+    heartbeat: &mut dyn FnMut(),
 ) -> GateVerdict {
     match plan {
         GatePlan::Block(reason) => GateVerdict {
@@ -324,16 +379,28 @@ pub fn execute_plan(
             detail: String::new(),
             env_fault: None,
         },
-        GatePlan::Full(reason) => run_cmd(runner, shell, test_cmd, &[], "full-suite", reason),
+        GatePlan::Full(reason) => run_cmd(
+            runner,
+            shell,
+            test_cmd,
+            &[],
+            "full-suite",
+            reason,
+            run,
+            heartbeat,
+        ),
         GatePlan::Subset(ids, reason) => {
             let label = format!("subset({})", ids.len());
-            run_cmd(runner, shell, test_cmd, &ids, &label, reason)
+            run_cmd(
+                runner, shell, test_cmd, &ids, &label, reason, run, heartbeat,
+            )
         }
     }
 }
 
 /// Run `test_cmd` (optionally with selected ids appended) through `shell` and
 /// read the verdict from its exit code.
+#[allow(clippy::too_many_arguments)]
 fn run_cmd(
     runner: &dyn Runner,
     shell: &ShellCmd,
@@ -341,6 +408,8 @@ fn run_cmd(
     ids: &[String],
     plan_label: &str,
     reason: String,
+    run: &GateRunOpts,
+    heartbeat: &mut dyn FnMut(),
 ) -> GateVerdict {
     // A blank command is no command: it would reach the shell, run nothing,
     // exit 0, and pass everything. Fail it closed like an unset one.
@@ -374,33 +443,107 @@ fn run_cmd(
         full.push(' ');
         full.push_str(&shell_quote(id, shell.posix));
     }
-    match run_in_shell(runner, shell, &full) {
-        Ok(out) => GateVerdict {
-            passed: out.success(),
-            structural: false,
-            reason_code: if out.success() {
-                reason_code::PASS
-            } else {
-                reason_code::TESTS_FAILED
-            },
-            plan: plan_label.to_string(),
-            reason,
-            ran_tests: true,
-            tests_run: ids.len(),
-            test_ids: ids.to_vec(),
-            detail: last_lines(&out.stdout, &out.stderr, 20),
-            env_fault: if out.success() {
-                None
-            } else {
-                env_fault_line(&out.stdout, &out.stderr, out.code, cmd)
-            },
-        },
+    // SF-17: the suite is SUPERVISED like every other long-running child. It
+    // used to be a bare `.output()` — no timeout, no kill, no heartbeat — so a
+    // suite that deadlocked, or one that exited while a grandchild (a test
+    // server, a watcher) still held its stdout pipe, blocked the gate forever.
+    // Output streams to a LOG FILE (no pipe to hold open; the root's exit is
+    // what ends the run), and what a suite leaves running is killed.
+    let (log_path, temp_log) = match &run.log_path {
+        Some(p) => (p.clone(), false),
+        None => (temp_log_path(), true),
+    };
+    let ropts = AgentRunOpts {
+        timeout: run.timeout,
+        heartbeat_interval: run.heartbeat_interval,
+        log_path: Some(log_path.clone()),
+        env: Vec::new(),
+        // A test server a suite leaves behind holds its port and poisons the
+        // NEXT gate: kill the tree on a normal exit too, not only on a timeout.
+        kill_tree_on_exit: true,
+    };
+    let args = [shell.flag.as_str(), full.as_str()];
+    let outcome = match run.idle {
+        // Progress = the log growing; the probe never reports a worktree
+        // change, and there is no finish grace for a test run.
+        Some(idle) => {
+            let mut no_probe = || None;
+            let mut watch = ProgressWatch {
+                idle,
+                probe_every: Duration::from_secs(30),
+                grace: Duration::ZERO,
+                probe: &mut no_probe,
+            };
+            runner.run_agent_watched(&shell.program, &args, &ropts, &mut watch, heartbeat)
+        }
+        None => runner.run_agent(&shell.program, &args, &ropts, heartbeat),
+    };
+    // The real supervisor returns no in-memory output (it streams to the
+    // log); a mock returns it in memory. Prefer memory when there is any.
+    let text = |out: &CmdOutput| -> (String, String) {
+        if out.stdout.is_empty() && out.stderr.is_empty() {
+            (read_log_tail(&log_path), String::new())
+        } else {
+            (out.stdout.clone(), out.stderr.clone())
+        }
+    };
+    let verdict = match outcome {
+        Ok(AgentOutcome::Exited(out)) => {
+            let (stdout, stderr) = text(&out);
+            GateVerdict {
+                passed: out.success(),
+                structural: false,
+                reason_code: if out.success() {
+                    reason_code::PASS
+                } else {
+                    reason_code::TESTS_FAILED
+                },
+                plan: plan_label.to_string(),
+                reason,
+                ran_tests: true,
+                tests_run: ids.len(),
+                test_ids: ids.to_vec(),
+                detail: last_lines(&stdout, &stderr, 20),
+                env_fault: if out.success() {
+                    None
+                } else {
+                    env_fault_line(&stdout, &stderr, out.code, cmd)
+                },
+            }
+        }
+        // A limit fired and the whole tree was killed. A FAIL (a hung or
+        // too-slow suite), but never an environment fault: re-running setup
+        // cannot unhang it, so `env_fault` stays None even if the partial
+        // output happens to look like a missing dependency.
+        Ok(AgentOutcome::TimedOut { output, kind }) => {
+            let (stdout, stderr) = text(&output);
+            let what = timeout_sentence(kind, run);
+            let mut detail = last_lines(&stdout, &stderr, 19);
+            if !detail.is_empty() {
+                detail.push('\n');
+            }
+            // Last, so it survives `error_tail`'s keep-the-end cut and the
+            // next attempt (`SIRIUS_LAST_GATE_TAIL`) learns WHY it failed.
+            detail.push_str(&format!("[sirius] {what}"));
+            GateVerdict {
+                passed: false,
+                structural: false,
+                reason_code: reason_code::TIMED_OUT,
+                plan: plan_label.to_string(),
+                reason: format!("{what} ({reason})"),
+                ran_tests: true,
+                tests_run: ids.len(),
+                test_ids: ids.to_vec(),
+                detail,
+                env_fault: None,
+            }
+        }
         Err(e) => GateVerdict {
             passed: false,
             structural: false,
             // SF-15: the SHELL did not start, so nothing about the code was
-            // tested. `e` already names the shell (see shell::run_in_shell) —
-            // the old bare "program not found" read as a missing test binary.
+            // tested. The message names the shell — the old bare "program not
+            // found" read as a missing test binary.
             reason_code: reason_code::SHELL_SPAWN_FAILED,
             plan: plan_label.to_string(),
             reason,
@@ -409,10 +552,70 @@ fn run_cmd(
             // The command failed to spawn: no tests ran, so per the field's
             // contract (ids the gate *ran*) this is empty, not the selection.
             test_ids: vec![],
-            detail: e,
+            detail: shell_spawn_message(shell, &full, &e),
             env_fault: None,
         },
+    };
+    if temp_log {
+        let _ = std::fs::remove_file(&log_path);
     }
+    verdict
+}
+
+/// What a kill says, naming the limit that fired, its length, and the config
+/// key that raises it (SF-17).
+fn timeout_sentence(kind: TimeoutKind, run: &GateRunOpts) -> String {
+    match kind {
+        TimeoutKind::Hard => format!(
+            "gate.test_cmd hit the hard cap of {}s and its process tree was killed \
+             (gate.timeout_secs; raise it if the suite legitimately needs longer)",
+            run.timeout.as_secs()
+        ),
+        TimeoutKind::Idle => format!(
+            "gate.test_cmd printed nothing for {}s and its process tree was killed \
+             (gate.idle_secs; raise or unset it if the suite can be silent that long)",
+            run.idle.map_or(0, |d| d.as_secs())
+        ),
+    }
+}
+
+/// A scratch log for a gate run with no configured log path (the serial CLI
+/// outside a workspace, tests). Removed once the verdict is built.
+fn temp_log_path() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "sirius-gate-{}-{}.log",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// How much of a gate log is read back (its END): enough for a failing
+/// suite's summary and the env-fault scan, bounded so a chatty suite's
+/// multi-GB log can never be loaded whole.
+const LOG_TAIL_BYTES: u64 = 1024 * 1024;
+
+/// The last [`LOG_TAIL_BYTES`] of the streamed log, lossily decoded, without
+/// the supervisor's own `[sirius] agent …` trailer/kill-note lines (they are
+/// not the suite's output, and the exit status is already the verdict). A
+/// missing or unreadable log is empty — never a reason to fail a gate.
+fn read_log_tail(path: &Path) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let _ = f.seek(SeekFrom::Start(len.saturating_sub(LOG_TAIL_BYTES)));
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&buf)
+        .lines()
+        .filter(|l| !l.starts_with("[sirius] agent "))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Evaluate the gate for a set of changed files, free of any Ametrite side
@@ -423,10 +626,19 @@ pub fn evaluate(
     runner: &dyn Runner,
     gate: &GateConfig,
     changed_files: &[String],
+    run: &GateRunOpts,
+    heartbeat: &mut dyn FnMut(),
 ) -> GateVerdict {
     let sel = select(hv, changed_files);
     let plan = decide_plan(&sel, changed_files, gate.fallback);
-    execute_plan(runner, &resolve_shell(), gate.test_cmd.as_deref(), plan)
+    execute_plan(
+        runner,
+        &resolve_shell(),
+        gate.test_cmd.as_deref(),
+        plan,
+        run,
+        heartbeat,
+    )
 }
 
 /// Gate under maximal doubt — the changed-file set itself is UNKNOWN (e.g. git
@@ -434,9 +646,22 @@ pub fn evaluate(
 /// straight to the fallback policy. SIRF-11: the loop used to fold a git error
 /// into "nothing changed" and skip the gate entirely — fail-open; this is the
 /// fail-closed replacement.
-pub fn evaluate_doubt(runner: &dyn Runner, gate: &GateConfig, reason: &str) -> GateVerdict {
+pub fn evaluate_doubt(
+    runner: &dyn Runner,
+    gate: &GateConfig,
+    reason: &str,
+    run: &GateRunOpts,
+    heartbeat: &mut dyn FnMut(),
+) -> GateVerdict {
     let plan = fallback_plan(gate.fallback, reason.to_string());
-    execute_plan(runner, &resolve_shell(), gate.test_cmd.as_deref(), plan)
+    execute_plan(
+        runner,
+        &resolve_shell(),
+        gate.test_cmd.as_deref(),
+        plan,
+        run,
+        heartbeat,
+    )
 }
 
 /// The fleet's gate: an isolated worktree is invisible to the code-graph
@@ -448,8 +673,19 @@ pub fn evaluate_doubt(runner: &dyn Runner, gate: &GateConfig, reason: &str) -> G
 /// code-graph daemon — selection cannot be trusted", and it was the ONLY text
 /// in the failure comment — workers and humans alike read it as the CAUSE of
 /// the failure. It is a routine note about which tests ran, and now says so.
-pub fn evaluate_isolated(runner: &dyn Runner, gate: &GateConfig) -> GateVerdict {
-    evaluate_doubt(runner, gate, &isolated_reason(gate.fallback))
+pub fn evaluate_isolated(
+    runner: &dyn Runner,
+    gate: &GateConfig,
+    run: &GateRunOpts,
+    heartbeat: &mut dyn FnMut(),
+) -> GateVerdict {
+    evaluate_doubt(
+        runner,
+        gate,
+        &isolated_reason(gate.fallback),
+        run,
+        heartbeat,
+    )
 }
 
 fn isolated_reason(fallback: GateFallback) -> String {
@@ -679,6 +915,7 @@ pub fn run_setup(
     // Supervised, with a wall clock: a stalled registry must not hang the
     // worker (or, at launch, the whole fleet) forever.
     let run_opts = AgentRunOpts {
+        kill_tree_on_exit: false,
         timeout: opts.timeout,
         heartbeat_interval: opts.heartbeat_interval,
         log_path: opts.log_path.clone(),
@@ -880,6 +1117,7 @@ pub fn run_gate(
     tier: &str,
     target_status: &str,
     range: Option<&str>,
+    run: &GateRunOpts,
 ) -> Result<GateOutcome, String> {
     let changed = crate::gitrange::changed_files(runner, range)?;
     if changed.is_empty() {
@@ -889,7 +1127,8 @@ pub fn run_gate(
         ));
     }
 
-    let v = evaluate(hv, runner, gate, &changed);
+    // The serial CLI holds no lease, so the heartbeat has nothing to renew.
+    let v = evaluate(hv, runner, gate, &changed, run, &mut || {});
 
     if v.passed {
         amt.update_status(issue, target_status)?;
@@ -1067,6 +1306,53 @@ mod tests {
         ShellCmd::posix_sh()
     }
 
+    // Mock-based tests drive the gate with default supervision and no lease:
+    // these shadow the production entry points (a local item beats the glob
+    // import) so the many pre-SF-17 call sites stay about what they assert.
+    fn execute_plan(
+        runner: &dyn Runner,
+        shell: &ShellCmd,
+        test_cmd: Option<&str>,
+        plan: GatePlan,
+    ) -> GateVerdict {
+        super::execute_plan(
+            runner,
+            shell,
+            test_cmd,
+            plan,
+            &GateRunOpts::default(),
+            &mut || {},
+        )
+    }
+
+    fn run_cmd(
+        runner: &dyn Runner,
+        shell: &ShellCmd,
+        test_cmd: Option<&str>,
+        ids: &[String],
+        plan_label: &str,
+        reason: String,
+    ) -> GateVerdict {
+        super::run_cmd(
+            runner,
+            shell,
+            test_cmd,
+            ids,
+            plan_label,
+            reason,
+            &GateRunOpts::default(),
+            &mut || {},
+        )
+    }
+
+    fn evaluate_doubt(runner: &dyn Runner, gate: &GateConfig, reason: &str) -> GateVerdict {
+        super::evaluate_doubt(runner, gate, reason, &GateRunOpts::default(), &mut || {})
+    }
+
+    fn evaluate_isolated(runner: &dyn Runner, gate: &GateConfig) -> GateVerdict {
+        super::evaluate_isolated(runner, gate, &GateRunOpts::default(), &mut || {})
+    }
+
     #[test]
     fn blank_test_cmd_fails_closed_like_an_unset_one() {
         let m = MockRunner::new();
@@ -1156,6 +1442,7 @@ mod tests {
         let g = GateConfig {
             test_cmd: Some("run-suite".into()),
             fallback: GateFallback::FullSuite,
+            ..GateConfig::default()
         };
         let v = evaluate_doubt(&m, &g, "cannot determine changed files: boom");
         assert!(v.ran_tests && v.passed);
@@ -1165,6 +1452,7 @@ mod tests {
         let g2 = GateConfig {
             test_cmd: Some("run-suite".into()),
             fallback: GateFallback::Fail,
+            ..GateConfig::default()
         };
         let v2 = evaluate_doubt(&MockRunner::new(), &g2, "boom");
         assert!(!v2.passed && !v2.ran_tests);
@@ -1173,6 +1461,7 @@ mod tests {
         let g3 = GateConfig {
             test_cmd: None,
             fallback: GateFallback::FullSuite,
+            ..GateConfig::default()
         };
         let v3 = evaluate_doubt(&MockRunner::new(), &g3, "boom");
         assert!(!v3.passed);
@@ -1424,6 +1713,7 @@ mod tests {
         GateConfig {
             test_cmd: cmd.map(|s| s.to_string()),
             fallback: fb,
+            ..GateConfig::default()
         }
     }
 
@@ -1460,6 +1750,7 @@ mod tests {
             "safe",
             "in_review",
             None,
+            &GateRunOpts::default(),
         )
         .unwrap();
         assert!(o.passed);
@@ -1503,6 +1794,7 @@ mod tests {
             "safe",
             "in_review",
             None,
+            &GateRunOpts::default(),
         )
         .unwrap();
         assert!(!o.passed);
@@ -1536,6 +1828,7 @@ mod tests {
             "safe",
             "in_review",
             None,
+            &GateRunOpts::default(),
         )
         .unwrap();
         assert!(!o.passed);
@@ -1950,6 +2243,7 @@ mod tests {
             "safe",
             "in_review",
             None,
+            &GateRunOpts::default(),
         )
         .unwrap();
         assert!(!o.passed);
@@ -1993,8 +2287,631 @@ mod tests {
             "AMT-7",
             "safe",
             "in_review",
-            None
+            None,
+            &GateRunOpts::default(),
         )
         .is_err());
+    }
+
+    // ---- SF-17: the real run is supervised ----------------------------------
+    //
+    // `gate.test_cmd` was the one long-running child sirius did not supervise:
+    // a bare `.output()` with no timeout, no kill and no heartbeat. These tests
+    // run the REAL gate (`RealRunner`, the machine's resolved shell, a real
+    // command) against a suite that hangs, and against one that exits while a
+    // grandchild still holds its stdout. Each gate call runs on a worker thread
+    // behind a deadline, so a regression to the old behaviour is an ASSERTION
+    // failure here instead of a test run that never ends.
+    mod supervised {
+        use super::*;
+        use crate::shell::{AgentOutcome, AgentRunOpts, CmdOutput, RealRunner};
+        use std::path::Path;
+        use std::sync::mpsc::RecvTimeoutError;
+        use std::time::Instant;
+
+        /// Run the real gate on a worker thread; `poll` runs on THIS thread
+        /// between 100ms waits (it is where a test watches for its grandchild,
+        /// and keeps an idle clock from starting early). `None` = the gate had
+        /// not returned by `deadline` — i.e. it hung.
+        fn run_bounded(
+            test_cmd: &str,
+            opts: GateRunOpts,
+            cwd: &Path,
+            deadline: Duration,
+            mut poll: impl FnMut(),
+        ) -> Option<GateVerdict> {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let cmd = test_cmd.to_string();
+            let runner = RealRunner {
+                cwd: Some(cwd.to_path_buf()),
+            };
+            std::thread::spawn(move || {
+                let v = crate::gate::execute_plan(
+                    &runner,
+                    &resolve_shell(),
+                    Some(&cmd),
+                    GatePlan::Full("test".into()),
+                    &opts,
+                    &mut || {},
+                );
+                let _ = tx.send(v);
+            });
+            let end = Instant::now() + deadline;
+            loop {
+                poll();
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(v) => return Some(v),
+                    Err(RecvTimeoutError::Timeout) if Instant::now() < end => {}
+                    Err(_) => return None,
+                }
+            }
+        }
+
+        fn opts(timeout_secs: u64, idle_secs: Option<u64>, log: PathBuf) -> GateRunOpts {
+            GateRunOpts {
+                timeout: Duration::from_secs(timeout_secs),
+                idle: idle_secs.map(Duration::from_secs),
+                heartbeat_interval: Duration::from_millis(100),
+                log_path: Some(log),
+            }
+        }
+
+        /// The invariants of ANY timeout verdict.
+        fn assert_timed_out(v: &GateVerdict, key: &str, secs: u64) {
+            assert!(!v.passed, "{v:?}");
+            assert_eq!(v.reason_code, reason_code::TIMED_OUT, "{v:?}");
+            assert!(
+                !v.structural,
+                "a timeout is not structural: a fresh attempt can differ"
+            );
+            assert!(v.ran_tests, "the suite DID run: {v:?}");
+            assert!(
+                v.env_fault.is_none(),
+                "a timeout must never trigger the env-fault setup re-run: {v:?}"
+            );
+            for text in [&v.reason, &v.detail] {
+                assert!(text.contains(key), "must name `{key}`: {text}");
+                assert!(
+                    text.contains(&format!("{secs}s")),
+                    "must say {secs}s: {text}"
+                );
+            }
+        }
+
+        /// Make a log file grow: the "this suite is alive" signal an idle
+        /// window watches. A test calls it from `poll` until its suite exists,
+        /// so the idle clock starts when the suite does, not at spawn.
+        fn keep_alive(log: &Path) {
+            use std::io::Write;
+            if let Some(dir) = log.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log)
+            {
+                let _ = f.write_all(b".");
+            }
+        }
+
+        // -- platform-neutral: the wiring, with the mock runner ---------------
+
+        #[test]
+        fn the_gate_asks_the_runner_for_a_supervised_tree_killing_run() {
+            // A recording runner: the AgentRunOpts and watch the gate built.
+            struct Spy(std::sync::Mutex<Vec<(AgentRunOpts, Option<Duration>)>>);
+            impl Runner for Spy {
+                fn run(&self, _: &str, _: &[&str]) -> std::io::Result<CmdOutput> {
+                    panic!("the test command must not go through a bare run()");
+                }
+                fn run_agent(
+                    &self,
+                    _: &str,
+                    _: &[&str],
+                    o: &AgentRunOpts,
+                    hb: &mut dyn FnMut(),
+                ) -> std::io::Result<AgentOutcome> {
+                    hb();
+                    self.0.lock().unwrap().push((o.clone(), None));
+                    Ok(AgentOutcome::Exited(CmdOutput {
+                        code: Some(0),
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    }))
+                }
+                fn run_agent_watched(
+                    &self,
+                    p: &str,
+                    a: &[&str],
+                    o: &AgentRunOpts,
+                    w: &mut crate::shell::ProgressWatch<'_>,
+                    hb: &mut dyn FnMut(),
+                ) -> std::io::Result<AgentOutcome> {
+                    // The probe must never claim progress by itself: only the
+                    // log growing counts for the gate.
+                    assert!((w.probe)().is_none());
+                    let r = self.run_agent(p, a, o, hb);
+                    self.0.lock().unwrap().last_mut().unwrap().1 = Some(w.idle);
+                    r
+                }
+            }
+            let log =
+                std::env::temp_dir().join(format!("sirius-gate-spy-{}.log", std::process::id()));
+            let mut beats = 0;
+            for idle in [None, Some(Duration::from_secs(90))] {
+                let spy = Spy(Default::default());
+                let run = GateRunOpts {
+                    timeout: Duration::from_secs(7),
+                    idle,
+                    heartbeat_interval: Duration::from_secs(3),
+                    log_path: Some(log.clone()),
+                };
+                let v = crate::gate::execute_plan(
+                    &spy,
+                    &test_shell(),
+                    Some("cargo test"),
+                    GatePlan::Full("doubt".into()),
+                    &run,
+                    &mut || beats += 1,
+                );
+                assert!(v.passed, "{v:?}");
+                let calls = spy.0.lock().unwrap();
+                let (o, watched) = &calls[0];
+                assert_eq!(o.timeout, Duration::from_secs(7));
+                assert_eq!(o.heartbeat_interval, Duration::from_secs(3));
+                assert_eq!(o.log_path.as_deref(), Some(log.as_path()));
+                assert!(o.kill_tree_on_exit, "a suite's leftovers must be killed");
+                assert_eq!(
+                    *watched, idle,
+                    "idle watchdog only when gate.idle_secs is set"
+                );
+            }
+            assert_eq!(beats, 2, "the caller's heartbeat reaches the supervisor");
+            let _ = std::fs::remove_file(&log);
+        }
+
+        #[test]
+        fn a_timed_out_run_is_a_timed_out_verdict_not_a_failed_test() {
+            for (kind_idle, key) in [(false, "gate.timeout_secs"), (true, "gate.idle_secs")] {
+                let m = MockRunner::new();
+                m.push(MockResponse::new(
+                    &["sh", "-c"],
+                    1,
+                    "",
+                    "Cannot find module 'react'\nrunning 3 tests",
+                ));
+                m.arm_gate_timeout(
+                    if kind_idle {
+                        TimeoutKind::Idle
+                    } else {
+                        TimeoutKind::Hard
+                    },
+                    2,
+                );
+                let mut beats = 0;
+                let run = GateRunOpts {
+                    timeout: Duration::from_secs(300),
+                    idle: kind_idle.then(|| Duration::from_secs(45)),
+                    ..GateRunOpts::default()
+                };
+                let v = crate::gate::execute_plan(
+                    &m,
+                    &test_shell(),
+                    Some("cargo test"),
+                    GatePlan::Full("doubt".into()),
+                    &run,
+                    &mut || beats += 1,
+                );
+                assert_eq!(beats, 2);
+                assert_timed_out(&v, key, if kind_idle { 45 } else { 300 });
+                // Whatever the suite printed before the kill is kept...
+                assert!(v.detail.contains("running 3 tests"), "{}", v.detail);
+                // ...even though it looks like a missing dependency: a hang is
+                // not an environment fault and must not re-run setup.
+                assert!(v.env_fault.is_none());
+            }
+        }
+
+        #[test]
+        fn output_is_read_back_from_the_log_when_the_runner_returns_none() {
+            // The real supervisor streams to the log and returns no output.
+            let dir = std::env::temp_dir().join(format!("sirius-gate-log-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            let log = dir.join("gate.log");
+            std::fs::write(
+                &log,
+                "running 3 tests\nError: Cannot find module 'react'\n\n[sirius] agent exit: 1\n",
+            )
+            .unwrap();
+            let m = MockRunner::new();
+            m.push(MockResponse::new(&["sh", "-c"], 1, "", ""));
+            let run = GateRunOpts {
+                log_path: Some(log),
+                ..GateRunOpts::default()
+            };
+            let v = crate::gate::execute_plan(
+                &m,
+                &test_shell(),
+                Some("bun test"),
+                GatePlan::Full("doubt".into()),
+                &run,
+                &mut || {},
+            );
+            assert_eq!(v.reason_code, reason_code::TESTS_FAILED, "{v:?}");
+            assert!(v.detail.contains("running 3 tests"), "{}", v.detail);
+            // sirius's own trailer is not the suite's output.
+            assert!(!v.detail.contains("[sirius]"), "{}", v.detail);
+            assert_eq!(
+                v.env_fault.as_deref(),
+                Some("Error: Cannot find module 'react'")
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_shell_that_will_not_start_keeps_its_own_verdict() {
+            struct Boom;
+            impl Runner for Boom {
+                fn run(&self, _: &str, _: &[&str]) -> std::io::Result<CmdOutput> {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "program not found",
+                    ))
+                }
+            }
+            let v = crate::gate::execute_plan(
+                &Boom,
+                &test_shell(),
+                Some("cargo test"),
+                GatePlan::Full("doubt".into()),
+                &GateRunOpts::default(),
+                &mut || {},
+            );
+            assert_eq!(v.reason_code, reason_code::SHELL_SPAWN_FAILED, "{v:?}");
+            assert!(!v.ran_tests);
+            assert!(v.detail.contains("cannot start the SHELL"), "{}", v.detail);
+        }
+
+        // -- Windows: real processes ------------------------------------------
+
+        #[cfg(windows)]
+        mod windows {
+            use super::*;
+            use crate::shell::wintree::Grandchild;
+
+            // The gate runs in the system temp dir, not the scratch dir: a process
+            // whose cwd is a directory keeps it from being removed.
+            /// A path as PowerShell (and any shell) can take it unescaped.
+            fn fwd(p: &Path) -> String {
+                p.display().to_string().replace('\\', "/")
+            }
+
+            /// PowerShell that starts `ping -n 90` — a grandchild that outlives
+            /// its parent unless something kills it — and records its pid.
+            /// `inherit`: the ping keeps the suite's STDOUT (so, under the old
+            /// pipe-reading gate, the pipe stays open); otherwise its output is
+            /// redirected away and the suite stays silent.
+            fn spawn_ping(pidfile: &Path, inherit: bool) -> String {
+                format!(
+                    "$psi = New-Object System.Diagnostics.ProcessStartInfo\n\
+                     $psi.FileName = 'ping'\n\
+                     $psi.Arguments = '-n 90 127.0.0.1'\n\
+                     $psi.UseShellExecute = $false\n\
+                     {}\
+                     $p = [System.Diagnostics.Process]::Start($psi)\n\
+                     Set-Content -Path '{}' -Value $p.Id\n",
+                    if inherit {
+                        ""
+                    } else {
+                        "$psi.RedirectStandardOutput = $true\n"
+                    },
+                    fwd(pidfile)
+                )
+            }
+
+            /// `test_cmd` that runs `body` as a PowerShell script — the same
+            /// string works under `sh -c` and `cmd /C`, whichever the machine
+            /// resolves.
+            fn test_cmd(g: &Grandchild, body: &str) -> String {
+                let script = g.dir.join("suite.ps1");
+                std::fs::write(&script, body).unwrap();
+                format!(
+                    "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{}\"",
+                    fwd(&script)
+                )
+            }
+
+            // A hung suite: the cap kills the ROOT AND THE GRANDCHILD and the
+            // gate says which limit fired. The cap is wall time from spawn, so
+            // it is generous (the grandchild must exist before it fires); the
+            // deadline is far past it, so only a genuine hang trips that.
+            #[test]
+            fn a_hung_suite_is_killed_with_its_whole_tree_at_the_cap() {
+                let g = Grandchild::new("gate-hang");
+                let body = spawn_ping(&g.pidfile, true) + "Start-Sleep -Seconds 90\n";
+                let cmd = test_cmd(&g, &body);
+                let v = run_bounded(
+                    &cmd,
+                    opts(15, None, g.dir.join("gate.log")),
+                    &std::env::temp_dir(),
+                    Duration::from_secs(60),
+                    || {
+                        g.up();
+                    },
+                )
+                .expect("the gate never returned: the hung suite blocked it past its cap");
+                assert_timed_out(&v, "gate.timeout_secs", 15);
+                g.assert_dead_within(10, "a gate timeout");
+            }
+
+            // The other hang: the suite EXITS 0, but a grandchild it started
+            // still holds its stdout. A pipe-reading gate waits for EOF that
+            // does not come for 90s. The supervised gate polls the root, so it
+            // returns at once — and kills the leftover (a test server a suite
+            // forgot would hold its port and poison the next gate).
+            #[test]
+            fn a_suite_that_exits_but_leaves_a_stdout_holder_returns_and_kills_it() {
+                let g = Grandchild::new("gate-holder");
+                let body = spawn_ping(&g.pidfile, true) + "exit 0\n";
+                let cmd = test_cmd(&g, &body);
+                let v = run_bounded(
+                    &cmd,
+                    opts(120, None, g.dir.join("gate.log")),
+                    &std::env::temp_dir(),
+                    Duration::from_secs(60),
+                    || {
+                        g.up();
+                    },
+                )
+                .expect("the gate never returned: a grandchild holding stdout blocked it");
+                assert!(v.passed, "{v:?}");
+                assert_eq!(v.reason_code, reason_code::PASS);
+                g.assert_dead_within(10, "the suite exiting (leftovers are killed)");
+            }
+
+            // The suite's failure is still a failure, with its output tail read
+            // back from the log.
+            #[test]
+            fn a_failing_suite_still_reports_its_output_tail() {
+                let g = Grandchild::new("gate-fail");
+                let cmd = test_cmd(&g, "Write-Output 'FAILED test_x'\nexit 3\n");
+                let v = run_bounded(
+                    &cmd,
+                    opts(120, None, g.dir.join("gate.log")),
+                    &std::env::temp_dir(),
+                    Duration::from_secs(60),
+                    || {},
+                )
+                .expect("the gate hung");
+                assert_eq!(v.reason_code, reason_code::TESTS_FAILED, "{v:?}");
+                assert!(v.detail.contains("FAILED test_x"), "{}", v.detail);
+            }
+
+            // idle_secs: a SILENT suite is killed (tree and all)...
+            #[test]
+            fn a_silent_suite_is_killed_by_the_idle_watchdog() {
+                let g = Grandchild::new("gate-idle");
+                let body = spawn_ping(&g.pidfile, false) + "Start-Sleep -Seconds 90\n";
+                let cmd = test_cmd(&g, &body);
+                let log = g.dir.join("gate.log");
+                let v = run_bounded(
+                    &cmd,
+                    opts(120, Some(4), log.clone()),
+                    &std::env::temp_dir(),
+                    Duration::from_secs(60),
+                    // The idle clock starts when the suite EXISTS, not at
+                    // spawn: however slow PowerShell is to start, the log
+                    // keeps growing until the grandchild is up.
+                    || {
+                        if !g.up() {
+                            keep_alive(&log);
+                        }
+                    },
+                )
+                .expect("the gate never returned: the idle watchdog did not fire");
+                assert_timed_out(&v, "gate.idle_secs", 4);
+                g.assert_dead_within(10, "an idle kill");
+            }
+
+            // ...and one that keeps printing is NOT, however long it runs.
+            #[test]
+            fn a_suite_that_keeps_printing_is_not_idle_killed() {
+                let g = Grandchild::new("gate-chatty");
+                // Own pid as the "started" marker; ~10s of output, 4s idle.
+                let body = format!(
+                    "Set-Content -Path '{}' -Value $PID\n\
+                     1..40 | ForEach-Object {{ Write-Output \"tick $_\"; Start-Sleep -Milliseconds 250 }}\n\
+                     exit 0\n",
+                    fwd(&g.pidfile)
+                );
+                let cmd = test_cmd(&g, &body);
+                let log = g.dir.join("gate.log");
+                let v = run_bounded(
+                    &cmd,
+                    opts(120, Some(4), log.clone()),
+                    &std::env::temp_dir(),
+                    Duration::from_secs(90),
+                    || {
+                        if !g.up() {
+                            keep_alive(&log);
+                        }
+                    },
+                )
+                .expect("the gate hung");
+                assert!(v.passed, "a chatty suite is not idle: {v:?}");
+                assert!(v.detail.contains("tick 40"), "{}", v.detail);
+            }
+        }
+
+        // -- unix: real processes ----------------------------------------------
+
+        #[cfg(unix)]
+        mod unix {
+            use super::*;
+
+            /// A scratch dir, removed on drop (pass or fail).
+            struct Scratch(PathBuf);
+            impl Scratch {
+                fn new(tag: &str) -> Self {
+                    let d = std::env::temp_dir()
+                        .join(format!("sirius-gatesup-{tag}-{}", std::process::id()));
+                    let _ = std::fs::remove_dir_all(&d);
+                    std::fs::create_dir_all(&d).unwrap();
+                    Scratch(d)
+                }
+                fn pidfile(&self) -> PathBuf {
+                    self.0.join("bg.pid")
+                }
+                fn started(&self) -> PathBuf {
+                    self.0.join("started")
+                }
+                fn pid(&self) -> Option<String> {
+                    std::fs::read_to_string(self.pidfile())
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                }
+            }
+            impl Drop for Scratch {
+                fn drop(&mut self) {
+                    // A red run must not leave its `sleep 300` behind.
+                    if let Some(pid) = self.pid() {
+                        let _ = std::process::Command::new("kill")
+                            .args(["-KILL", &pid])
+                            .output();
+                    }
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+
+            /// Wait (bounded) for `pid` to be gone; a zombie awaiting its reaper
+            /// counts as gone.
+            fn assert_dead_within(pid: &str, secs: u64, what: &str) {
+                let end = Instant::now() + Duration::from_secs(secs);
+                loop {
+                    let alive = std::process::Command::new("ps")
+                        .args(["-o", "stat=", "-p", pid])
+                        .output()
+                        .map(|o| {
+                            let st = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                            o.status.success() && !st.is_empty() && !st.starts_with('Z')
+                        })
+                        .unwrap_or(false);
+                    if !alive {
+                        return;
+                    }
+                    assert!(
+                        Instant::now() < end,
+                        "the background child {pid} survived {what}: only the root was killed"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+
+            #[test]
+            fn a_hung_suite_is_killed_with_its_whole_tree_at_the_cap() {
+                let s = Scratch::new("hang");
+                let cmd = format!("sleep 300 & echo $! > '{}'; wait", s.pidfile().display());
+                let v = run_bounded(
+                    &cmd,
+                    opts(5, None, s.0.join("gate.log")),
+                    &s.0,
+                    Duration::from_secs(60),
+                    || {},
+                )
+                .expect("the gate never returned: the hung suite blocked it past its cap");
+                assert_timed_out(&v, "gate.timeout_secs", 5);
+                let pid = s
+                    .pid()
+                    .expect("the suite never started its background child");
+                assert_dead_within(&pid, 10, "a gate timeout");
+            }
+
+            #[test]
+            fn a_suite_that_exits_but_leaves_a_stdout_holder_returns_and_kills_it() {
+                let s = Scratch::new("holder");
+                // The background `sleep` inherits the suite's stdout.
+                let cmd = format!("sleep 300 & echo $! > '{}'", s.pidfile().display());
+                let v = run_bounded(
+                    &cmd,
+                    opts(120, None, s.0.join("gate.log")),
+                    &s.0,
+                    Duration::from_secs(60),
+                    || {},
+                )
+                .expect("the gate never returned: a grandchild holding stdout blocked it");
+                assert!(v.passed, "{v:?}");
+                assert_eq!(v.reason_code, reason_code::PASS);
+                let pid = s
+                    .pid()
+                    .expect("the suite never started its background child");
+                assert_dead_within(&pid, 10, "the suite exiting (leftovers are killed)");
+            }
+
+            #[test]
+            fn a_failing_suite_still_reports_its_output_tail() {
+                let s = Scratch::new("fail");
+                let v = run_bounded(
+                    "echo 'FAILED test_x'; exit 3",
+                    opts(120, None, s.0.join("gate.log")),
+                    &s.0,
+                    Duration::from_secs(60),
+                    || {},
+                )
+                .expect("the gate hung");
+                assert_eq!(v.reason_code, reason_code::TESTS_FAILED, "{v:?}");
+                assert!(v.detail.contains("FAILED test_x"), "{}", v.detail);
+            }
+
+            #[test]
+            fn a_silent_suite_is_killed_by_the_idle_watchdog() {
+                let s = Scratch::new("idle");
+                let cmd = format!("sleep 300 & echo $! > '{}'; wait", s.pidfile().display());
+                let log = s.0.join("gate.log");
+                let v = run_bounded(
+                    &cmd,
+                    opts(120, Some(4), log.clone()),
+                    &s.0,
+                    Duration::from_secs(60),
+                    // The idle clock starts when the suite exists.
+                    || {
+                        if s.pid().is_none() {
+                            keep_alive(&log);
+                        }
+                    },
+                )
+                .expect("the gate never returned: the idle watchdog did not fire");
+                assert_timed_out(&v, "gate.idle_secs", 4);
+                let pid = s
+                    .pid()
+                    .expect("the suite never started its background child");
+                assert_dead_within(&pid, 10, "an idle kill");
+            }
+
+            #[test]
+            fn a_suite_that_keeps_printing_is_not_idle_killed() {
+                let s = Scratch::new("chatty");
+                let cmd = format!(
+                    "echo up > '{}'; for i in 1 2 3 4 5 6 7 8 9 10 11 12; do echo tick $i; sleep 0.5; done",
+                    s.started().display()
+                );
+                let log = s.0.join("gate.log");
+                let v = run_bounded(
+                    &cmd,
+                    opts(120, Some(4), log.clone()),
+                    &s.0,
+                    Duration::from_secs(60),
+                    || {
+                        if !s.started().exists() {
+                            keep_alive(&log);
+                        }
+                    },
+                )
+                .expect("the gate hung");
+                assert!(v.passed, "a chatty suite is not idle: {v:?}");
+                assert!(v.detail.contains("tick 12"), "{}", v.detail);
+            }
+        }
     }
 }

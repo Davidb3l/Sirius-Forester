@@ -46,6 +46,12 @@ pub struct AgentRunOpts {
     /// (`SIRIUS_ISSUE`, `SIRIUS_WORKER`, `AMT_AGENT`, `SIRIUS_PHASE`, …).
     /// Layered on top of the inherited environment.
     pub env: Vec<(String, String)>,
+    /// SF-17: after the root EXITS on its own, kill whatever it left running
+    /// (and, on unix, put the child in its own process group so that can be
+    /// found). Off for agents, which keep the SIRF-56 rule — a normal exit
+    /// leaves the tree alone. On for `gate.test_cmd`: a test server a suite
+    /// leaves behind holds its ports and poisons the next gate.
+    pub kill_tree_on_exit: bool,
 }
 
 /// Which limit killed an agent (SIRF-41 #3).
@@ -379,10 +385,24 @@ impl RealRunner {
         // The baseline snapshot is taken BEFORE the spawn, so even a commit
         // the agent makes in its first second differs from it.
         let baseline = watch.as_mut().and_then(|w| (w.probe)());
+        // SF-17: a child whose leftovers are killed when it exits (the gate's
+        // test suite) gets its OWN process group on unix. Once the root exits
+        // its children are reparented to init, so the `ps` walk below can no
+        // longer find them — but they keep the group id, and `killpg` still
+        // reaches every one. The trade-off, deliberately accepted for the gate
+        // only: a process in another group does not receive the terminal's
+        // Ctrl-C, and a daemon that `setsid`s itself away still escapes.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            if opts.kill_tree_on_exit {
+                cmd.process_group(0);
+            }
+        }
         let mut child = cmd.spawn()?;
         // Windows: put the child in a Job Object NOW, before it has had a
         // chance to start anything, so a later kill reaches its whole tree.
-        let tree = ChildTree::adopt(&child);
+        let tree = ChildTree::adopt(&child, opts.kill_tree_on_exit);
 
         // Poll on a tick short enough to stay responsive to the timeout (and
         // the probe cadence), but never longer than the heartbeat interval.
@@ -405,7 +425,7 @@ impl RealRunner {
 
         loop {
             if let Some(status) = child.try_wait()? {
-                tree.release();
+                tree.finish(opts.kill_tree_on_exit);
                 append_exit_trailer(opts.log_path.as_deref(), status.code());
                 return Ok(AgentOutcome::Exited(CmdOutput {
                     code: status.code(),
@@ -446,7 +466,7 @@ impl RealRunner {
                 // that exited meanwhile finished — never report it as killed.
                 if kill {
                     if let Some(status) = child.try_wait()? {
-                        tree.release();
+                        tree.finish(opts.kill_tree_on_exit);
                         append_exit_trailer(opts.log_path.as_deref(), status.code());
                         return Ok(AgentOutcome::Exited(CmdOutput {
                             code: status.code(),
@@ -603,21 +623,60 @@ pub fn bg_tasks_killed_in(path: Option<&Path>) -> bool {
 /// root `cmd.exe`/`sh` and the real agent (and its children) kept writing to a
 /// worktree that `commit_all` and the release path were already resetting.
 #[cfg(not(windows))]
-struct ChildTree;
+struct ChildTree {
+    /// The child's own process group (SF-17), when it was started in one.
+    group: Option<u32>,
+}
 
 #[cfg(not(windows))]
 impl ChildTree {
-    fn adopt(_child: &std::process::Child) -> Self {
-        ChildTree
+    fn adopt(child: &std::process::Child, own_group: bool) -> Self {
+        ChildTree {
+            group: own_group.then(|| child.id()),
+        }
     }
 
-    /// The child exited on its own; nothing to disarm on unix.
-    fn release(&self) {}
+    /// The child exited on its own. Kill what it left behind
+    /// (`kill_leftovers`, SF-17) or leave it be (agents); nothing to disarm
+    /// on unix either way.
+    fn finish(&self, kill_leftovers: bool) {
+        if kill_leftovers {
+            if let Some(pgid) = self.group {
+                kill_process_group(pgid);
+            }
+        }
+    }
 
     /// Kill the whole tree, then the root.
     fn kill(&self, child: &mut std::process::Child) {
+        // The `ps` walk first: it needs the still-live root to find
+        // descendants that left the group.
         kill_descendants(child.id());
+        if let Some(pgid) = self.group {
+            kill_process_group(pgid);
+        }
         let _ = child.kill();
+    }
+}
+
+#[cfg(not(windows))]
+extern "C" {
+    fn killpg(pgrp: i32, sig: i32) -> i32;
+}
+
+/// SIGKILL every member of process group `pgid` (SF-17). Straight to
+/// `killpg(2)`: no `kill` binary to resolve, and the same call on Linux and
+/// macOS. The group id is the root's pid, so after the root is reaped it
+/// could in theory be recycled by an unrelated process — which only ever
+/// becomes a group leader by calling `setpgid`/`setsid` itself; the window
+/// between `try_wait` and this call is microseconds.
+#[cfg(not(windows))]
+fn kill_process_group(pgid: u32) {
+    const SIGKILL: i32 = 9;
+    // SAFETY: a plain syscall wrapper with integer arguments; failure (the
+    // group is already empty) is ignored.
+    unsafe {
+        killpg(pgid as i32, SIGKILL);
     }
 }
 
@@ -626,21 +685,30 @@ impl ChildTree {
 ///
 /// On a NORMAL exit the job is released without killing anything: survivors the
 /// agent left behind keep running, exactly as on unix, where the tree is
-/// killed only on a timeout. On any other way out of supervision (an I/O
-/// error, a panic, sirius itself dying) the still-armed job kills the tree when
-/// its handle closes, so no unsupervised agent outlives the supervisor.
+/// killed only on a timeout. (SF-17: a run started with `kill_tree_on_exit` —
+/// the gate's test suite — terminates the job instead.) On any other way out
+/// of supervision (an I/O error, a panic, sirius itself dying) the still-armed
+/// job kills the tree when its handle closes, so no unsupervised agent
+/// outlives the supervisor.
 #[cfg(windows)]
 struct ChildTree(Option<crate::winjob::TreeJob>);
 
 #[cfg(windows)]
 impl ChildTree {
-    fn adopt(child: &std::process::Child) -> Self {
+    fn adopt(child: &std::process::Child, _own_group: bool) -> Self {
         ChildTree(crate::winjob::TreeJob::adopt(child))
     }
 
-    fn release(&self) {
+    /// The child exited on its own: disarm the job, or (SF-17) kill every
+    /// process still in it. Only the job can do that now — the root is gone,
+    /// so a `taskkill /T` from its pid has nothing to walk.
+    fn finish(&self, kill_leftovers: bool) {
         if let Some(job) = &self.0 {
-            job.release();
+            if kill_leftovers {
+                job.terminate();
+            } else {
+                job.release();
+            }
         }
     }
 
@@ -1013,26 +1081,20 @@ pub fn find_program(program: &str) -> Option<PathBuf> {
     )
 }
 
-/// Run `script` through `shell`. A spawn failure NAMES the shell: the old bare
-/// "program not found" read as if the *test binary* were missing and sent the
-/// SF-15 reporter looking in entirely the wrong place.
-pub fn run_in_shell(
-    runner: &dyn Runner,
-    shell: &ShellCmd,
-    script: &str,
-) -> Result<CmdOutput, String> {
-    runner
-        .run(&shell.program, &[shell.flag.as_str(), script])
-        .map_err(|e| {
-            format!(
-                "cannot start the SHELL `{}` that sirius runs gate.test_cmd through: {e} \
-                 (this is the shell, not your test binary — the command `{}` was never \
-                 reached). Install a POSIX sh, or set {SHELL_OVERRIDE_ENV} to a shell \
-                 that exists.",
-                shell.program,
-                first_line_of(script),
-            )
-        })
+/// The SF-15 message for a shell that would not start. A spawn failure NAMES
+/// the shell: the old bare "program not found" read as if the *test binary*
+/// were missing and sent the SF-15 reporter looking in entirely the wrong
+/// place. Used by the gate's supervised run (SF-17; it replaced the old
+/// `run_in_shell`).
+pub fn shell_spawn_message(shell: &ShellCmd, script: &str, e: &std::io::Error) -> String {
+    format!(
+        "cannot start the SHELL `{}` that sirius runs gate.test_cmd through: {e} \
+         (this is the shell, not your test binary — the command `{}` was never \
+         reached). Install a POSIX sh, or set {SHELL_OVERRIDE_ENV} to a shell \
+         that exists.",
+        shell.program,
+        first_line_of(script),
+    )
 }
 
 fn first_line_of(s: &str) -> String {
@@ -1098,6 +1160,12 @@ pub struct MockRunner {
     probe_calls: Mutex<u32>,
     /// Everything the probe returned when it was invoked.
     probes: Mutex<Vec<Option<WorktreeProbe>>>,
+    /// SF-17: the gate's test run also goes through `run_agent` (it is
+    /// supervised), but it is NOT an agent: its options are recorded here,
+    /// not in `agent_envs`, and it never consumes an agent's armed sim.
+    gate_runs: Mutex<Vec<AgentRunOpts>>,
+    /// SF-17: how the next gate run behaves (beats fired, then maybe killed).
+    gate_sim: Mutex<Option<AgentSim>>,
 }
 
 #[cfg(test)]
@@ -1210,6 +1278,31 @@ impl MockRunner {
         self
     }
 
+    /// SF-17: the supervision options of every gate test run so far.
+    pub fn gate_runs(&self) -> Vec<AgentRunOpts> {
+        self.gate_runs.lock().unwrap().clone()
+    }
+
+    /// SF-17: the next gate run fires its heartbeat `beats` times, then
+    /// exits normally.
+    pub fn arm_gate_heartbeats(&self, beats: u32) -> &Self {
+        *self.gate_sim.lock().unwrap() = Some(AgentSim {
+            beats,
+            timeout: None,
+        });
+        self
+    }
+
+    /// SF-17: the next gate run fires its heartbeat `beats` times, then is
+    /// killed by the `kind` limit.
+    pub fn arm_gate_timeout(&self, kind: TimeoutKind, beats: u32) -> &Self {
+        *self.gate_sim.lock().unwrap() = Some(AgentSim {
+            beats,
+            timeout: Some(kind),
+        });
+        self
+    }
+
     /// SIRF-23: the env of every `run_agent` call so far, in order.
     pub fn agent_envs(&self) -> Vec<Vec<(String, String)>> {
         self.agent_envs.lock().unwrap().clone()
@@ -1271,6 +1364,24 @@ impl Runner for MockRunner {
         opts: &AgentRunOpts,
         heartbeat: &mut dyn FnMut(),
     ) -> std::io::Result<AgentOutcome> {
+        // SF-17: the gate's test run — supervised, but not an agent.
+        if opts.kill_tree_on_exit {
+            self.gate_runs.lock().unwrap().push(opts.clone());
+            let out = self.run(program, args)?;
+            let sim = self.gate_sim.lock().unwrap().take();
+            return Ok(match sim {
+                Some(s) => {
+                    for _ in 0..s.beats {
+                        heartbeat();
+                    }
+                    match s.timeout {
+                        Some(kind) => AgentOutcome::TimedOut { output: out, kind },
+                        None => AgentOutcome::Exited(out),
+                    }
+                }
+                None => AgentOutcome::Exited(out),
+            });
+        }
         self.agent_envs.lock().unwrap().push(opts.env.clone());
         // Play any scripted side effect for this phase (SIRF-23).
         let phase = opts
@@ -1343,14 +1454,16 @@ impl Runner for MockRunner {
         watch: &mut ProgressWatch<'_>,
         heartbeat: &mut dyn FnMut(),
     ) -> std::io::Result<AgentOutcome> {
-        self.watches
-            .lock()
-            .unwrap()
-            .push((opts.timeout, watch.idle, watch.grace));
-        let n = std::mem::take(&mut *self.probe_calls.lock().unwrap());
-        for _ in 0..n {
-            let snap = (watch.probe)();
-            self.probes.lock().unwrap().push(snap);
+        if !opts.kill_tree_on_exit {
+            self.watches
+                .lock()
+                .unwrap()
+                .push((opts.timeout, watch.idle, watch.grace));
+            let n = std::mem::take(&mut *self.probe_calls.lock().unwrap());
+            for _ in 0..n {
+                let snap = (watch.probe)();
+                self.probes.lock().unwrap().push(snap);
+            }
         }
         self.run_agent(program, args, opts, heartbeat)
     }
@@ -1392,6 +1505,217 @@ fn canon_shell(argv: &[String]) -> Vec<String> {
         out[1] = "-c".to_string();
     }
     out
+}
+
+/// Real-process helpers for the Windows process-tree tests (SIRF-56, SF-17):
+/// a grandchild `ping` that outlives its parent unless the tree is killed, with
+/// a pid file as the "is up" signal and a guard that kills it on drop. Shared
+/// by this module's tests and the gate's.
+#[cfg(all(test, windows))]
+pub(crate) mod wintree {
+    use super::*;
+    use std::cell::Cell;
+
+    mod ffi {
+        use std::ffi::c_void;
+        #[link(name = "kernel32")]
+        extern "system" {
+            pub fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+            pub fn WaitForSingleObject(h: *mut c_void, ms: u32) -> u32;
+            pub fn TerminateProcess(h: *mut c_void, code: u32) -> i32;
+            pub fn CloseHandle(h: *mut c_void) -> i32;
+        }
+    }
+
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    const WAIT_TIMEOUT: u32 = 258;
+
+    /// Is `pid` still a running process? (`OpenProcess` fails for a pid that
+    /// is gone; a handle to an exited-but-referenced process is signalled.)
+    pub fn pid_alive(pid: u32) -> bool {
+        // SAFETY: plain Win32 calls on a handle we open and close here.
+        unsafe {
+            let h = ffi::OpenProcess(SYNCHRONIZE, 0, pid);
+            if h.is_null() {
+                // 87 = ERROR_INVALID_PARAMETER: no such process. Anything
+                // else (access denied) means it exists.
+                return std::io::Error::last_os_error().raw_os_error() != Some(87);
+            }
+            let alive = ffi::WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+            ffi::CloseHandle(h);
+            alive
+        }
+    }
+
+    /// A scratch dir + pid file for one test's grandchild.
+    ///
+    /// [`Grandchild::up`] opens a HANDLE to the grandchild the first time it
+    /// sees the pid file, while the process certainly exists; liveness and
+    /// the cleanup kill then go through that handle, so neither can ever hit
+    /// an unrelated process that was handed the pid after the grandchild
+    /// died. On drop — pass or FAIL — the grandchild is terminated, so a red
+    /// run never leaves a 90-second `ping` behind.
+    pub struct Grandchild {
+        pub dir: PathBuf,
+        pub pidfile: PathBuf,
+        pid: Cell<u32>,
+        handle: Cell<usize>,
+    }
+
+    impl Grandchild {
+        pub fn new(tag: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("sirius-wintree-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Grandchild {
+                pidfile: dir.join("grandchild.pid"),
+                dir,
+                pid: Cell::new(0),
+                handle: Cell::new(0),
+            }
+        }
+
+        /// Has the grandchild announced itself? Cheap enough to call from a
+        /// probe or heartbeat closure on every tick.
+        pub fn up(&self) -> bool {
+            if self.pid.get() != 0 {
+                return true;
+            }
+            let Some(pid) = std::fs::read_to_string(&self.pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            else {
+                return false;
+            };
+            self.pid.set(pid);
+            // SAFETY: a plain OpenProcess; the handle is closed in Drop.
+            let h = unsafe { ffi::OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
+            self.handle.set(h as usize);
+            true
+        }
+
+        fn alive(&self) -> bool {
+            match self.handle.get() {
+                // SAFETY: a handle we opened and have not closed.
+                h if h != 0 => unsafe { ffi::WaitForSingleObject(h as *mut _, 0) == WAIT_TIMEOUT },
+                _ => pid_alive(self.pid.get()),
+            }
+        }
+
+        /// Wait (bounded) for the grandchild to come up.
+        pub fn wait_up(&self, secs: u64) {
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            while !self.up() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(self.up(), "the grandchild never started (no pid file)");
+        }
+
+        pub fn opts(&self, hard_ms: u64) -> AgentRunOpts {
+            AgentRunOpts {
+                timeout: Duration::from_millis(hard_ms),
+                heartbeat_interval: Duration::from_millis(50),
+                log_path: None,
+                env: vec![(
+                    "SIRIUS_TEST_PIDFILE".into(),
+                    self.pidfile.display().to_string(),
+                )],
+                kill_tree_on_exit: false,
+            }
+        }
+
+        /// Is the grandchild still running? (After [`Grandchild::up`].)
+        pub fn is_running(&self) -> bool {
+            assert!(self.up(), "the grandchild never started (no pid file)");
+            self.alive()
+        }
+
+        /// Poll (bounded) for the grandchild to die after the kill.
+        pub fn assert_dead_within(&self, secs: u64, what: &str) {
+            assert!(
+                self.up(),
+                "the grandchild never started (no pid file): test setup too slow"
+            );
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            while self.alive() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(
+                !self.alive(),
+                "grandchild ping.exe (pid {}) survived {what}: only the root was killed",
+                self.pid.get()
+            );
+        }
+    }
+
+    impl Drop for Grandchild {
+        fn drop(&mut self) {
+            // Pick the pid up even if no probe ever did (a failed run).
+            if self.up() && self.alive() {
+                match self.handle.get() {
+                    // SAFETY: a handle we opened and have not closed.
+                    h if h != 0 => unsafe {
+                        ffi::TerminateProcess(h as *mut _, 1);
+                    },
+                    _ => {
+                        let _ = Command::new("taskkill")
+                            .args(["/F", "/PID", &self.pid.get().to_string()])
+                            .output();
+                    }
+                }
+            }
+            if self.handle.get() != 0 {
+                // SAFETY: closed exactly once, here.
+                unsafe {
+                    ffi::CloseHandle(self.handle.get() as *mut _);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// PowerShell: start `ping` for 90s, record its PID, then sleep. The
+    /// pid file doubles as the "grandchild is up" signal.
+    const SPAWN_GRANDCHILD: &str = "$p = Start-Process -FilePath ping \
+        -ArgumentList '-n','90','127.0.0.1' -PassThru -WindowStyle Hidden; \
+        Set-Content -Path $env:SIRIUS_TEST_PIDFILE -Value $p.Id; Start-Sleep -Seconds 90";
+
+    /// The root exactly as sirius runs an `--agent-cmd` without a POSIX sh:
+    /// `cmd.exe /C "<script>"`, here wrapping the PowerShell above.
+    pub fn via_cmd() -> (String, Vec<String>) {
+        let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into());
+        let line = format!("powershell -NoProfile -NonInteractive -Command \"{SPAWN_GRANDCHILD}\"");
+        (comspec, vec!["/C".into(), line])
+    }
+
+    /// The same grandchild, with PowerShell itself as the root process.
+    pub fn via_powershell() -> (String, Vec<String>) {
+        (
+            "powershell.exe".into(),
+            vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                SPAWN_GRANDCHILD.into(),
+            ],
+        )
+    }
+
+    /// Spawn the PowerShell root directly (no supervisor), for the tests
+    /// that drive `winjob` themselves.
+    pub fn spawn_root(g: &Grandchild) -> std::process::Child {
+        let (program, args) = via_powershell();
+        Command::new(program)
+            .args(args)
+            .env("SIRIUS_TEST_PIDFILE", &g.pidfile)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
 }
 
 #[cfg(test)]
@@ -1525,15 +1849,21 @@ mod tests {
             flag: "-c".into(),
             posix: true,
         };
-        let err =
-            run_in_shell(&Boom, &shell, "cargo test --workspace && bun run check").unwrap_err();
+        let spawn_err = Boom
+            .run(&shell.program, &[shell.flag.as_str(), "x"])
+            .unwrap_err();
+        let err = shell_spawn_message(
+            &shell,
+            "cargo test --workspace && bun run check",
+            &spawn_err,
+        );
         assert!(err.contains("SHELL `sh`"), "{err}");
         assert!(err.contains("not your test binary"), "{err}");
         assert!(err.contains(SHELL_OVERRIDE_ENV), "{err}");
     }
 
     #[test]
-    fn run_in_shell_passes_the_script_through_the_flag() {
+    fn a_shell_invocation_passes_the_script_through_the_flag() {
         let m = MockRunner::new();
         m.expect(&["sh", "-c"], 0, "ok");
         let shell = ShellCmd {
@@ -1541,7 +1871,9 @@ mod tests {
             flag: "/C".into(),
             posix: false,
         };
-        let out = run_in_shell(&m, &shell, "cargo test").unwrap();
+        let out = m
+            .run(&shell.program, &[shell.flag.as_str(), "cargo test"])
+            .unwrap();
         assert!(out.success());
         assert_eq!(out.stdout, "ok");
         // Recorded verbatim — canonicalization is for MATCHING only.
@@ -1562,7 +1894,9 @@ mod tests {
         ] {
             let m = MockRunner::new();
             m.expect(&["sh", "-c"], 7, "suite output");
-            let out = run_in_shell(&m, &shell, "cargo test").unwrap();
+            let out = m
+                .run(&shell.program, &[shell.flag.as_str(), "cargo test"])
+                .unwrap();
             assert_eq!(out.code, Some(7), "did not match for {shell:?}");
         }
     }
@@ -1590,6 +1924,7 @@ mod tests {
         m.expect(&["sh", "-c"], 0, "done");
         m.arm_agent_heartbeats(3);
         let opts = AgentRunOpts {
+            kill_tree_on_exit: false,
             timeout: Duration::from_secs(60),
             heartbeat_interval: Duration::from_secs(1),
             log_path: None,
@@ -1611,6 +1946,7 @@ mod tests {
         m.expect(&["sh", "-c"], 0, "");
         m.arm_agent_timeout(2);
         let opts = AgentRunOpts {
+            kill_tree_on_exit: false,
             timeout: Duration::from_secs(1),
             heartbeat_interval: Duration::from_secs(1),
             log_path: None,
@@ -1647,6 +1983,7 @@ mod tests {
         let script = format!("sleep 30 & echo $! > '{}'; wait", pidfile.display());
         let r = RealRunner::default();
         let opts = AgentRunOpts {
+            kill_tree_on_exit: false,
             timeout: Duration::from_millis(1500),
             heartbeat_interval: Duration::from_millis(100),
             log_path: None,
@@ -1685,213 +2022,6 @@ mod tests {
     // real chain  cmd.exe -> powershell.exe -> ping.exe  (the shape of
     // `cmd /C claude -p ...` -> claude -> its tools) and assert the grandchild
     // `ping` — which would otherwise run for 90s — is gone after each kill.
-
-    #[cfg(windows)]
-    mod wintree {
-        use super::*;
-        use std::cell::Cell;
-
-        mod ffi {
-            use std::ffi::c_void;
-            #[link(name = "kernel32")]
-            extern "system" {
-                pub fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
-                pub fn WaitForSingleObject(h: *mut c_void, ms: u32) -> u32;
-                pub fn TerminateProcess(h: *mut c_void, code: u32) -> i32;
-                pub fn CloseHandle(h: *mut c_void) -> i32;
-            }
-        }
-
-        const SYNCHRONIZE: u32 = 0x0010_0000;
-        const PROCESS_TERMINATE: u32 = 0x0001;
-        const WAIT_TIMEOUT: u32 = 258;
-
-        /// Is `pid` still a running process? (`OpenProcess` fails for a pid that
-        /// is gone; a handle to an exited-but-referenced process is signalled.)
-        pub fn pid_alive(pid: u32) -> bool {
-            // SAFETY: plain Win32 calls on a handle we open and close here.
-            unsafe {
-                let h = ffi::OpenProcess(SYNCHRONIZE, 0, pid);
-                if h.is_null() {
-                    // 87 = ERROR_INVALID_PARAMETER: no such process. Anything
-                    // else (access denied) means it exists.
-                    return std::io::Error::last_os_error().raw_os_error() != Some(87);
-                }
-                let alive = ffi::WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
-                ffi::CloseHandle(h);
-                alive
-            }
-        }
-
-        /// A scratch dir + pid file for one test's grandchild.
-        ///
-        /// [`Grandchild::up`] opens a HANDLE to the grandchild the first time it
-        /// sees the pid file, while the process certainly exists; liveness and
-        /// the cleanup kill then go through that handle, so neither can ever hit
-        /// an unrelated process that was handed the pid after the grandchild
-        /// died. On drop — pass or FAIL — the grandchild is terminated, so a red
-        /// run never leaves a 90-second `ping` behind.
-        pub struct Grandchild {
-            dir: PathBuf,
-            pub pidfile: PathBuf,
-            pid: Cell<u32>,
-            handle: Cell<usize>,
-        }
-
-        impl Grandchild {
-            pub fn new(tag: &str) -> Self {
-                let dir = std::env::temp_dir()
-                    .join(format!("sirius-wintree-{tag}-{}", std::process::id()));
-                let _ = std::fs::remove_dir_all(&dir);
-                std::fs::create_dir_all(&dir).unwrap();
-                Grandchild {
-                    pidfile: dir.join("grandchild.pid"),
-                    dir,
-                    pid: Cell::new(0),
-                    handle: Cell::new(0),
-                }
-            }
-
-            /// Has the grandchild announced itself? Cheap enough to call from a
-            /// probe or heartbeat closure on every tick.
-            pub fn up(&self) -> bool {
-                if self.pid.get() != 0 {
-                    return true;
-                }
-                let Some(pid) = std::fs::read_to_string(&self.pidfile)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u32>().ok())
-                else {
-                    return false;
-                };
-                self.pid.set(pid);
-                // SAFETY: a plain OpenProcess; the handle is closed in Drop.
-                let h = unsafe { ffi::OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
-                self.handle.set(h as usize);
-                true
-            }
-
-            fn alive(&self) -> bool {
-                match self.handle.get() {
-                    // SAFETY: a handle we opened and have not closed.
-                    h if h != 0 => unsafe {
-                        ffi::WaitForSingleObject(h as *mut _, 0) == WAIT_TIMEOUT
-                    },
-                    _ => pid_alive(self.pid.get()),
-                }
-            }
-
-            /// Wait (bounded) for the grandchild to come up.
-            pub fn wait_up(&self, secs: u64) {
-                let deadline = Instant::now() + Duration::from_secs(secs);
-                while !self.up() && Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                assert!(self.up(), "the grandchild never started (no pid file)");
-            }
-
-            pub fn opts(&self, hard_ms: u64) -> AgentRunOpts {
-                AgentRunOpts {
-                    env: vec![(
-                        "SIRIUS_TEST_PIDFILE".into(),
-                        self.pidfile.display().to_string(),
-                    )],
-                    ..opts_for(hard_ms, None)
-                }
-            }
-
-            /// Is the grandchild still running? (After [`Grandchild::up`].)
-            pub fn is_running(&self) -> bool {
-                assert!(self.up(), "the grandchild never started (no pid file)");
-                self.alive()
-            }
-
-            /// Poll (bounded) for the grandchild to die after the kill.
-            pub fn assert_dead_within(&self, secs: u64, what: &str) {
-                assert!(
-                    self.up(),
-                    "the grandchild never started (no pid file): test setup too slow"
-                );
-                let deadline = Instant::now() + Duration::from_secs(secs);
-                while self.alive() && Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                assert!(
-                    !self.alive(),
-                    "grandchild ping.exe (pid {}) survived {what}: only the root was killed",
-                    self.pid.get()
-                );
-            }
-        }
-
-        impl Drop for Grandchild {
-            fn drop(&mut self) {
-                // Pick the pid up even if no probe ever did (a failed run).
-                if self.up() && self.alive() {
-                    match self.handle.get() {
-                        // SAFETY: a handle we opened and have not closed.
-                        h if h != 0 => unsafe {
-                            ffi::TerminateProcess(h as *mut _, 1);
-                        },
-                        _ => {
-                            let _ = Command::new("taskkill")
-                                .args(["/F", "/PID", &self.pid.get().to_string()])
-                                .output();
-                        }
-                    }
-                }
-                if self.handle.get() != 0 {
-                    // SAFETY: closed exactly once, here.
-                    unsafe {
-                        ffi::CloseHandle(self.handle.get() as *mut _);
-                    }
-                }
-                let _ = std::fs::remove_dir_all(&self.dir);
-            }
-        }
-
-        /// PowerShell: start `ping` for 90s, record its PID, then sleep. The
-        /// pid file doubles as the "grandchild is up" signal.
-        const SPAWN_GRANDCHILD: &str = "$p = Start-Process -FilePath ping \
-            -ArgumentList '-n','90','127.0.0.1' -PassThru -WindowStyle Hidden; \
-            Set-Content -Path $env:SIRIUS_TEST_PIDFILE -Value $p.Id; Start-Sleep -Seconds 90";
-
-        /// The root exactly as sirius runs an `--agent-cmd` without a POSIX sh:
-        /// `cmd.exe /C "<script>"`, here wrapping the PowerShell above.
-        pub fn via_cmd() -> (String, Vec<String>) {
-            let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into());
-            let line =
-                format!("powershell -NoProfile -NonInteractive -Command \"{SPAWN_GRANDCHILD}\"");
-            (comspec, vec!["/C".into(), line])
-        }
-
-        /// The same grandchild, with PowerShell itself as the root process.
-        pub fn via_powershell() -> (String, Vec<String>) {
-            (
-                "powershell.exe".into(),
-                vec![
-                    "-NoProfile".into(),
-                    "-NonInteractive".into(),
-                    "-Command".into(),
-                    SPAWN_GRANDCHILD.into(),
-                ],
-            )
-        }
-
-        /// Spawn the PowerShell root directly (no supervisor), for the tests
-        /// that drive `winjob` themselves.
-        pub fn spawn_root(g: &Grandchild) -> std::process::Child {
-            let (program, args) = via_powershell();
-            Command::new(program)
-                .args(args)
-                .env("SIRIUS_TEST_PIDFILE", &g.pidfile)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .unwrap()
-        }
-    }
 
     // The wall clock (reviewer / integration / canary runs and the work agent's
     // hard cap). The cap is wall time from spawn, so it is generous: the
@@ -2070,6 +2200,7 @@ mod tests {
         // sub-second timeout so the test stays fast.
         let r = RealRunner::default();
         let opts = AgentRunOpts {
+            kill_tree_on_exit: false,
             timeout: Duration::from_millis(200),
             heartbeat_interval: Duration::from_millis(50),
             log_path: None,
@@ -2101,6 +2232,7 @@ mod tests {
         let log = std::env::temp_dir().join(format!("sirius-agentlog-{}.log", std::process::id()));
         let _ = std::fs::remove_file(&log);
         let opts = AgentRunOpts {
+            kill_tree_on_exit: false,
             timeout: Duration::from_secs(10),
             heartbeat_interval: Duration::from_secs(1),
             log_path: Some(log.clone()),
@@ -2136,6 +2268,7 @@ mod tests {
         let log = std::env::temp_dir().join(format!("sirius-biglog-{}.log", std::process::id()));
         let _ = std::fs::remove_file(&log);
         let opts = AgentRunOpts {
+            kill_tree_on_exit: false,
             timeout: Duration::from_secs(15),
             heartbeat_interval: Duration::from_secs(100),
             log_path: Some(log.clone()),
@@ -2170,6 +2303,7 @@ mod tests {
 
     fn opts_for(hard_ms: u64, log: Option<PathBuf>) -> AgentRunOpts {
         AgentRunOpts {
+            kill_tree_on_exit: false,
             timeout: Duration::from_millis(hard_ms),
             heartbeat_interval: Duration::from_millis(50),
             log_path: log,

@@ -105,6 +105,33 @@ pub struct GateConfig {
     /// Behavior when the selection cannot be trusted to be complete.
     #[serde(default)]
     pub fallback: GateFallback,
+    /// SF-17: hard wall clock for ONE `test_cmd` run. On expiry the whole
+    /// process tree is killed and the gate FAILS with reason `timed_out`.
+    /// null ⇒ [`DEFAULT_GATE_TIMEOUT_SECS`]. Raise it for a suite that
+    /// legitimately takes longer.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// SF-17: optional idle watchdog — kill the run once it has printed
+    /// nothing (the log did not grow) for this long. null ⇒ DISABLED: a
+    /// false idle kill fails healthy work (a quiet compile, a long test), and
+    /// the hard cap already ends a real hang.
+    #[serde(default)]
+    pub idle_secs: Option<u64>,
+}
+
+/// SF-17: default hard cap for one gate run (1 hour).
+pub const DEFAULT_GATE_TIMEOUT_SECS: u64 = 3600;
+
+impl GateConfig {
+    /// The effective hard wall clock for one `test_cmd` run.
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timeout_secs.unwrap_or(DEFAULT_GATE_TIMEOUT_SECS))
+    }
+
+    /// The idle window, or `None` when the watchdog is off (the default).
+    pub fn idle(&self) -> Option<std::time::Duration> {
+        self.idle_secs.map(std::time::Duration::from_secs)
+    }
 }
 
 /// What to do when the review stage cannot reach a clean verdict (SIRF-23).
@@ -724,6 +751,12 @@ impl Config {
                     .into(),
             );
         }
+        if zero(self.gate.timeout_secs) || zero(self.gate.idle_secs) {
+            return Err(
+                "gate.timeout_secs / gate.idle_secs must be > 0 (omit or null for the default)"
+                    .into(),
+            );
+        }
         if zero(self.worktree.setup_timeout_secs) {
             return Err(
                 "worktree.setup_timeout_secs must be > 0 (omit or null for the default)".into(),
@@ -1192,6 +1225,43 @@ mod tests {
             r#"{"timeouts":{"idle_secs":0}}"#,
             r#"{"timeouts":{"hard_secs":0}}"#,
             r#"{"timeouts":{"routes":[{"labels":["x"],"hard_secs":0}]}}"#,
+        ] {
+            let c: Config = serde_json::from_str(json).unwrap();
+            assert!(c.validate().is_err(), "{json}");
+        }
+    }
+
+    // SF-17: the gate's own limits. A config written before them still parses
+    // (the keys are optional), the cap defaults to an hour, and the idle
+    // watchdog is OFF unless asked for.
+    #[test]
+    fn gate_limits_default_and_old_configs_still_parse() {
+        let c: Config = serde_json::from_str(r#"{"gate":{"test_cmd":"cargo test"}}"#).unwrap();
+        assert!(c.validate().is_ok());
+        assert_eq!(c.gate.timeout_secs, None);
+        assert_eq!(
+            c.gate.timeout(),
+            std::time::Duration::from_secs(DEFAULT_GATE_TIMEOUT_SECS)
+        );
+        assert_eq!(DEFAULT_GATE_TIMEOUT_SECS, 3600);
+        assert_eq!(c.gate.idle(), None, "idle is disabled unless set");
+        let c: Config =
+            serde_json::from_str(r#"{"gate":{"timeout_secs":90,"idle_secs":20}}"#).unwrap();
+        assert_eq!(c.gate.timeout(), std::time::Duration::from_secs(90));
+        assert_eq!(c.gate.idle(), Some(std::time::Duration::from_secs(20)));
+        // Same file the default config writes: `sirius init` shows the knobs.
+        let json = serde_json::to_string(&Config::default()).unwrap();
+        assert!(
+            json.contains(r#""timeout_secs":null,"idle_secs":null"#),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn zero_gate_limits_are_rejected() {
+        for json in [
+            r#"{"gate":{"timeout_secs":0}}"#,
+            r#"{"gate":{"idle_secs":0}}"#,
         ] {
             let c: Config = serde_json::from_str(json).unwrap();
             assert!(c.validate().is_err(), "{json}");

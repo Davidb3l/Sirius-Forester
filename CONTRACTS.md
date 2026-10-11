@@ -167,7 +167,7 @@ sirius why AMT-7 --json     -> {"ref":"AMT-7","symbols":[str],"decisions":[str],
 sirius gate AMT-7 [--tier safe] [--target-status in_review] [--range <git-range>] --json
    -> {"ok":bool,"issue":"AMT-7","tier":"safe","gate":"pass|fail",
        "plan":"subset(n)|full-suite|blocked|pass-with-warning|unconfigured",
-       "reason_code":"pass|tests_failed|blocked_by_policy|passed_without_tests|unconfigured_test_cmd|shell_spawn_failed",
+       "reason_code":"pass|tests_failed|blocked_by_policy|passed_without_tests|unconfigured_test_cmd|shell_spawn_failed|timed_out",
        "structural":bool,
        "ran_tests":bool,"advanced_to":"in_review"|null,
        "tests_selected":int,"comment_filed":bool}
@@ -178,6 +178,17 @@ sirius gate AMT-7 [--tier safe] [--target-status in_review] [--range <git-range>
    # gate.test_cmd runs through an EXPLICIT shell, never the launcher's (SF-15):
    # $SIRIUS_SHELL if set; else /bin/sh -c on unix; else the first sh.exe on PATH;
    # else %ComSpec% /C.
+   # SF-17: gate.test_cmd is SUPERVISED, not a bare blocking call: its output streams to
+   # .sirius/logs/gate-<issue>.log (the CLI) / gate-<worker>.log (the fleet) — never a pipe a
+   # grandchild could hold open — and the verdict's tail is read back from there (last 1 MiB).
+   # gate.timeout_secs (default 3600) caps the run, gate.idle_secs (default: off) kills a
+   # silent one; either kills the WHOLE process tree and yields gate "fail", reason_code
+   # "timed_out", structural:false, ran_tests:true (never an env fault: no setup re-run),
+   # with the limit that fired and the key to raise in "reason". Whatever a suite leaves
+   # running after it exits (a test server) is killed too — on unix the suite runs in its own
+   # process group, so it does not receive the terminal's Ctrl-C. In the fleet the amt lease
+   # and entity claims are renewed while the suite runs; a refused renewal aborts the
+   # iteration (lease_lost) instead of recording the verdict.
    # SIRF-48: a fail comment carries the runner's output tail (last 15 non-empty lines,
    # ≤2KB, fenced); the ledger gate_tier fail event gains "error_tail":str and
    # "env_fault":bool (the output looks like a missing dependency — SIRF-50).
@@ -386,6 +397,16 @@ other stdout formats.
   "retry_budget": 3,
   "worker_concurrency": 3,
   "claim_mode": "adaptive",                // "always" | "never" | "adaptive"
+  "gate": {
+    "test_cmd": null,                      // run verbatim through the resolved shell; null = gate refuses to pass
+    "fallback": "full-suite",              // "full-suite" | "fail" | "pass-with-warning" — on selection doubt
+    "timeout_secs": null,                  // SF-17 — null = 3600: hard cap on ONE test_cmd run; on expiry the
+                                           //   whole process tree is killed and the gate fails "timed_out".
+                                           //   Raise it for a suite that legitimately runs longer.
+    "idle_secs": null                      // SF-17 — null = OFF: kill a run whose output (its log) has not
+                                           //   grown for this long (a false idle kill fails healthy work, and
+                                           //   the hard cap already ends a real hang)
+  },
   "models": {                              // SIRF-26 — resolution: flag > config > $SIRIUS_PARENT_MODEL
     "default": null,                       // worker model when no route matches (--model)
     "routes": [],                          // [{"labels": ["security","auth"], "model": "<id>"}], first match wins

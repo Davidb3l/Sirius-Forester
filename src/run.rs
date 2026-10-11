@@ -1399,6 +1399,7 @@ pub fn run_iteration(
             // SIRF-41: hard cap + idle watchdog + finish grace, per label.
             let limits = config.agent_timeouts(&labels);
             let opts = AgentRunOpts {
+                kill_tree_on_exit: false,
                 timeout: Duration::from_secs(limits.hard_secs),
                 heartbeat_interval: Duration::from_secs(config.heartbeat_interval_secs()),
                 log_path: log_path.clone(),
@@ -1582,6 +1583,31 @@ pub fn run_iteration(
             //    the verdict from the test runner (never from the selector's exit
             //    code). `hayven affected-tests` only selects; on any doubt the gate
             //    runs the full suite. See gate.rs / SIRF-5 / D-3.
+            //
+            // SF-17: the suite is supervised — a hard cap, an optional idle
+            // watchdog, its output streamed to `.sirius/logs/gate-<worker>.log`
+            // — and while it runs the heartbeat renews the amt lease AND the
+            // hayven entity claims (a long suite used to outlast both, with
+            // nothing renewing them). A REFUSED renewal cannot abort the suite
+            // from inside its supervisor; it is remembered here and acted on
+            // the moment the gate returns, before anything is commented or
+            // advanced on a lease that is no longer ours.
+            let gate_lease_refused: std::cell::RefCell<Option<String>> =
+                std::cell::RefCell::new(None);
+            let gate_heartbeat = || {
+                || {
+                    if gate_lease_refused.borrow().is_none() {
+                        if let Err(reason) = renew_checked() {
+                            *gate_lease_refused.borrow_mut() = Some(reason);
+                        }
+                    }
+                }
+            };
+            let gate_run = crate::gate::GateRunOpts::from_config(
+                &config.gate,
+                Duration::from_secs(config.heartbeat_interval_secs()),
+                fleet.map(|f| gate_log_path(&f.sirius_dir, worker)),
+            );
             let gate_once = || match baseline_err.clone().map_or_else(
                 || crate::gitrange::changed_since(runner, pre_head.as_deref(), &pre_untracked),
                 Err,
@@ -1594,6 +1620,8 @@ pub fn run_iteration(
                     runner,
                     &config.gate,
                     &format!("cannot determine changed files: {e}"),
+                    &gate_run,
+                    &mut gate_heartbeat(),
                 )),
                 // Genuinely nothing changed (committed, staged, unstaged, or
                 // untracked) since the pre-work baseline → nothing to gate.
@@ -1607,12 +1635,25 @@ pub fn run_iteration(
                 // for the serial `sirius gate` CLI, which runs where the
                 // daemon watches. (SIRF-48: the reason now reads as the
                 // routine note it is, not as a cause of failure.)
-                Ok(_) if isolate_base.is_some() => {
-                    Some(crate::gate::evaluate_isolated(runner, &config.gate))
-                }
-                Ok(files) => Some(crate::gate::evaluate(hv, runner, &config.gate, &files)),
+                Ok(_) if isolate_base.is_some() => Some(crate::gate::evaluate_isolated(
+                    runner,
+                    &config.gate,
+                    &gate_run,
+                    &mut gate_heartbeat(),
+                )),
+                Ok(files) => Some(crate::gate::evaluate(
+                    hv,
+                    runner,
+                    &config.gate,
+                    &files,
+                    &gate_run,
+                    &mut gate_heartbeat(),
+                )),
             };
             let mut verdict = gate_once();
+            if let Some(reason) = gate_lease_refused.take() {
+                return WorkGate::Exit(lease_lost(out, &reason, "recording the gate result"));
+            }
             // SIRF-50: a failure whose output says a DEPENDENCY is missing
             // (`Cannot find module 'react'`) is the environment's fault, not
             // the agent's. Re-run worktree setup and gate again — ONCE, and
@@ -1675,6 +1716,10 @@ pub fn run_iteration(
                         "Environment fault suspected (`{line}`); no worktree.setup_cmd is configured to repair it."
                     ),
                 });
+            }
+            // The re-gate ran under the same lease watch.
+            if let Some(reason) = gate_lease_refused.take() {
+                return WorkGate::Exit(lease_lost(out, &reason, "recording the gate result"));
             }
             // Only a fault setup could NOT repair (no setup command, or the
             // re-run failed) leaves the work unjudged.
@@ -2325,6 +2370,16 @@ pub fn setup_log_path(sirius_dir: &std::path::Path, worker: &str) -> std::path::
     sirius_dir
         .join("logs")
         .join(format!("setup-{}.log", safe_name(worker)))
+}
+
+/// A worker's gate log (SF-17): `<.sirius>/logs/gate-<worker, file-safe>.log`.
+/// The suite's output streams here (a pipe could be held open by a grandchild
+/// and hang the gate), and the verdict's tail is read back from it. One file
+/// per worker, overwritten by each gate run.
+pub fn gate_log_path(sirius_dir: &std::path::Path, who: &str) -> std::path::PathBuf {
+    sirius_dir
+        .join("logs")
+        .join(format!("gate-{}.log", safe_name(who)))
 }
 
 fn safe_name(s: &str) -> String {
@@ -3825,6 +3880,7 @@ fn review_once(
     }
     let fp_before = tree_fingerprint(cx.runner);
     let opts = AgentRunOpts {
+        kill_tree_on_exit: false,
         timeout: Duration::from_secs(rc.timeout_secs),
         heartbeat_interval: Duration::from_secs(cx.config.heartbeat_interval_secs()),
         // Absolute, under the fleet's .sirius/: the reviewer's final message
@@ -4437,6 +4493,7 @@ mod tests {
             gate: crate::config::GateConfig {
                 test_cmd: Some("run-suite".into()),
                 fallback: crate::config::GateFallback::FullSuite,
+                ..crate::config::GateConfig::default()
             },
             ..Config::default()
         }
@@ -5368,6 +5425,7 @@ mod tests {
             gate: crate::config::GateConfig {
                 test_cmd: None, // fail-closed, structurally unpassable
                 fallback: crate::config::GateFallback::FullSuite,
+                ..crate::config::GateConfig::default()
             },
             ..cfg()
         };
@@ -6987,6 +7045,124 @@ mod tests {
             "no receipt"
         );
         assert!(nd.contains("\"reason\":\"lease_lost\""), "{nd}");
+    }
+
+    // SF-17: the gate's suite is supervised and, while it runs, the heartbeat
+    // renews the amt lease (a long suite used to outlast it unrenewed).
+    #[test]
+    fn the_gate_renews_the_lease_while_the_suite_runs_and_logs_per_worker() {
+        let renewals = |gate_beats: u32| {
+            let m = MockRunner::new();
+            program_review_iteration(&m, "AMT-70");
+            m.expect(
+                &["amt", "--json", "claim", "--issue"],
+                0,
+                r#"{"id":"AMT-70"}"#,
+            );
+            m.arm_gate_heartbeats(gate_beats);
+            let (o, _led, _nd) = run_fleet(&m, &cfg());
+            assert_eq!(o, IterationOutcome::Completed);
+            let runs = m.gate_runs();
+            assert_eq!(runs.len(), 1, "one supervised gate run");
+            let opts = &runs[0];
+            assert!(opts.kill_tree_on_exit);
+            assert_eq!(opts.timeout, cfg().gate.timeout());
+            assert!(
+                opts.log_path.as_ref().is_some_and(
+                    |p| p.ends_with(std::path::Path::new("logs").join("gate-sirius_oak.log"))
+                ),
+                "{:?}",
+                opts.log_path
+            );
+            m.recorded()
+                .iter()
+                .filter(|c| c.starts_with("amt --json claim --issue"))
+                .count()
+        };
+        assert_eq!(
+            renewals(3) - renewals(0),
+            3,
+            "each gate heartbeat renews the amt lease"
+        );
+    }
+
+    #[test]
+    fn a_lease_refused_during_the_gate_aborts_before_anything_is_recorded() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-71");
+        // Pre-spawn renewal OK; the renewal DURING the gate is refused.
+        m.expect(
+            &["amt", "--json", "claim", "--issue"],
+            0,
+            r#"{"id":"AMT-71"}"#,
+        );
+        m.expect(
+            &["amt", "--json", "claim", "--issue"],
+            0,
+            r#"{"claimed":false,"reason":"held by sirius/rowan"}"#,
+        );
+        m.arm_gate_heartbeats(1);
+        let (o, _led, nd) = run_fleet(&m, &cfg());
+        match o {
+            IterationOutcome::Error(e) => {
+                assert!(e.contains("recording the gate result"), "{e}")
+            }
+            other => panic!("expected a lease-lost error, got {other:?}"),
+        }
+        let rec = m.recorded();
+        assert!(
+            !rec.iter().any(|c| c.starts_with("amt --json release")),
+            "not ours to release: {rec:?}"
+        );
+        assert!(
+            !rec.iter().any(|c| c.starts_with("amt --json decide")),
+            "no receipt on a lease that is gone"
+        );
+        assert!(
+            !rec.iter().any(|c| c.contains("gate failed")),
+            "no gate comment on a lease that is gone"
+        );
+        assert!(nd.contains("\"reason\":\"lease_lost\""), "{nd}");
+    }
+
+    // SF-17: a gate killed by its cap is an ordinary FAILED gate to the loop —
+    // retryable like any other (a fresh attempt can differ), never an
+    // environment fault (no setup re-run), and the next attempt is told why.
+    #[test]
+    fn a_gate_timeout_is_an_ordinary_retryable_failure_not_an_env_fault() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-72");
+        // Looks like a missing dependency — but a hung suite is not that.
+        m.push(crate::shell::MockResponse::new(
+            &["sh", "-c"],
+            1,
+            "",
+            "Error: Cannot find module 'react'",
+        ));
+        m.arm_gate_timeout(crate::shell::TimeoutKind::Hard, 0);
+        let mut c = cfg();
+        c.retry_budget = 2;
+        c.worktree.setup_cmd = Some("bun install".into());
+        let (_o, _led, nd) = run_fleet(&m, &c);
+        let rec = m.recorded();
+        assert!(
+            !rec.iter().any(|c| c.contains("bun install")),
+            "a timeout must not re-run worktree setup: {rec:?}"
+        );
+        assert!(
+            rec.iter()
+                .any(|c| c.contains("gate failed") && c.contains("timed_out")),
+            "{rec:?}"
+        );
+        assert!(nd.contains("\"reason_code\":\"timed_out\""), "{nd}");
+        assert!(nd.contains("\"env_fault\":false"), "{nd}");
+        // A second work attempt ran, exactly as after any failed gate.
+        assert_eq!(
+            phases(&m).iter().filter(|p| *p == "work").count(),
+            2,
+            "{:?}",
+            phases(&m)
+        );
     }
 
     #[test]

@@ -462,6 +462,7 @@ fn run_in_tree(
         std::process::id()
     ));
     let opts = AgentRunOpts {
+        kill_tree_on_exit: false,
         timeout: Duration::from_secs(cfg.integration.timeout_secs.max(1)),
         heartbeat_interval: Duration::from_secs(60),
         log_path: Some(log.clone()),

@@ -550,6 +550,14 @@ fn cmd_gate(
     };
     let amt = Amt::new(runner);
     let hv = Hayven::new(runner);
+    // SF-17: the suite is supervised (gate.timeout_secs / gate.idle_secs); its
+    // output streams to `.sirius/logs/gate-<issue>.log`. This path holds no
+    // lease, so the heartbeat cadence is only the supervisor's poll bound.
+    let run_opts = gate::GateRunOpts::from_config(
+        &cfg.gate,
+        std::time::Duration::from_secs(cfg.heartbeat_interval_secs()),
+        Some(run::gate_log_path(&ws.sirius_dir(), issue)),
+    );
     let tier = tier.unwrap_or(cfg.gate_tier);
     let target = target_status.unwrap_or(cfg.target_status);
 
@@ -563,6 +571,7 @@ fn cmd_gate(
         &tier,
         &target,
         range.as_deref(),
+        &run_opts,
     ) {
         Ok(o) => {
             // Spine (§2): amt status advance / fail comment already applied
