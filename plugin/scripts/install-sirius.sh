@@ -139,7 +139,9 @@ suite_hint() {
     || s_missing="$s_missing Catryna"
   if [ -z "$s_missing" ]; then return 0; fi
   log ""
-  log "fleet suite: missing:$s_missing. Sirius is the foreman; for full fleet control install the whole suite (one-shot: /sirius:install-suite):"
+  log "fleet suite: missing:$s_missing. Sirius is the foreman; for full fleet control install the whole suite."
+  log "  The Sothis suite now lives at github.com/Davidb3l/Sothis — install with \`sothis install\` (or the \`sothis@sothis\` plugin)."
+  log "  These Sirius-hosted suite installers (/sirius:install-suite) remain for compatibility and will be removed after two Sothis releases. To add just what is missing:"
   # Anyone running this script has the sirius plugin, hence the sirius-forester
   # marketplace: the Sothis bundle entries install with no extra marketplace add.
   case "$s_missing" in *Hayvenhurst*) log "  Hayvenhurst (code graph): claude plugin install hayvenhurst@sirius-forester, then /hayvenhurst:install-binary" ;; esac

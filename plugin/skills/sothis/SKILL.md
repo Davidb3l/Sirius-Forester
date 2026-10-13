@@ -19,6 +19,12 @@ description: >-
 
 # Installing the Sothis suite — "let's Sothis this up"
 
+> **Moved.** The Sothis suite now lives at github.com/Davidb3l/Sothis — install
+> with `sothis install` (or the `sothis@sothis` plugin). This Sirius-hosted
+> skill and its installers remain for compatibility and will be removed after
+> two Sothis releases. If the user has the `sothis` CLI, prefer
+> `sothis install --profile core|docs|full`; otherwise carry on below.
+
 **Sothis** is the local-first suite led by Sirius Forester. Five standalone
 tools that compose through the suite contracts:
 
@@ -52,6 +58,12 @@ claude plugin install sirius@sirius-forester
 claude plugin install hayvenhurst@sirius-forester
 claude plugin install catryna@sirius-forester
 ```
+
+The canonical home is the Sothis marketplace (`claude plugin marketplace add
+Davidb3l/Sothis`, then `claude plugin install <name>@sothis`). Either
+marketplace satisfies the checks below; the commands above work today and
+remain supported through the compatibility window. If the user already has
+the `sothis` marketplace, install `<name>@sothis` instead.
 
 A plugin already installed from its own standalone marketplace
 (`hayvenhurst@hayvenhurst`, `catryna@catryna-wikinelli`) counts — check with
@@ -135,9 +147,9 @@ What it does, in order (identical on both paths):
    plugin, and only falls back to fetching that script over HTTPS from the
    Hayvenhurst repo. If you'd rather install hayven through its plugin, pass
    `--skip-hayven` (`-SkipHayven`) and run `/hayvenhurst:install-binary`.
-   **On Windows this step is best-effort:** Hayvenhurst ships no native
-   Windows installer yet (no `install-hayven.ps1`, and `install-hayven.sh`
-   refuses Git Bash / MSYS / Cygwin), so both one-shots print a
+   **On Windows this step is best-effort:** Hayvenhurst v0.0.8+ ships Windows
+   installers (`install-hayven.ps1`, and a Windows-capable `install-hayven.sh`),
+   but if the delegated install still fails, both one-shots print a
    `hayven: WARNING` with the manual route (the `windows-x64` release tarball,
    checked against its `.sha256`) and carry on. Relay it — sirius runs without
    hayven, with reduced function, until it's installed. Elsewhere a hayven
@@ -150,8 +162,8 @@ What it does, in order (identical on both paths):
 5. Runs **`sirius doctor`** — the suite's ground-truth health check.
 6. Ends by **auto-installing any missing plugin half** via the non-interactive
    `claude plugin` CLI (skippable with `--skip-plugins`), then **verifying** it
-   (bundle marketplace + the three plugins, matched by `<name>@` prefix so any
-   marketplace counts). Only if something is STILL missing is its last output
+   (bundle marketplace — `sothis` or `sirius-forester` — plus the three plugins,
+   matched by `<name>@` prefix so any marketplace counts). Only if something is STILL missing is its last output
    a `YOU ARE NOT DONE` block listing the remaining routes (shell commands,
    the desktop app's plugin browser, or `/plugin`).
 

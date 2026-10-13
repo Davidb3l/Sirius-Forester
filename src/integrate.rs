@@ -463,6 +463,8 @@ fn run_in_tree(
     ));
     let opts = AgentRunOpts {
         kill_tree_on_exit: false,
+        // The command starts IN the frontier tree (was a POSIX `cd` prefix).
+        cwd: Some(std::path::PathBuf::from(t)),
         timeout: Duration::from_secs(cfg.integration.timeout_secs.max(1)),
         heartbeat_interval: Duration::from_secs(60),
         log_path: Some(log.clone()),
@@ -472,8 +474,8 @@ fn run_in_tree(
             ("SIRIUS_BASE_REF".into(), base_ref.to_string()),
         ],
     };
-    let full = format!("cd \"$SIRIUS_INTEGRATION_DIR\" || exit 1; {cmd}");
-    let ran = runner.run_agent("sh", &["-c", &full], &opts, &mut || {});
+    let sh = crate::shell::resolve_shell();
+    let ran = runner.run_agent(&sh.program, &[sh.flag.as_str(), cmd], &opts, &mut || {});
     report.ran = true;
     report.log = Some(log.display().to_string());
     match ran {
@@ -482,7 +484,12 @@ fn run_in_tree(
             report.exit = o.output().code;
             report.ok = o.success() && !o.timed_out();
         }
-        Err(e) => return Err(format!("cannot run integration.cmd: {e}")),
+        Err(e) => {
+            return Err(format!(
+                "cannot run integration.cmd: {}",
+                crate::shell::shell_run_error(&sh, "integration.cmd", opts.cwd.as_deref(), &e)
+            ))
+        }
     }
     Ok(report)
 }

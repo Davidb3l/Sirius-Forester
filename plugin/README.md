@@ -3,6 +3,8 @@
 Ships the **Sirius worker Skill** (the claim → map → lock → brief → work → gate
 → receipt → release loop) plus an installer for the compiled `sirius` CLI.
 
+> **The Sothis suite now lives at [github.com/Davidb3l/Sothis](https://github.com/Davidb3l/Sothis)** — install with `sothis install` (or the `sothis@sothis` plugin). The Sirius-hosted suite installers below (`/sirius:install-suite`, `install-sothis.sh`/`.ps1`) remain for compatibility and will be removed after two Sothis releases. Installing just Sirius (this plugin + `/sirius:install-binary`) is unaffected.
+
 ## Install
 
 ```
@@ -29,7 +31,7 @@ use the commands:
 | Command | What it does |
 |---|---|
 | `/sirius:install-binary [vX.Y.Z]` | install or update the `sirius` CLI |
-| `/sirius:install-suite` | install the whole Sothis suite |
+| `/sirius:install-suite` | install the whole Sothis suite (deprecated — use `sothis install`; kept through the compatibility window) |
 | `/sirius:integrate [--clear-red]` | build the integration frontier (base + every in-flight branch) and run your integration command on it before anything merges |
 | `/sirius:escape <ISSUE> <what escaped>` | record a bug that got past review, so later reviews check for it; `--list`, or retire a kind with `--kind <slug> --automated-by <path>` |
 | `/sirius:review-canary [--n N]` | measure the reviewer: replay recorded escapes (the real bugs, back) and report recall and false positives |
@@ -37,9 +39,9 @@ use the commands:
 Starting the fleet itself is a conversation, not a command: "let's get Sirius on
 this repo" — the Skill walks through the launch.
 
-Windows: no installer script yet — download the `windows-x64` tarball from the
-[releases page](https://github.com/Davidb3l/Sirius-Forester/releases), verify
-the `.sha256`, and put `sirius.exe` on your `PATH`.
+Windows: run `scripts/install-sirius.ps1` from PowerShell (`-RequireSignature`
+makes a missing Sigstore verifier fatal; `-AddToPath` updates your user `PATH`),
+or `/sirius:install-binary` from Claude Code.
 
 ## The full suite — Sothis
 
@@ -51,6 +53,8 @@ for living "why" docs, and rings
 [PingMyBell](https://github.com/Davidb3l/pingmybell) — the optional desktop
 notch/voice app — when the fleet needs you. Each tool stands alone, but full
 fleet control comes from running the four CLIs.
+
+> **Forwarding note.** The canonical marketplace is now `Davidb3l/Sothis` (`claude plugin marketplace add Davidb3l/Sothis`, then `claude plugin install <name>@sothis`, or just `sothis install`). The commands below keep working for the compatibility window and satisfy `sirius doctor` / the install checks exactly as the Sothis marketplace does; they will be removed after two Sothis releases.
 
 Installing the suite has two halves. **The plugins** — this marketplace is a
 bundle: one add exposes all three (Ametrite's `amt` is a CLI bootstrapped by its

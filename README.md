@@ -68,6 +68,8 @@ Code **plugins**, then the **CLIs** — and only the first rung depends on where
 you are, because every richer entry point lives inside the plugin you haven't
 installed yet:
 
+> **The Sothis suite now lives at [github.com/Davidb3l/Sothis](https://github.com/Davidb3l/Sothis) — install with `sothis install` (or the `sothis@sothis` plugin).** The Sirius-hosted suite installers below (`/sirius:install-suite`, `plugin/scripts/install-sothis.sh`/`.ps1`, the `Davidb3l/Sirius-Forester` marketplace) remain for compatibility and will be removed after two Sothis releases.
+
 **First rung — get the `sirius` plugin (pick ONE):**
 
 - **Desktop app, zero terminal:** click **+** next to the prompt box →

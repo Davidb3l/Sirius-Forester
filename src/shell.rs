@@ -52,6 +52,12 @@ pub struct AgentRunOpts {
     /// leaves the tree alone. On for `gate.test_cmd`: a test server a suite
     /// leaves behind holds its ports and poisons the next gate.
     pub kill_tree_on_exit: bool,
+    /// Working directory for THIS child (overrides the runner's). The reviewer,
+    /// integration and canary scripts used to start with `cd "$DIR" || exit 1;`,
+    /// a POSIX-only prefix; the directory is now the spawn's own cwd, so the
+    /// same command works under `sh -c` and `cmd /S /C`. A directory that does
+    /// not exist fails the spawn ("did not run") instead of running elsewhere.
+    pub cwd: Option<PathBuf>,
 }
 
 /// Which limit killed an agent (SIRF-41 #3).
@@ -202,6 +208,14 @@ pub trait Runner: Send + Sync {
 
 /// Build the `Command` for `program args`.
 ///
+/// `program` is resolved against `PATH` first ([`resolve_program`]) and the
+/// ABSOLUTE path is spawned. On Windows `CreateProcess` searches the running
+/// executable's own directory BEFORE `PATH`, so a `sirius.exe` in
+/// `~/.local/bin` would run a stale `amt.exe` sitting beside it instead of the
+/// `amt` the user's shell resolves. If the name is not found on `PATH`, the
+/// bare name is spawned as before, so the "program not found" error stays
+/// sensible.
+///
 /// One exception to plain `args`: a script handed to `cmd.exe /C` on Windows.
 /// Rust quotes an argument the MSVC way (`"` inside becomes `\"`), which cmd.exe
 /// does not understand — `claude -p "work the claimed issue"` reached claude as
@@ -209,7 +223,7 @@ pub trait Runner: Send + Sync {
 /// command line RAW, as `/S /C "<script>"`: `/S` makes cmd strip exactly the
 /// outer pair of quotes and run the rest verbatim, whatever quotes it contains.
 fn command_for(program: &str, args: &[&str]) -> Command {
-    let mut cmd = Command::new(program);
+    let mut cmd = command(program);
     #[cfg(windows)]
     if let [flag, script] = args {
         if flag.eq_ignore_ascii_case("/c") && is_cmd_exe(program) {
@@ -220,6 +234,54 @@ fn command_for(program: &str, args: &[&str]) -> Command {
     }
     cmd.args(args);
     cmd
+}
+
+/// `Command::new` with the program resolved PATH-first (see [`command_for`]).
+/// Use this for every peer-tool spawn (`git`, `amt`, `hayven`, …).
+pub fn command(program: &str) -> Command {
+    match resolve_program(program) {
+        Some(abs) => Command::new(abs),
+        None => Command::new(program),
+    }
+}
+
+/// Where a BARE program name resolves on `PATH` (honoring `PATHEXT` on
+/// Windows), or `None` for a path, an unfound name, or any non-Windows host
+/// (where `execvp` already searches only `PATH`).
+pub fn resolve_program(program: &str) -> Option<PathBuf> {
+    resolve_program_from(
+        program,
+        cfg!(windows),
+        std::env::var("PATH").ok().as_deref(),
+        std::env::var("PATHEXT").ok().as_deref(),
+        &|p: &Path| p.is_file(),
+    )
+}
+
+/// Pure core of [`resolve_program`], parameterised like [`find_program_from`]
+/// so both platforms are testable on either.
+///
+/// On Windows an extension-less hit is NOT a match: `find_program_from` probes
+/// the name as written first, and a shebang shim named `amt` (no extension)
+/// next to the real `amt.exe` cannot be spawned (`CreateProcess` error 193).
+/// Only candidates `CreateProcess` can run — i.e. with an extension — count.
+pub fn resolve_program_from(
+    program: &str,
+    windows: bool,
+    path_var: Option<&str>,
+    pathext: Option<&str>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    if !windows
+        || program.is_empty()
+        || program.contains('/')
+        || program.contains('\\')
+        || program.contains(':')
+    {
+        return None;
+    }
+    let runnable = |p: &Path| p.extension().is_some() && exists(p);
+    find_program_from(program, windows, path_var, pathext, &runnable)
 }
 
 /// Whether `program` is `cmd.exe` (by file stem, so `%ComSpec%`'s absolute
@@ -379,7 +441,7 @@ impl RealRunner {
             .stdout(stdout_cfg)
             .stderr(stderr_cfg);
         cmd.envs(opts.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-        if let Some(d) = &self.cwd {
+        if let Some(d) = opts.cwd.as_ref().or(self.cwd.as_ref()) {
             cmd.current_dir(d);
         }
         // The baseline snapshot is taken BEFORE the spawn, so even a commit
@@ -1105,6 +1167,27 @@ pub fn shell_spawn_message(shell: &ShellCmd, script: &str, e: &std::io::Error) -
     )
 }
 
+/// B4: why a sirius-built `what` (review.cmd, integration.cmd, …) did not run.
+/// Names the SHELL (and the directory it was to start in): the old bare
+/// "program not found" read as if the reviewer's own binary were missing, when
+/// the literal `sh` it was launched through was.
+pub fn shell_run_error(
+    shell: &ShellCmd,
+    what: &str,
+    cwd: Option<&Path>,
+    e: &std::io::Error,
+) -> String {
+    let dir = cwd
+        .map(|d| format!(" in `{}`", d.display()))
+        .unwrap_or_default();
+    format!(
+        "cannot start the shell `{}` that runs {what}{dir}: {e} (this is the shell or \
+         its working directory, not {what}'s own program — install a POSIX sh or set \
+         {SHELL_OVERRIDE_ENV} to a shell that exists)",
+        shell.program
+    )
+}
+
 fn first_line_of(s: &str) -> String {
     s.lines().next().unwrap_or("").trim().to_string()
 }
@@ -1148,6 +1231,8 @@ pub struct MockRunner {
     /// SIRF-23: the environment of every `run_agent` call, in order, so tests
     /// can assert the agent contract.
     agent_envs: Mutex<Vec<Vec<(String, String)>>>,
+    /// B4: the `cwd` of every `run_agent` call, in order (None = the runner's).
+    agent_cwds: Mutex<Vec<Option<PathBuf>>>,
     /// SIRF-23: scripted agent side effects keyed by `SIRIUS_PHASE`. Each
     /// entry is (env var naming the output path, file contents); a `run_agent`
     /// call in that phase pops one and writes it — how a test plays the
@@ -1211,6 +1296,11 @@ impl MockRunner {
             .iter()
             .map(|c| c.join(" "))
             .collect()
+    }
+
+    /// B4: the per-spawn working directories handed to `run_agent`, in order.
+    pub fn agent_cwds(&self) -> Vec<Option<PathBuf>> {
+        self.agent_cwds.lock().unwrap().clone()
     }
 
     pub fn call_count(&self) -> usize {
@@ -1391,6 +1481,7 @@ impl Runner for MockRunner {
             });
         }
         self.agent_envs.lock().unwrap().push(opts.env.clone());
+        self.agent_cwds.lock().unwrap().push(opts.cwd.clone());
         // Play any scripted side effect for this phase (SIRF-23).
         let phase = opts
             .env
@@ -1631,6 +1722,7 @@ pub(crate) mod wintree {
                     self.pidfile.display().to_string(),
                 )],
                 kill_tree_on_exit: false,
+                cwd: None,
             }
         }
 
@@ -1933,6 +2025,7 @@ mod tests {
         m.arm_agent_heartbeats(3);
         let opts = AgentRunOpts {
             kill_tree_on_exit: false,
+            cwd: None,
             timeout: Duration::from_secs(60),
             heartbeat_interval: Duration::from_secs(1),
             log_path: None,
@@ -1955,6 +2048,7 @@ mod tests {
         m.arm_agent_timeout(2);
         let opts = AgentRunOpts {
             kill_tree_on_exit: false,
+            cwd: None,
             timeout: Duration::from_secs(1),
             heartbeat_interval: Duration::from_secs(1),
             log_path: None,
@@ -1992,6 +2086,7 @@ mod tests {
         let r = RealRunner::default();
         let opts = AgentRunOpts {
             kill_tree_on_exit: false,
+            cwd: None,
             timeout: Duration::from_millis(1500),
             heartbeat_interval: Duration::from_millis(100),
             log_path: None,
@@ -2209,6 +2304,7 @@ mod tests {
         let r = RealRunner::default();
         let opts = AgentRunOpts {
             kill_tree_on_exit: false,
+            cwd: None,
             timeout: Duration::from_millis(200),
             heartbeat_interval: Duration::from_millis(50),
             log_path: None,
@@ -2230,6 +2326,68 @@ mod tests {
         assert!(beats >= 1, "heartbeat should fire while the child runs");
     }
 
+    /// B4: the per-spawn `cwd` replaces the POSIX-only `cd "$DIR" || exit 1;`
+    /// prefix — the SAME command (no `cd`, no `$VAR`) runs under whichever
+    /// shell is resolved, in the directory it was handed.
+    #[test]
+    fn real_runner_starts_the_child_in_opts_cwd() {
+        let dir = std::env::temp_dir().join(format!("sirius-b4-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut opts = opts_for(10_000, None);
+        opts.cwd = Some(dir.clone());
+        let sh = resolve_shell();
+        let r = RealRunner::default(); // the runner's own cwd is NOT `dir`
+        let mut hb = || {};
+        let outcome = r
+            .run_agent(
+                &sh.program,
+                &[sh.flag.as_str(), "echo here> marker.txt"],
+                &opts,
+                &mut hb,
+            )
+            .unwrap();
+        assert!(outcome.success());
+        assert!(dir.join("marker.txt").is_file(), "ran outside opts.cwd");
+        // A directory that does not exist fails the SPAWN (never "runs
+        // elsewhere" the way a failed `cd` ignored would).
+        opts.cwd = Some(dir.join("missing"));
+        let err = r
+            .run_agent(
+                &sh.program,
+                &[sh.flag.as_str(), "echo here"],
+                &opts,
+                &mut hb,
+            )
+            .err();
+        assert!(err.is_some(), "a missing cwd must not spawn");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B4: a "did not run" error NAMES the shell and the directory — it used to
+    /// read as a bare "program not found".
+    #[test]
+    fn shell_run_error_names_the_shell_and_dir() {
+        let sh = ShellCmd::for_program("nonexistent-shell-xyz");
+        let e = std::io::Error::new(std::io::ErrorKind::NotFound, "program not found");
+        let msg = shell_run_error(&sh, "review.cmd", Some(Path::new("/w/review")), &e);
+        assert!(msg.contains("`nonexistent-shell-xyz`"), "{msg}");
+        assert!(msg.contains("review.cmd"), "{msg}");
+        assert!(msg.contains("/w/review"), "{msg}");
+        assert!(msg.contains(SHELL_OVERRIDE_ENV), "{msg}");
+        // And the real runner really does fail that way for a missing shell.
+        let r = RealRunner::default();
+        let mut hb = || {};
+        let err = r
+            .run_agent(
+                "nonexistent-shell-xyz",
+                &["-c", "true"],
+                &opts_for(2000, None),
+                &mut hb,
+            )
+            .expect_err("a missing shell must be a spawn error");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
     #[test]
     fn real_runner_captures_output_and_writes_log() {
         // SIRF-7: a fast command exits normally and both streams land in the
@@ -2241,6 +2399,7 @@ mod tests {
         let _ = std::fs::remove_file(&log);
         let opts = AgentRunOpts {
             kill_tree_on_exit: false,
+            cwd: None,
             timeout: Duration::from_secs(10),
             heartbeat_interval: Duration::from_secs(1),
             log_path: Some(log.clone()),
@@ -2277,6 +2436,7 @@ mod tests {
         let _ = std::fs::remove_file(&log);
         let opts = AgentRunOpts {
             kill_tree_on_exit: false,
+            cwd: None,
             timeout: Duration::from_secs(15),
             heartbeat_interval: Duration::from_secs(100),
             log_path: Some(log.clone()),
@@ -2312,6 +2472,7 @@ mod tests {
     fn opts_for(hard_ms: u64, log: Option<PathBuf>) -> AgentRunOpts {
         AgentRunOpts {
             kill_tree_on_exit: false,
+            cwd: None,
             timeout: Duration::from_millis(hard_ms),
             heartbeat_interval: Duration::from_millis(50),
             log_path: log,
@@ -2853,6 +3014,120 @@ mod tests {
         assert_eq!(
             find_program_from("claude", true, None, None, &only(&[])),
             None
+        );
+    }
+
+    /// B7: a bare name resolves against PATH, in PATH order, to an ABSOLUTE
+    /// path — so the spawn cannot fall back to `CreateProcess`'s
+    /// application-directory-first search (a stale `amt.exe` beside
+    /// `sirius.exe` outranking the `amt` the user's shell runs).
+    #[test]
+    fn resolve_program_is_path_first_and_absolute_on_windows() {
+        let path = r"C:\Users\u\.cargo\bin;C:\Users\u\.local\bin";
+        let new = r"C:\Users\u\.cargo\bin\amt.EXE";
+        let stale = r"C:\Users\u\.local\bin\amt.EXE";
+        let found = resolve_program_from("amt", true, Some(path), None, &only(&[stale, new]));
+        assert_eq!(found, Some(PathBuf::from(new)));
+        // PATH order is the only tie-break: flip it and the other one wins.
+        let flipped = r"C:\Users\u\.local\bin;C:\Users\u\.cargo\bin";
+        let found = resolve_program_from("amt", true, Some(flipped), None, &only(&[stale, new]));
+        assert_eq!(found, Some(PathBuf::from(stale)));
+    }
+
+    #[test]
+    fn resolve_program_skips_extensionless_shims_and_honours_pathext() {
+        let path = r"C:\bin";
+        // A shebang shim named `amt` cannot be CreateProcess'd: skip it.
+        assert_eq!(
+            resolve_program_from("amt", true, Some(path), None, &only(&[r"C:\bin\amt"])),
+            None
+        );
+        let both = [r"C:\bin\amt", r"C:\bin\amt.CMD"];
+        assert_eq!(
+            resolve_program_from("amt", true, Some(path), None, &only(&both)),
+            Some(PathBuf::from(r"C:\bin\amt.CMD"))
+        );
+        // A name that already carries its extension resolves as written.
+        assert_eq!(
+            resolve_program_from(
+                "git.exe",
+                true,
+                Some(path),
+                None,
+                &only(&[r"C:\bin\git.exe"])
+            ),
+            Some(PathBuf::from(r"C:\bin\git.exe"))
+        );
+    }
+
+    #[test]
+    fn resolve_program_leaves_paths_unfound_names_and_unix_alone() {
+        let path = r"C:\bin";
+        let fs = only(&[r"C:\bin\amt.exe"]);
+        // Paths are the caller's explicit choice.
+        assert_eq!(
+            resolve_program_from(r"C:\x\amt.exe", true, Some(path), None, &fs),
+            None
+        );
+        assert_eq!(
+            resolve_program_from("./amt", true, Some(path), None, &fs),
+            None
+        );
+        // Not on PATH: None, so the bare name is spawned and the OS error
+        // ("program not found") still names it.
+        assert_eq!(
+            resolve_program_from("nope", true, Some(path), None, &fs),
+            None
+        );
+        assert_eq!(resolve_program_from("amt", true, None, None, &fs), None);
+        // Unix: execvp already searches PATH only.
+        assert_eq!(
+            resolve_program_from("amt", false, Some("/bin"), None, &only(&["/bin/amt"])),
+            None
+        );
+    }
+
+    /// B7 end to end on Windows: with the application directory holding one
+    /// program and PATH holding another of the same name, the resolved spawn
+    /// runs the PATH one. (`whoami` and `hostname` print different things.)
+    #[cfg(windows)]
+    #[test]
+    fn command_runs_the_path_program_not_the_exe_dir_one() {
+        let sys32 = Path::new(&std::env::var_os("SystemRoot").unwrap()).join("System32");
+        let (whoami, hostname) = (sys32.join("whoami.exe"), sys32.join("hostname.exe"));
+        if !whoami.is_file() || !hostname.is_file() {
+            return;
+        }
+        let tag = format!("sirius-b7-peer-{}", std::process::id());
+        let exe_dir = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let path_dir = std::env::temp_dir().join(&tag);
+        std::fs::create_dir_all(&path_dir).unwrap();
+        let stale = exe_dir.join(format!("{tag}.exe"));
+        std::fs::copy(&hostname, &stale).unwrap();
+        std::fs::copy(&whoami, path_dir.join(format!("{tag}.exe"))).unwrap();
+        let resolved = resolve_program_from(
+            &tag,
+            true,
+            Some(&path_dir.to_string_lossy()),
+            None,
+            &|p: &Path| p.is_file(),
+        );
+        let result = resolved.as_ref().map(|abs| {
+            Command::new(abs)
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        });
+        let _ = std::fs::remove_file(&stale);
+        let _ = std::fs::remove_dir_all(&path_dir);
+        let out = result.expect("resolved").expect("spawned");
+        // whoami prints DOMAIN\user; hostname prints a bare host name.
+        assert!(
+            out.contains('\\'),
+            "ran the exe-dir copy, not PATH's: {out}"
         );
     }
 

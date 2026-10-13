@@ -6,6 +6,12 @@ allowed-tools: Bash("${CLAUDE_PLUGIN_ROOT}/scripts/install-sothis.sh":*), Bash(p
 
 # Install the Sothis suite
 
+> **Moved.** The Sothis suite now lives at github.com/Davidb3l/Sothis — install
+> with `sothis install` (or the `sothis@sothis` plugin). These Sirius-hosted
+> suite installers remain for compatibility and will be removed after two
+> Sothis releases. Prefer `sothis install` when the user has it; otherwise this
+> command still works as described below.
+
 Sirius is the foreman of the **Sothis** suite; full fleet control comes from the
 four CLIs, with PingMyBell (the desktop notch/voice app) as the optional fifth.
 Installing them has two halves — this command handles the CLIs, and the script
@@ -71,7 +77,8 @@ After it finishes (either path):
   ends by AUTO-INSTALLING any missing Claude Code plugin half via the
   non-interactive `claude plugin` CLI, then VERIFYING it (bundle marketplace +
   the sirius/hayvenhurst/catryna plugins, matched by `<name>@` prefix so a
-  plugin from its own standalone marketplace counts). If it still printed a
+  plugin from its own standalone marketplace counts; the bundle marketplace may
+  be the canonical `sothis` one or the legacy `sirius-forester` one). If it still printed a
   **`YOU ARE NOT DONE`** block, the auto-attempt failed (old/missing `claude`
   CLI): relay the block prominently — you may run its `claude plugin ...`
   commands yourself via Bash, or point desktop-app users at **+ → Plugins →
@@ -86,11 +93,13 @@ After it finishes (either path):
 - If it noted **pingmybell not installed**, mention it once as optional — the
   bell (voice callouts + notch board) is a desktop app built from source at
   https://github.com/Davidb3l/pingmybell; never attempt to install it yourself.
-- **On Windows, a `hayven: WARNING` is expected, not a failure.** Hayvenhurst
-  has no native Windows installer yet (its `install-hayven.sh` refuses Git Bash
-  / MSYS / Cygwin), so both one-shots warn, print the manual route (the
-  `windows-x64` release tarball + its `.sha256`), and carry on. Relay that
-  route; sirius works without hayven, with reduced function, until it's done.
+- **On Windows, a `hayven: WARNING` is a soft failure, not an abort.** Hayvenhurst
+  v0.0.8+ ships Windows installers (`install-hayven.sh` under Git Bash / MSYS /
+  Cygwin, and `install-hayven.ps1`), but if the delegated install still fails
+  (or an older pinned ref refused the shell) both one-shots warn, print the
+  manual route (the `windows-x64` release tarball + its `.sha256`), and carry
+  on. Relay that route; sirius works without hayven, with reduced function,
+  until it's done.
 - If the script **fetched and ran hayven's installer over HTTPS** (no local copy
   found), that's expected; but if a download, checksum, or **signature
   verification failed**, report the exact error and stop — never work around a

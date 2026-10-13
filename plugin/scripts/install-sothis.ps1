@@ -4,6 +4,11 @@
     install-sothis.sh.
 
 .DESCRIPTION
+    NOTE - the Sothis suite now lives at github.com/Davidb3l/Sothis: install
+    with `sothis install` (or the `sothis@sothis` plugin). This Sirius-hosted
+    installer remains for compatibility and will be removed after two Sothis
+    releases.
+
     Sothis is the local-first suite led by Sirius Forester: the foreman
     (`sirius`) claims work from an Ametrite board (`amt`), locks code through a
     Hayvenhurst code graph (`hayven`), pairs with Catryna Wikinelli (`catryna`)
@@ -22,10 +27,11 @@
       catryna  - bun-based MCP plugin    -> bun checked; the plugin comes from the
                                            marketplace bundle (auto-installed below)
 
-    On Windows the hayven step is best-effort: Hayvenhurst has no native
-    Windows installer yet (no install-hayven.ps1, and its install-hayven.sh
-    refuses Git Bash / MSYS / Cygwin), so a failure there prints a WARNING
-    with the manual route and the run carries on. Elsewhere it stays fatal.
+    On Windows the hayven step is best-effort: Hayvenhurst v0.0.8+ ships
+    install-hayven.ps1 and a Windows-capable install-hayven.sh (older pinned
+    refs refused Git Bash / MSYS / Cygwin), but a failure there still prints a
+    WARNING with the manual route and the run carries on. Elsewhere it stays
+    fatal.
 
     WHY a .ps1 next to the .sh: install-sothis.sh is POSIX sh and needs a POSIX
     shell. A stock Windows box - and a Claude Code agent running in a
@@ -138,7 +144,7 @@ if ([string]::IsNullOrEmpty($HayvenRepo)) { $HayvenRepo = 'Davidb3l/Hayvenhurst-
 # A TAG, not `main`: the fetched-over-HTTPS installer should be an immutable,
 # reviewed revision. Bump deliberately when hayven ships installer changes.
 $HayvenInstallerRef = $env:HAYVEN_INSTALLER_REF
-if ([string]::IsNullOrEmpty($HayvenInstallerRef)) { $HayvenInstallerRef = 'v0.0.6' }
+if ([string]::IsNullOrEmpty($HayvenInstallerRef)) { $HayvenInstallerRef = 'v0.0.8' }
 
 $AmetriteRepo = $env:AMETRITE_REPO
 if ([string]::IsNullOrEmpty($AmetriteRepo)) { $AmetriteRepo = 'Davidb3l/Ametrite' }
@@ -381,10 +387,28 @@ function Get-ToolWhere {
 # name; installed_plugins.json v2 keys plugins as "<name>@<marketplace>". The
 # same plugin can come from DIFFERENT marketplaces (hayvenhurst@hayvenhurst vs
 # hayvenhurst@sirius-forester), so match the "<name>@ prefix, never a full key.
-# Only the bundle marketplace is matched by its exact name.
+# Only the bundle marketplace is matched by its exact name - and EITHER the
+# canonical `sothis` marketplace (Davidb3l/Sothis) or the legacy
+# `sirius-forester` one (Davidb3l/Sirius-Forester) satisfies it, for the whole
+# two-release compatibility window.
+function Test-BundleMarketplace {
+    $km = Join-Path $ClaudePluginsDir 'known_marketplaces.json'
+    return ((Test-FileContains $km '"sothis"') -or (Test-FileContains $km '"sirius-forester"'))
+}
+
+# Catryna is a PLUGIN. It may come from the canonical Sothis marketplace
+# (catryna@sothis), the legacy Sirius-hosted bundle (catryna@sirius-forester) or
+# its standalone marketplace (catryna@catryna-wikinelli) - accept any.
+function Test-CatrynaPlugin {
+    $ip = Join-Path $ClaudePluginsDir 'installed_plugins.json'
+    return ((Test-FileContains $ip '"catryna@sothis"') -or
+            (Test-FileContains $ip '"catryna@sirius-forester"') -or
+            (Test-FileContains $ip '"catryna@catryna-wikinelli"'))
+}
+
 function Get-PluginHandoffMissing {
     $missing = @()
-    if (-not (Test-FileContains (Join-Path $ClaudePluginsDir 'known_marketplaces.json') '"sirius-forester"')) {
+    if (-not (Test-BundleMarketplace)) {
         $missing += 'bundle-marketplace'
     }
     foreach ($p in @('sirius', 'hayvenhurst', 'catryna')) {
@@ -457,6 +481,12 @@ function Invoke-PluginAutoInstall {
     Write-Log ''
     Write-Log 'install-sothis: finishing the plugin half via the claude CLI (non-interactive)'
 
+    # Which marketplace the plugin installs come from: the canonical `sothis`
+    # one (Davidb3l/Sothis) when it is already added, else the legacy
+    # Sirius-hosted one - the one that is published today (compatibility window).
+    $pm = 'sirius-forester'
+    if (Test-FileContains (Join-Path $ClaudePluginsDir 'known_marketplaces.json') '"sothis"') { $pm = 'sothis' }
+
     if ($missing -contains 'bundle-marketplace') {
         $r = Invoke-NativeCapture -FilePath 'claude' -ArgumentList @('plugin', 'marketplace', 'add', 'Davidb3l/Sirius-Forester') -NullStdin
         if ($r.ExitCode -eq 0) {
@@ -472,14 +502,14 @@ function Invoke-PluginAutoInstall {
     }
     foreach ($p in @('sirius', 'hayvenhurst', 'catryna')) {
         if (-not ($missing -contains ($p + '-plugin'))) { continue }
-        $r = Invoke-NativeCapture -FilePath 'claude' -ArgumentList @('plugin', 'install', ($p + '@sirius-forester')) -NullStdin
+        $r = Invoke-NativeCapture -FilePath 'claude' -ArgumentList @('plugin', 'install', ($p + '@' + $pm)) -NullStdin
         if ($r.ExitCode -eq 0) {
-            Write-Log ('  installed plugin: ' + $p + '@sirius-forester')
+            Write-Log ('  installed plugin: ' + $p + '@' + $pm)
         } else {
             Write-Log ('  ' + $p + ' plugin install failed - it said:')
             Write-Indented $r.Output
             if (Test-PluginOutputIsSshFailure $r.Output) {
-                Write-SshWorkaround ('claude plugin install ' + $p + '@sirius-forester')
+                Write-SshWorkaround ('claude plugin install ' + $p + '@' + $pm)
             } else {
                 Write-Log '  (routes to finish it by hand are in the block below)'
             }
@@ -500,7 +530,7 @@ function Write-PluginHandoffBlock {
         Write-Log ''
         Write-Log 'install-sothis: no Claude Code detected on this machine - skipping the'
         Write-Log '  plugin-half check. If you use Claude Code elsewhere, finish there with:'
-        Write-Log '  claude plugin marketplace add Davidb3l/Sirius-Forester'
+        Write-Log '  claude plugin marketplace add Davidb3l/Sothis'
         return
     }
     $missing = Get-PluginHandoffMissing
@@ -516,11 +546,14 @@ function Write-PluginHandoffBlock {
     Write-Log ''
     Write-Log '  Any ONE of these routes finishes it:'
     Write-Log ''
-    Write-Log '  a) From any shell (claude CLI v2.1.195+):'
-    if ($missing -contains 'bundle-marketplace') { Write-Log '       claude plugin marketplace add Davidb3l/Sirius-Forester' }
-    if ($missing -contains 'sirius-plugin')      { Write-Log '       claude plugin install sirius@sirius-forester' }
-    if ($missing -contains 'hayvenhurst-plugin') { Write-Log '       claude plugin install hayvenhurst@sirius-forester' }
-    if ($missing -contains 'catryna-plugin')     { Write-Log '       claude plugin install catryna@sirius-forester' }
+    Write-Log '  a) From any shell (claude CLI v2.1.195+) - the canonical Sothis marketplace:'
+    if ($missing -contains 'bundle-marketplace') { Write-Log '       claude plugin marketplace add Davidb3l/Sothis' }
+    if ($missing -contains 'sirius-plugin')      { Write-Log '       claude plugin install sirius@sothis' }
+    if ($missing -contains 'hayvenhurst-plugin') { Write-Log '       claude plugin install hayvenhurst@sothis' }
+    if ($missing -contains 'catryna-plugin')     { Write-Log '       claude plugin install catryna@sothis' }
+    Write-Log '     (The old Sirius-hosted marketplace - Davidb3l/Sirius-Forester, plugins'
+    Write-Log '      @sirius-forester - still works during the compatibility window and'
+    Write-Log '      satisfies this check too.)'
     if ($script:SshFailureSeen) {
         Write-Log ''
         Write-Log '     This machine hit the SSH-clone failure above, so set the HTTPS'
@@ -529,7 +562,7 @@ function Write-PluginHandoffBlock {
     }
     Write-Log ''
     Write-Log '  b) Claude DESKTOP APP (no terminal): click + next to the prompt box'
-    Write-Log '     -> Plugins -> Add plugin -> add the Davidb3l/Sirius-Forester'
+    Write-Log '     -> Plugins -> Add plugin -> add the Davidb3l/Sothis'
     Write-Log '     marketplace and install what''s listed above.'
     Write-Log ''
     Write-Log '  c) Terminal claude session: the interactive /plugin dialog.'
@@ -557,10 +590,16 @@ function Get-PingMyBellWhere {
 
 if ($Check) {
     Write-Log 'Sothis suite status:'
-    foreach ($t in @('sirius', 'hayven', 'amt', 'catryna')) {
+    foreach ($t in @('sirius', 'hayven', 'amt')) {
         Write-Log ('  ' + $t + ': ' + (Get-ToolWhere $t))
     }
-    # catryna is a plugin, not a PATH binary; report its runtime instead.
+    # catryna is a Claude Code PLUGIN, not a PATH binary - a PATH lookup always
+    # said "not installed" (SOT-26). Report the plugin, and its runtime (bun).
+    if (Test-CatrynaPlugin) {
+        Write-Log '  catryna (plugin): installed'
+    } else {
+        Write-Log '  catryna (plugin): not installed'
+    }
     $bun = Get-CommandPath 'bun'
     if ($null -ne $bun) {
         Write-Log ('  bun (catryna runtime): ' + $bun)
@@ -703,21 +742,22 @@ function Get-PosixShell {
     return $null
 }
 
-# On Windows a hayven failure is a WARNING, not an abort. Hayvenhurst ships no
-# native install-hayven.ps1 yet, and its install-hayven.sh refuses
-# MINGW/MSYS/CYGWIN ("unsupported OS"), so on this platform the delegated
-# install is expected to fail - and aborting would take amt / catryna /
-# sirius doctor / the plugin half down with it. Say what happened, how to get
-# hayven by hand, and carry on. Anywhere else (pwsh on macOS/Linux) a failure
-# is a real failure, so it stays fatal, exactly like install-sothis.sh.
+# On Windows a hayven failure is a WARNING, not an abort: aborting would take
+# amt / catryna / sirius doctor / the plugin half down with it. Say what
+# happened, how to get hayven by hand, and carry on. Anywhere else (pwsh on
+# macOS/Linux) a failure is a real failure, so it stays fatal, exactly like
+# install-sothis.sh. Hayvenhurst v0.0.8+ ships Windows installers
+# (install-hayven.ps1 and a Windows-capable install-hayven.sh); an OLDER pinned
+# ref (v0.0.6 and earlier) had no .ps1 and refused MINGW/MSYS/CYGWIN.
 function Stop-HayvenInstall {
     param([string]$Reason)
     if (-not $OnWindows) { Stop-WithError $Reason }
     Write-Log ''
     Write-Log ('hayven: WARNING: ' + $Reason)
     Write-Log '        Skipping hayven and carrying on with the rest of the suite.'
-    Write-Log '        Hayvenhurst has no native Windows installer yet (its install-hayven.sh'
-    Write-Log '        only covers macOS/Linux), so install hayven by hand: from'
+    Write-Log '        Hayvenhurst v0.0.8+ has Windows installers (install-hayven.ps1 /'
+    Write-Log '        install-hayven.sh) - if this ran an older HAYVEN_INSTALLER_REF it'
+    Write-Log '        may have refused this shell. Either way, install hayven by hand: from'
     Write-Log ('          https://github.com/' + $HayvenRepo + '/releases/latest')
     Write-Log '        take hayvenhurst-<version>-windows-x64.tar.gz, check it against the'
     Write-Log '        .sha256 published beside it, extract it (tar -xzf), and put hayven.exe'
@@ -756,9 +796,11 @@ function Invoke-HayvenInstaller {
     # and carry on so amt / catryna / the plugin half still get handled.
     #
     # No "install Git for Windows and re-run" advice here any more: Git Bash's
-    # bash IS what Get-PosixShell picks when present, but install-hayven.sh
-    # refuses MINGW/MSYS/CYGWIN anyway, so sending the user off to install Git
-    # would not get them hayven. Stop-HayvenInstall prints the route that does.
+    # bash IS what Get-PosixShell picks when present, but a v0.0.8+ ref ships
+    # install-hayven.ps1 (preferred above, no POSIX shell needed) and an OLDER
+    # install-hayven.sh refuses MINGW/MSYS/CYGWIN anyway, so sending the user
+    # off to install Git would not get them hayven. Stop-HayvenInstall prints
+    # the route that does.
     $shell = Get-PosixShell
     if ($null -eq $shell) {
         Stop-HayvenInstall ('found only the POSIX installer (install-hayven.sh) and no usable sh/bash
@@ -792,8 +834,8 @@ function Install-Hayven {
     }
 
     # No local copy. Fetch the installer from the pinned ref - preferring a
-    # native .ps1 if Hayvenhurst ships one (it does not yet; the 404 is
-    # expected), else its .sh.
+    # native .ps1 (Hayvenhurst ships one since v0.0.8; an older pinned
+    # ref 404s, which is fine), else its .sh.
     $base = 'https://raw.githubusercontent.com/' + $HayvenRepo + '/' + $HayvenInstallerRef + '/plugin/scripts/install-hayven.'
     $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ('hayven-install.' + [System.Guid]::NewGuid().ToString('N').Substring(0, 8))
     New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
@@ -851,12 +893,10 @@ function Test-Amt {
 
 # ---- catryna (a plugin; verify its bun runtime) -----------------------------
 function Test-Catryna {
-    # Catryna may be installed from the Sothis bundle (catryna@sirius-forester)
-    # or its standalone marketplace (catryna@catryna-wikinelli) - accept either.
-    $installedPlugins = Join-Path $ClaudePluginsDir 'installed_plugins.json'
-    $present = (Test-FileContains $installedPlugins '"catryna@sirius-forester"') -or `
-               (Test-FileContains $installedPlugins '"catryna@catryna-wikinelli"')
-    if ($present) {
+    # Catryna may come from the canonical Sothis marketplace (catryna@sothis), the
+    # legacy Sirius-hosted bundle (catryna@sirius-forester) or its standalone
+    # marketplace (catryna@catryna-wikinelli) - Test-CatrynaPlugin accepts any.
+    if (Test-CatrynaPlugin) {
         Write-Log 'catryna: plugin installed.'
     } else {
         Write-Log ''

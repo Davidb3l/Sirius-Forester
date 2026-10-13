@@ -375,6 +375,7 @@ pub fn lock_entities(
     hv: &Hayven,
     ledger: &Ledger,
     config: &Config,
+    worker: &str,
     issue: &str,
     title: &str,
     entities: &[String],
@@ -384,7 +385,7 @@ pub fn lock_entities(
     // Parallel to `acquired`: how each held claim was obtained (SIRF-9).
     let mut verdicts: Vec<&'static str> = Vec::new();
     for ent in entities {
-        match hv.claim(std::slice::from_ref(ent), &intent, false) {
+        match hv.claim(std::slice::from_ref(ent), &intent, false, worker) {
             ClaimVerdict::Registered { claim_id } => {
                 // SIRF-8: a Registered verdict with NO claim id means the daemon
                 // gave us nothing we can hand back to `hayven release`. Pushing
@@ -433,7 +434,7 @@ pub fn lock_entities(
                     Oracle202::ForceWithBudget => {
                         // Force the claim, spending budget (token accounting is
                         // the agent's; we just record the force).
-                        match hv.claim(std::slice::from_ref(ent), &intent, true) {
+                        match hv.claim(std::slice::from_ref(ent), &intent, true, worker) {
                             // SIRF-8: same missing-id guard as the clean path — a
                             // forced claim with no id is unmanageable, so unwind.
                             ClaimVerdict::Registered { claim_id: Some(id) } => {
@@ -472,6 +473,31 @@ pub fn lock_entities(
         claim_ids: acquired,
         verdicts,
     }
+}
+
+/// Re-assert every held entity claim (the heartbeat's Hayvenhurst half).
+/// One call PER ENTITY — exactly how `lock_entities` acquired them — because
+/// hayven derives the claim id from `(agent, scope)`: re-claiming the same
+/// single-entity scope as the same agent is an idempotent no-op (200), while a
+/// combined multi-entity scope is a NEW claim that overlaps our own and 409s.
+/// An EXPIRED claim of ours is transparently released and re-registered by
+/// `Hayven::claim`. Returns one message per entity that did not come back as
+/// ours (empty = every lease still held).
+pub(crate) fn renew_entity_claims(
+    hv: &Hayven,
+    worker: &str,
+    entities: &[String],
+    intent: &str,
+) -> Vec<String> {
+    entities
+        .iter()
+        .filter_map(
+            |ent| match hv.claim(std::slice::from_ref(ent), intent, false, worker) {
+                ClaimVerdict::Registered { .. } => None,
+                other => Some(format!("{ent}: {other:?}")),
+            },
+        )
+        .collect()
 }
 
 /// Bounded release-retry policy (SIRF-8), mirroring the SIRF-4 reverse-stamp
@@ -929,7 +955,7 @@ pub fn run_iteration(
     let mut claim_ids: Vec<String> = Vec::new();
     let mut oracle_verdicts: Vec<String> = Vec::new();
     if config.claim_order_enforced && decision == ClaimDecision::PreClaim && !entities.is_empty() {
-        match lock_entities(hv, ledger, config, &issue, &title, &entities) {
+        match lock_entities(hv, ledger, config, worker, &issue, &title, &entities) {
             LockResult::Locked {
                 claim_ids: ids,
                 verdicts,
@@ -1136,15 +1162,12 @@ pub fn run_iteration(
         if let Err(e) = amt.heartbeat(&issue, worker) {
             eprintln!("sirius: {e} for {issue} (agent still running)");
         }
-        // Renew each held Hayvenhurst entity claim (re-claim = refresh) — and
-        // say so when the renewal comes back as anything but ours.
-        if !held_entities.is_empty() {
-            match hv.claim(&held_entities, &lock_intent, false) {
-                crate::hayven::ClaimVerdict::Registered { .. } => {}
-                other => eprintln!(
-                    "sirius: entity lease renewal for {issue} returned {other:?} (agent still running)"
-                ),
-            }
+        // Re-assert each held Hayvenhurst entity claim (per entity, as the
+        // same agent) — and say so when one comes back as anything but ours.
+        for problem in renew_entity_claims(hv, worker, &held_entities, &lock_intent) {
+            eprintln!(
+                "sirius: entity lease renewal for {issue} returned {problem} (agent still running)"
+            );
         }
     };
     // A refused lease refresh mid-iteration: the issue may now belong to
@@ -1244,11 +1267,8 @@ pub fn run_iteration(
             Err(crate::amt::HeartbeatError::Refused(reason)) => return Err(reason),
             Err(e) => eprintln!("sirius: {e} for {issue} (continuing — may be transient)"),
         }
-        if !held_entities.is_empty() {
-            match hv.claim(&held_entities, &lock_intent, false) {
-                crate::hayven::ClaimVerdict::Registered { .. } => {}
-                other => eprintln!("sirius: entity lease renewal for {issue} returned {other:?}"),
-            }
+        for problem in renew_entity_claims(hv, worker, &held_entities, &lock_intent) {
+            eprintln!("sirius: entity lease renewal for {issue} returned {problem}");
         }
         Ok(())
     };
@@ -1400,6 +1420,7 @@ pub fn run_iteration(
             let limits = config.agent_timeouts(&labels);
             let opts = AgentRunOpts {
                 kill_tree_on_exit: false,
+                cwd: None,
                 timeout: Duration::from_secs(limits.hard_secs),
                 heartbeat_interval: Duration::from_secs(config.heartbeat_interval_secs()),
                 log_path: log_path.clone(),
@@ -3892,6 +3913,8 @@ fn review_once(
     let fp_before = tree_fingerprint(cx.runner);
     let opts = AgentRunOpts {
         kill_tree_on_exit: false,
+        // The reviewer starts IN its throwaway tree (was a POSIX `cd` prefix).
+        cwd: Some(review_dir.clone()),
         timeout: Duration::from_secs(rc.timeout_secs),
         heartbeat_interval: Duration::from_secs(cx.config.heartbeat_interval_secs()),
         // Absolute, under the fleet's .sirius/: the reviewer's final message
@@ -3901,13 +3924,16 @@ fn review_once(
     };
     // A FRESH process: the reviewer's only inputs are the issue spec (via
     // amt), the diff, and the repo — never the worker's session.
-    let cmd = format!(
-        "cd \"$SIRIUS_REVIEW_DIR\" || exit 1; {}",
-        template_cmd(review_cmd, cx.issue, cx.worker, review_model.as_deref())
-    );
+    let cmd = template_cmd(review_cmd, cx.issue, cx.worker, review_model.as_deref());
+    // The same explicitly resolved shell as the worker agent and the gate
+    // (B4): a literal `sh` died with "program not found" on a PATH without one,
+    // and the `cd "$DIR" || exit 1;` prefix only parsed under a POSIX shell.
+    let sh = crate::shell::resolve_shell();
     let ran = cx
         .runner
-        .run_agent("sh", &["-c", &cmd], &opts, &mut || (cx.renew)());
+        .run_agent(&sh.program, &[sh.flag.as_str(), &cmd], &opts, &mut || {
+            (cx.renew)()
+        });
 
     remove_review_tree(cx, &review_dir);
     // READ-ONLY enforcement: any change to the worker's tree is discarded.
@@ -3922,7 +3948,10 @@ fn review_once(
         Err(e) => {
             return ReviewOnce::Failed {
                 result: RoundResult::Error,
-                detail: format!("reviewer did not run: {e}"),
+                detail: format!(
+                    "reviewer did not run: {}",
+                    crate::shell::shell_run_error(&sh, "review.cmd", opts.cwd.as_deref(), e)
+                ),
             }
         }
         Ok(o) if o.timed_out() => {
@@ -4517,7 +4546,15 @@ mod tests {
         m.expect(&["hayven", "claim"], 0, r#"{"id":"c2"}"#);
         let hv = Hayven::new(&m);
         let led = Ledger::open_in_memory().unwrap();
-        let r = lock_entities(&hv, &led, &cfg(), "AMT-7", "t", &["e1".into(), "e2".into()]);
+        let r = lock_entities(
+            &hv,
+            &led,
+            &cfg(),
+            "w1",
+            "AMT-7",
+            "t",
+            &["e1".into(), "e2".into()],
+        );
         match r {
             LockResult::Locked {
                 claim_ids,
@@ -4546,6 +4583,74 @@ mod tests {
         assert!(rel[1].contains("release c1"));
     }
 
+    // B1: the real hayven 0.0.8 shapes through the lock path. The first claim is
+    // a fresh 201 (exit 0); the retry of the SAME claim by the SAME worker is an
+    // idempotent 200 that EXITS 1 — it must still lock, with the same id.
+    #[test]
+    fn lock_entities_uses_agent_json_and_accepts_the_008_idempotent_reclaim() {
+        let granted = r#"{"status":"active","id":"claim_aaa","agent":"w1","intent":"AMT-7: t","scope":["e1"],"fingerprint":"cli:unfingerprinted","created":1,"ttl":2}"#;
+        let m = MockRunner::new();
+        m.push(MockResponse::new(&["hayven", "claim"], 0, granted, ""));
+        m.push(MockResponse::new(&["hayven", "claim"], 1, granted, ""));
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        for _ in 0..2 {
+            match lock_entities(&hv, &led, &cfg(), "w1", "AMT-7", "t", &["e1".into()]) {
+                LockResult::Locked { claim_ids, .. } => assert_eq!(claim_ids, vec!["claim_aaa"]),
+                other => panic!("expected Locked, got {other:?}"),
+            }
+        }
+        for call in m.recorded() {
+            assert_eq!(call, "hayven claim e1 --intent AMT-7: t --agent w1 --json");
+        }
+        assert_eq!(led.count_policy_events("claim_anomaly", 100).unwrap(), 0);
+    }
+
+    // B1: a 409 body from 0.0.8 is a hard overlap that names the blocker and
+    // feeds the adaptive-mode `backoff_409` counter.
+    #[test]
+    fn lock_entities_maps_a_008_409_body_to_overlap() {
+        let body = r#"{"status":409,"error":"scope overlaps an active claim","conflictingClaimId":"claim_zzz","overlappingEntities":["e1"]}"#;
+        let m = MockRunner::new();
+        m.push(MockResponse::new(&["hayven", "claim"], 1, body, ""));
+        let hv = Hayven::new(&m);
+        let led = Ledger::open_in_memory().unwrap();
+        match lock_entities(&hv, &led, &cfg(), "w1", "AMT-7", "t", &["e1".into()]) {
+            LockResult::Overlap { blocker, .. } => assert!(blocker.contains("claim_zzz")),
+            other => panic!("expected Overlap, got {other:?}"),
+        }
+        assert_eq!(led.count_policy_events("backoff_409", 100).unwrap(), 1);
+    }
+
+    // B1: heartbeat renewal re-asserts each entity SEPARATELY as the worker
+    // (a combined multi-entity scope would be a new claim that 409s against our
+    // own per-entity claims), and the 200-exit-1 idempotent answer is "held".
+    #[test]
+    fn renew_entity_claims_is_per_entity_as_the_worker() {
+        let held = r#"{"status":"active","id":"claim_aaa","agent":"w1","intent":"i","scope":["e1"],"fingerprint":"f","created":1,"ttl":2}"#;
+        let m = MockRunner::new();
+        m.push(MockResponse::new(&["hayven", "claim"], 1, held, ""));
+        m.push(MockResponse::new(&["hayven", "claim"], 1, held, ""));
+        let hv = Hayven::new(&m);
+        let problems = renew_entity_claims(&hv, "w1", &["e1".into(), "e2".into()], "i");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(
+            m.recorded(),
+            vec![
+                "hayven claim e1 --intent i --agent w1 --json",
+                "hayven claim e2 --intent i --agent w1 --json"
+            ]
+        );
+        // A claim we lost to someone else is reported, naming the entity.
+        let lost = r#"{"status":409,"error":"scope overlaps an active claim","conflictingClaimId":"claim_other","overlappingEntities":["e1"]}"#;
+        let m = MockRunner::new();
+        m.push(MockResponse::new(&["hayven", "claim"], 1, lost, ""));
+        let hv = Hayven::new(&m);
+        let problems = renew_entity_claims(&hv, "w1", &["e1".into()], "i");
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].starts_with("e1:"), "{problems:?}");
+    }
+
     #[test]
     fn overlap_on_second_entity_unwinds_first() {
         let m = MockRunner::new();
@@ -4558,7 +4663,15 @@ mod tests {
         ));
         let hv = Hayven::new(&m);
         let led = Ledger::open_in_memory().unwrap();
-        let r = lock_entities(&hv, &led, &cfg(), "AMT-7", "t", &["e1".into(), "e2".into()]);
+        let r = lock_entities(
+            &hv,
+            &led,
+            &cfg(),
+            "w1",
+            "AMT-7",
+            "t",
+            &["e1".into(), "e2".into()],
+        );
         match r {
             LockResult::Overlap { blocker, acquired } => {
                 assert!(blocker.contains("e2"));
@@ -4581,7 +4694,7 @@ mod tests {
             oracle_202: Oracle202::BackOff,
             ..Config::default()
         };
-        let r = lock_entities(&hv, &led, &c, "AMT-7", "t", &["e1".into()]);
+        let r = lock_entities(&hv, &led, &c, "w1", "AMT-7", "t", &["e1".into()]);
         assert!(matches!(r, LockResult::OracleBackoff { .. }));
         assert_eq!(led.count_policy_events("oracle_202", 100).unwrap(), 1);
     }
@@ -4603,7 +4716,7 @@ mod tests {
             oracle_202: Oracle202::ForceWithBudget,
             ..Config::default()
         };
-        let r = lock_entities(&hv, &led, &c, "AMT-7", "t", &["e1".into()]);
+        let r = lock_entities(&hv, &led, &c, "w1", "AMT-7", "t", &["e1".into()]);
         match r {
             LockResult::Locked {
                 claim_ids,
@@ -5115,7 +5228,15 @@ mod tests {
         m.expect(&["hayven", "claim"], 0, "");
         let hv = Hayven::new(&m);
         let led = Ledger::open_in_memory().unwrap();
-        let r = lock_entities(&hv, &led, &cfg(), "AMT-7", "t", &["e1".into(), "e2".into()]);
+        let r = lock_entities(
+            &hv,
+            &led,
+            &cfg(),
+            "w1",
+            "AMT-7",
+            "t",
+            &["e1".into(), "e2".into()],
+        );
         match r {
             LockResult::Overlap { blocker, acquired } => {
                 assert!(blocker.contains("e2"), "blocker names the id-less entity");
@@ -5744,10 +5865,13 @@ mod tests {
         assert_eq!(env_of(env, "SIRIUS_ROUND").as_deref(), Some("1"));
         let prompt = std::fs::read_to_string(env_of(env, "SIRIUS_REVIEW_PROMPT").unwrap()).unwrap();
         assert!(prompt.contains("issue AMT-52") && !prompt.contains("$SIRIUS_ISSUE"));
+        assert!(m.recorded().iter().any(|c| c == &agent_call("reviewer")));
+        // B4: no POSIX `cd` prefix — the reviewer is SPAWNED in its tree.
+        let review_dir = env_of(env, "SIRIUS_REVIEW_DIR").unwrap();
         assert!(m
-            .recorded()
+            .agent_cwds()
             .iter()
-            .any(|c| c.contains("sh -c cd \"$SIRIUS_REVIEW_DIR\" || exit 1; reviewer")));
+            .any(|c| c.as_deref() == Some(std::path::Path::new(&review_dir))));
         let rounds = led.review_rounds_for_issue("AMT-52").unwrap();
         assert_eq!(rounds.len(), 1);
         assert_eq!(rounds[0].result, "clean");
@@ -6079,12 +6203,7 @@ mod tests {
         program_review_iteration(&m, "AMT-91");
         checkpoint_heads(&m, &["ck1", "ck1"]);
         // Fable reviewer exits 1 at its limit; the Opus retry reviews clean.
-        m.push(MockResponse::new(
-            &["sh", "-c", "cd \"$SIRIUS_REVIEW_DIR\" || exit 1; reviewer"],
-            1,
-            "",
-            "",
-        ));
+        m.push(MockResponse::new(&["sh", "-c", "reviewer"], 1, "", ""));
         m.on_phase_stdout(
             "review",
             "You've reached your Fable 5.1 limit. Run /usage-credits to continue.\n",
@@ -6302,12 +6421,7 @@ mod tests {
         checkpoint_heads(&m, &["ck1", "ck1"]);
         // The reviewer exits 1 (as `claude -p` does at a limit); its whole
         // command is ONE argv element.
-        m.push(MockResponse::new(
-            &["sh", "-c", "cd \"$SIRIUS_REVIEW_DIR\" || exit 1; reviewer"],
-            1,
-            "",
-            "",
-        ));
+        m.push(MockResponse::new(&["sh", "-c", "reviewer"], 1, "", ""));
         m.on_phase_stdout("review", LIMIT);
         let amt = Amt::new(&m);
         let hv = Hayven::new(&m);
@@ -6933,6 +7047,81 @@ mod tests {
             "{decide}"
         );
         assert!(!decide.contains("0 bugs fixed"), "{decide}");
+    }
+
+    /// A runner whose REVIEW spawn fails like a PATH without the shell
+    /// ("program not found"); everything else behaves like the mock.
+    struct ReviewerShellMissing<'a>(&'a MockRunner);
+
+    impl Runner for ReviewerShellMissing<'_> {
+        fn run(&self, program: &str, args: &[&str]) -> std::io::Result<crate::shell::CmdOutput> {
+            self.0.run(program, args)
+        }
+        fn run_agent(
+            &self,
+            program: &str,
+            args: &[&str],
+            opts: &AgentRunOpts,
+            hb: &mut dyn FnMut(),
+        ) -> std::io::Result<crate::shell::AgentOutcome> {
+            if opts
+                .env
+                .iter()
+                .any(|(k, v)| k == "SIRIUS_PHASE" && v == "review")
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "program not found",
+                ));
+            }
+            self.0.run_agent(program, args, opts, hb)
+        }
+    }
+
+    // B4: a reviewer that cannot even START (no shell on PATH) is a review
+    // ERROR, never a pass: the error names the SHELL, the issue is flagged
+    // (`review:open` + a comment saying the review did not complete) and the
+    // receipt says "flagged" — it does not advance looking reviewed.
+    #[test]
+    fn a_reviewer_that_cannot_start_is_flagged_and_names_the_shell() {
+        let m = MockRunner::new();
+        program_review_iteration(&m, "AMT-61");
+        checkpoint_heads(&m, &["ck1", "ck1"]);
+        let fleet = test_fleet("base999");
+        let led = Ledger::open_in_memory().unwrap();
+        let r = ReviewerShellMissing(&m);
+        let (amt, hv) = (Amt::new(&m), Hayven::new(&m));
+        let mut out = Vec::new();
+        let o = run_iteration(
+            &amt,
+            &hv,
+            &led,
+            &review_cfg(3),
+            &r,
+            "sirius/oak",
+            Some("todo"),
+            "true",
+            &mut out,
+            None,
+            Some(&fleet),
+        );
+        assert_eq!(o, IterationOutcome::Completed);
+        let rounds = led.review_rounds_for_issue("AMT-61").unwrap();
+        assert!(!rounds.is_empty());
+        assert!(rounds.iter().all(|r| r.result == "error"), "{rounds:?}");
+        let rec = m.recorded();
+        assert!(rec.iter().any(|c| c.contains("--add-label review:open")));
+        let sh = crate::shell::resolve_shell();
+        assert!(
+            rec.iter().any(|c| c.contains("reviewer did not run")
+                && c.contains(&format!("cannot start the shell `{}`", sh.program))),
+            "the failure must name the shell: {rec:?}"
+        );
+        let decide = rec
+            .iter()
+            .find(|c| c.starts_with("amt --json decide"))
+            .unwrap();
+        assert!(decide.contains("(flagged)"), "{decide}");
     }
 
     #[test]

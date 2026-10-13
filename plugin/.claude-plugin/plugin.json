@@ -1,7 +1,7 @@
 {
   "name": "sirius",
   "version": "0.2.6",
-  "description": "The fleet foreman for AI coding agents. Ships the Sirius worker Skill so Claude Code runs the claim → map → lock → brief → work → gate → receipt → release loop against your local Ametrite board and Hayvenhurst code graph, plus installers for the `sirius` CLI binary and the whole Sothis suite (/sirius:install-suite, \"let's Sothis this up\").",
+  "description": "The fleet foreman for AI coding agents. Ships the Sirius worker Skill so Claude Code runs the claim → map → lock → brief → work → gate → receipt → release loop against your local Ametrite board and Hayvenhurst code graph, plus installers for the `sirius` CLI binary and the whole Sothis suite (/sirius:install-suite, \"let's Sothis this up\"). The Sothis suite now lives at github.com/Davidb3l/Sothis — install with `sothis install` (or the `sothis@sothis` plugin). These Sirius-hosted suite installers remain for compatibility and will be removed after two Sothis releases.",
   "author": {
     "name": "Sirius Forester",
     "email": "info@anchorsanvils.com",

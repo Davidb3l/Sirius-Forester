@@ -81,7 +81,7 @@ To keep that state rare, `sirius init` writes a starter config with `gate.test_c
 
 Subset ids are quoted for the resolved shell (`shell_quote`): ids made only of `[A-Za-z0-9_\-./:=]` pass bare; otherwise POSIX single quotes, or for `cmd.exe` MSVC-quoting with every cmd metacharacter (quotes and `%` included) caret-escaped (`cmd_quote`). `execute_plan` takes the shell as a parameter, so gate tests pin `ShellCmd::posix_sh()` instead of depending on the developer's box. A shell that cannot be spawned yields `reason_code: shell_spawn_failed` with `ran_tests: false` and a detail that names the shell and says it is not the test binary.
 
-Only `gate.test_cmd`, `--agent-cmd` (see [subsystems/loop](./loop)), and `worktree.setup_cmd` ([below](#environment-faults-and-worktree-setup)) go through this resolution; the review, integration, and review-canary spawns still run literal `sh -c`, since each wraps its command in a Sirius-built POSIX `cd "$…" || exit 1; …` script.
+Only `gate.test_cmd`, `--agent-cmd` (see [subsystems/loop](./loop)), and `worktree.setup_cmd` ([below](#environment-faults-and-worktree-setup)) go through this resolution; the review, integration, and review-canary spawns use the same resolved shell too, started IN their tree (`AgentRunOpts::cwd`) with no POSIX `cd` prefix; if the shell cannot start, the error names it.
 
 ## Outcome
 

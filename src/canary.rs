@@ -389,24 +389,29 @@ fn replay(cx: &Ctx, src: &Source, i: usize) -> Result<(Vec<Finding>, Vec<String>
         }
         let opts = AgentRunOpts {
             kill_tree_on_exit: false,
+            cwd: Some(t_path.clone()),
             timeout: Duration::from_secs(cx.cfg.review.timeout_secs.max(1)),
             heartbeat_interval: Duration::from_secs(60),
             log_path: Some(log.clone()),
             env: vars,
         };
-        let cmd = format!(
-            "cd \"$SIRIUS_REVIEW_DIR\" || exit 1; {}",
-            crate::run::template_cmd(
-                cx.review_cmd,
-                &issue,
-                "sirius/reviewer",
-                cx.model.as_deref()
-            )
+        let cmd = crate::run::template_cmd(
+            cx.review_cmd,
+            &issue,
+            "sirius/reviewer",
+            cx.model.as_deref(),
         );
+        // Same explicitly resolved shell as a real review round (B4).
+        let sh = crate::shell::resolve_shell();
         let ran = cx
             .runner
-            .run_agent("sh", &["-c", &cmd], &opts, &mut || {})
-            .map_err(|e| Skip::Error(format!("reviewer did not run: {e}")))?;
+            .run_agent(&sh.program, &[sh.flag.as_str(), &cmd], &opts, &mut || {})
+            .map_err(|e| {
+                Skip::Error(format!(
+                    "reviewer did not run: {}",
+                    crate::shell::shell_run_error(&sh, "review.cmd", opts.cwd.as_deref(), &e)
+                ))
+            })?;
         if ran.timed_out() {
             return Err(Skip::Error("reviewer timed out".into()));
         }
