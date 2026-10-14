@@ -592,12 +592,12 @@ amt release AMT-7 --json
 
 hayven query "<terms>" --json
 hayven impact <symbol> --json
-hayven claim <symbol> --intent "AMT-7: ..." --agent sirius/oak   # exit 0 ok, 1 overlap, 3 oracle
+hayven claim <symbol> --intent "AMT-7: ..." --agent sirius/oak --json   # decide from the JSON body (§6); exit 0 = 201, 3 = oracle, 1 = overlap OR re-claim OR error
 hayven context <symbol> --json
 hayven recall --node <id> --json
 hayven remember --kind decision --node <id> --scope <ids> "<text>"
 hayven affected-tests --changed <files> --json  # SELECTS tests (exit 0 = selected, NOT passed); sirius runs them
-hayven release <claimId>
+hayven release <claimId> --json            # 404 (already gone) counts as released
 ```
 
 Verify exact flag names against the installed CLIs (`amt --help`, `hayven --help`,
@@ -652,13 +652,42 @@ ever shells the parents directly (it should only shell `sirius --json`).
   reads this read-only and checks `>= 3` pragmatically — a hardcoded `== 3` compare would
   already be wrong.
 
-### Hayvenhurst (`hayven 0.0.5`)
+### Hayvenhurst (`hayven 0.0.5`; `claim` / `release` re-verified on `0.0.8`)
 
 - **No per-subcommand `--help`:** every `hayven <sub> --help` prints the same global help.
-- **`hayven claim <ids...> --intent "..." [--force]`** — ids are **positional** (multiple
-  allowed), there is **NO `--agent` flag** (agent is derived by the daemon) and **NO
-  `--node`/`--scope`** on claim. Exit codes as in §4: **0 registered, 1 hard overlap
-  (409), 3 oracle adjacency (202)**.
+- **`hayven claim <ids...> --intent "..." [--agent X] [--ttl S] [--force] [--json]`**
+  (`hayven 0.0.8`, re-verified against its source and live) — ids are **positional**
+  (multiple allowed); there is no `--node`/`--scope`. **`--agent` exists** (default
+  `cli`!) and Sirius passes the worker id (`sirius/oak`), because the daemon derives
+  the claim id from `sha256(agent, sorted scope)`: a retry of the same claim by the
+  same agent reuses the SAME id (an idempotent re-claim), and different agents on an
+  overlapping scope serialize. **`--json` is required** — without it hayven prints
+  markdown (`# Claim registered` / ``- id:    `claim_...` ``) and Sirius has no id to
+  release. The JSON is `{status, ...payload}`, but the payload's own `status`
+  overwrites the HTTP code on success, so read it by shape, not by exit code:
+
+  | Daemon HTTP | exit | `--json` body (0.0.8) | Sirius verdict |
+  |---|---|---|---|
+  | 201 registered | 0 | `{"status":"active","id":"claim_…","agent":"…","scope":[…],"ttl":<epoch ms>,…}` | `Registered{claim_id}` |
+  | 200 idempotent re-claim, same agent | **1** | same shape, `status:"active"` (no `suggestedScope`) | `Registered{claim_id}` (not an error) |
+  | 200 re-claim of our claim past its TTL | **1** | same shape, `status:"expired"` | release it, register again once |
+  | 409 overlap | 1 | `{"status":409,"error":"scope overlaps an active claim","conflictingClaimId":"…","overlappingEntities":[…]}` | `Overlap` (names the blocker) |
+  | 409 id held by another agent | 1 | `{"status":409,"error":"claim id already exists (held by a different agent)","existing":{…}}` | `Overlap` |
+  | 202 oracle adjacency | 3 | `{"status":"potential-conflict","verdicts":[{reason,confidence,oracle}…]}` | `OracleConflict` (`--force` to override) |
+  | 5xx / daemon unreachable / wrong project | 1 | no body, or `{"status":5xx,…}`; text on stderr | `Error` |
+
+  A forward-compatible hayven adds `httpStatus` (number) and `outcome`
+  (`granted` 201 | `held` 200 | `potential-conflict` 202, claim NOT registered |
+  `conflict` 409 | `error`) to the same body, without removing
+  keys, and exits 0 for `held`; Sirius prefers them when present (`classify_claim`).
+  Exit 1 alone is **never** an overlap. Re-claiming does **not** extend the TTL
+  (default 3600 s) — a 200 returns the stored row — so the heartbeat renewal only
+  confirms the claim is still ours (one call per entity, as it was claimed; a
+  combined multi-entity scope is a NEW claim that 409s against our own); an
+  expired claim of ours is released and registered afresh.
+- **`hayven release <claim_id> [--json]`** — 200 `{"status":200,"ok":true,"id":…}`
+  exit 0; 404 `{"status":404,"error":"claim not found"}` exit 1 (Sirius treats an
+  already-gone claim as released).
 - **`hayven remember "<note>" [--node <id>] [--kind K] [--scope a,b] [--ttl S]`** — the
   note is the **first positional arg**; `--scope` is a comma list. Returns
   `{"id":"mem_...","nodeId":...,"kind":...,"scope":[...]}`. There is no `--agent` (agent

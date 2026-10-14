@@ -20,17 +20,23 @@ pub struct Workspace {
 impl Workspace {
     /// Discover from a starting directory (usually the cwd).
     pub fn discover(start: &Path) -> Workspace {
-        // Canonicalize BOTH sides of the $HOME bound, best-effort: `start`
-        // comes from getcwd (symlink-resolved) while $HOME is a raw env
+        // Canonicalize BOTH sides of the home bound, best-effort: `start`
+        // comes from getcwd (symlink-resolved) while the home dir is a raw env
         // string — on a symlinked home (Fedora Silverblue's /home →
         // /var/home, or a user-set HOME) the two spell the same directory
         // differently and a lexical compare would never match, silently
         // unbounding the walk. Canonicalization failure falls back to the
         // raw paths (an unreadable home is not worth failing discovery over).
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|h| h.canonicalize().unwrap_or(h));
-        let start_canon = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
+        //
+        // `strip_verbatim` after canonicalizing: on Windows `canonicalize`
+        // returns `\?\C:\...`, which would otherwise flow into every child
+        // env (`SIRIUS_WORKTREE`, ...) and into user-facing output, and which
+        // `git -C` rejects. Stripped ONCE here, at the source of `Workspace::root`.
+        let home = home_dir()
+            .map(|h| h.canonicalize().unwrap_or(h))
+            .map(|h| strip_verbatim(&h));
+        let start_canon =
+            strip_verbatim(&start.canonicalize().unwrap_or_else(|_| start.to_path_buf()));
         Self::discover_bounded(&start_canon, home.as_deref())
     }
 
@@ -72,6 +78,63 @@ impl Workspace {
 
     pub fn config_path(&self) -> PathBuf {
         self.sirius_dir().join("config.json")
+    }
+}
+
+/// The current user's home directory: `$HOME`, else `%USERPROFILE%`, else the
+/// platform lookup. Windows shells other than Git Bash (PowerShell, cmd,
+/// services) set only `USERPROFILE`; reading `HOME` alone left the discovery
+/// fence unset there, so the walk climbed into `C:\Users\<u>\.hayven` (the
+/// GLOBAL state dir) and adopted it as the workspace. Empty values count as unset.
+pub fn home_dir() -> Option<PathBuf> {
+    home_dir_from(
+        std::env::var_os("HOME"),
+        std::env::var_os("USERPROFILE"),
+        platform_home_dir,
+    )
+}
+
+/// Pure core of [`home_dir`] (the env values and the platform fallback are
+/// injected so every branch is testable without touching the process env).
+pub fn home_dir_from(
+    home: Option<std::ffi::OsString>,
+    userprofile: Option<std::ffi::OsString>,
+    platform: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    [home, userprofile]
+        .into_iter()
+        .flatten()
+        .find(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(platform)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
+#[allow(deprecated)] // un-deprecated (and fixed on Windows) in Rust 1.87; our MSRV is older
+fn platform_home_dir() -> Option<PathBuf> {
+    std::env::home_dir()
+}
+
+/// Drop the Windows extended-length ("verbatim") prefix that
+/// `std::fs::canonicalize` adds: `\\?\C:\x` → `C:\x`, `\\?\UNC\srv\share` →
+/// `\\srv\share`. Anything else — unix paths, `\\?\Volume{..}\`, device
+/// paths, and paths past `MAX_PATH` (where the verbatim form is what makes
+/// them usable at all) — is returned untouched.
+pub fn strip_verbatim(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    let stripped = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        Some(format!(r"\\{rest}"))
+    } else {
+        s.strip_prefix(r"\\?\")
+            .filter(|rest| {
+                let b = rest.as_bytes();
+                b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\'
+            })
+            .map(str::to_string)
+    };
+    match stripped {
+        Some(t) if t.len() < 260 => PathBuf::from(t),
+        _ => p.to_path_buf(),
     }
 }
 
@@ -175,6 +238,95 @@ mod tests {
         let ws = Workspace::discover_bounded(&nested, Some(&home));
         assert_eq!(ws.hayven_dir, Some(repo.join(".hayven")));
         assert_eq!(ws.root, repo);
+    }
+
+    // B2: PowerShell / cmd / services set only USERPROFILE. With HOME unset the
+    // fence vanished and the walk adopted `C:\Users\<u>\.hayven`.
+    #[test]
+    fn home_dir_falls_back_to_userprofile_then_platform() {
+        use std::ffi::OsString;
+        let os = |s: &str| Some(OsString::from(s));
+        let never = || -> Option<PathBuf> { panic!("platform lookup must not run") };
+        // HOME wins when set.
+        assert_eq!(
+            home_dir_from(os("/h"), os(r"C:\Users\u"), never),
+            Some(PathBuf::from("/h"))
+        );
+        // HOME unset or empty -> USERPROFILE.
+        assert_eq!(
+            home_dir_from(None, os(r"C:\Users\u"), never),
+            Some(PathBuf::from(r"C:\Users\u"))
+        );
+        assert_eq!(
+            home_dir_from(os(""), os(r"C:\Users\u"), never),
+            Some(PathBuf::from(r"C:\Users\u"))
+        );
+        // Neither -> the platform lookup; nothing at all -> None.
+        assert_eq!(
+            home_dir_from(None, os(""), || Some(PathBuf::from("/plat"))),
+            Some(PathBuf::from("/plat"))
+        );
+        assert_eq!(home_dir_from(None, None, || None), None);
+    }
+
+    // B2 end to end: a home derived from USERPROFILE alone fences the walk, so
+    // the global `.hayven` there is never adopted as the workspace.
+    #[test]
+    fn userprofile_only_home_still_fences_the_walk() {
+        let home = tempdir();
+        fs::create_dir_all(home.join(".hayven")).unwrap();
+        let repo = home.join("Documents/repo");
+        fs::create_dir_all(&repo).unwrap();
+        let fence = home_dir_from(None, Some(home.clone().into_os_string()), || None);
+        let ws = Workspace::discover_bounded(&repo, fence.as_deref());
+        assert!(ws.hayven_dir.is_none(), "adopted the global ~/.hayven");
+        assert_eq!(ws.root, repo);
+    }
+
+    // B3: `\\?\` must not leak out of discovery.
+    #[test]
+    fn strip_verbatim_unwraps_drive_and_unc_paths_only() {
+        let s = |p: &str| strip_verbatim(Path::new(p));
+        assert_eq!(s(r"\\?\C:\Users\u\repo"), PathBuf::from(r"C:\Users\u\repo"));
+        assert_eq!(
+            s(r"\\?\UNC\srv\share\repo"),
+            PathBuf::from(r"\\srv\share\repo")
+        );
+        // Untouched: ordinary, unix, volume-GUID and device paths.
+        assert_eq!(s(r"C:\Users\u"), PathBuf::from(r"C:\Users\u"));
+        assert_eq!(s("/home/u/repo"), PathBuf::from("/home/u/repo"));
+        assert_eq!(
+            s(r"\\?\Volume{1234}\x"),
+            PathBuf::from(r"\\?\Volume{1234}\x")
+        );
+        assert_eq!(s(r"\\.\COM1"), PathBuf::from(r"\\.\COM1"));
+        // Past MAX_PATH the verbatim form is what makes the path usable.
+        let long = format!(r"\\?\C:\{}", "a".repeat(300));
+        assert_eq!(s(&long), PathBuf::from(&long));
+        // Idempotent.
+        assert_eq!(strip_verbatim(&s(r"\\?\C:\x")), PathBuf::from(r"C:\x"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn discover_returns_no_verbatim_root_on_windows() {
+        let tmp = tempdir();
+        let repo = tmp.join("repo");
+        fs::create_dir_all(repo.join(".ametrite")).unwrap();
+        fs::write(repo.join(".ametrite/ametrite.db"), b"x").unwrap();
+        let nested = repo.join("src");
+        fs::create_dir_all(&nested).unwrap();
+        let ws = Workspace::discover(&nested);
+        let shown = ws.root.display().to_string();
+        assert!(!shown.starts_with(r"\\?\"), "verbatim root leaked: {shown}");
+        assert!(!ws.sirius_dir().display().to_string().starts_with(r"\\?\"));
+        // git must accept the path exactly as sirius hands it over.
+        assert_eq!(
+            crate::gitrange::git_path(&ws.root),
+            shown,
+            "git_path is a no-op on an already-plain root"
+        );
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]

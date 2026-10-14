@@ -1122,22 +1122,19 @@ fn cmd_run(
         }
     }
     let lock_path = ws.sirius_dir().join("run.pid");
-    if let Ok(prev) = std::fs::read_to_string(&lock_path) {
-        let prev = prev.trim();
-        if let Ok(pid) = prev.parse::<i32>() {
-            let alive = libc_kill_probe(pid);
-            if alive {
-                eprint_err(&format!(
-                    "another `sirius run` appears active in this repo (pid {pid}, {}) — one fleet per repo; stop it first or remove the file if it is stale",
-                    lock_path.display()
-                ));
-                return 1;
-            }
+    match acquire_pid_lock(&lock_path, std::process::id(), &libc_kill_probe) {
+        Ok(()) => {}
+        Err(PidLockError::Held(pid)) => {
+            eprint_err(&format!(
+                "another `sirius run` appears active in this repo (pid {pid}, {}) — one fleet per repo; stop it first or remove the file if it is stale",
+                lock_path.display()
+            ));
+            return 1;
         }
-    }
-    if let Err(e) = std::fs::write(&lock_path, std::process::id().to_string()) {
-        eprint_err(&format!("cannot write {}: {e}", lock_path.display()));
-        return 1;
+        Err(PidLockError::Io(e)) => {
+            eprint_err(&e);
+            return 1;
+        }
     }
 
     // Resolve the fleet base ONCE and build every worktree serially, before
@@ -1487,7 +1484,7 @@ fn check_models(ws: &Workspace, cfg: &Config, agent_cmd: &str) -> Result<(), Str
         eprint_err("warning: no worker model set (--allow-default-model) — agents use their CLI's own default");
         return Ok(());
     }
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let home = workspace::home_dir();
     let would = match models::claude_default_model(&ws.root, home.as_deref()) {
         Some((m, from)) => format!("`{m}` (from {from})"),
         None => "the CLI's built-in default".into(),
@@ -1523,6 +1520,123 @@ fn load_review_prompt(ws: &Workspace, cfg: &Config) -> Result<String, String> {
         }
         Err(e) => Err(format!("cannot read review prompt {}: {e}", path.display())),
     }
+}
+
+/// Why [`acquire_pid_lock`] did not take the lock.
+#[derive(Debug, PartialEq, Eq)]
+enum PidLockError {
+    /// A live process (this pid) holds it.
+    Held(i32),
+    /// The filesystem refused (message).
+    Io(String),
+}
+
+/// Take the fleet pidfile `path` for `pid`, exclusively (B6).
+///
+/// The old read-pid / probe / `fs::write` sequence raced: two `sirius run`
+/// launched together both read "no file", both wrote, and both ran a fleet
+/// over the same worktrees. Acquisition is now `create_new` (`O_EXCL` /
+/// `CREATE_NEW`): exactly one creator wins, atomically.
+///
+/// A STALE lock (dead or unparseable pid) is replaced under a short-lived
+/// takeover guard (`<path>.takeover`, itself `create_new`): the guard holder
+/// re-reads the pid INSIDE the guard, and only then removes the stale file and
+/// competes in `create_new` like everyone else. Nothing but the guard holder
+/// ever removes an existing lock, so a live holder's file cannot be deleted by
+/// a taker that read an older, dead pid. `alive` is the liveness probe
+/// (injected for tests).
+fn acquire_pid_lock(
+    path: &std::path::Path,
+    pid: u32,
+    alive: &dyn Fn(i32) -> bool,
+) -> Result<(), PidLockError> {
+    use std::io::ErrorKind;
+    use std::time::Duration;
+    let guard = path.with_extension("takeover");
+    let create = |p: &std::path::Path| -> std::io::Result<bool> {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(p)
+        {
+            Ok(mut f) => {
+                f.write_all(pid.to_string().as_bytes())?;
+                Ok(true)
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(e),
+        }
+    };
+    let io = |what: &str, e: std::io::Error| {
+        PidLockError::Io(format!("cannot {what} {}: {e}", path.display()))
+    };
+    // The pid recorded in the lock; an EMPTY file is a creator between
+    // `create_new` and its write, so give it a moment before judging it.
+    let holder = || -> Option<i32> {
+        for _ in 0..10 {
+            let s = std::fs::read_to_string(path).unwrap_or_default();
+            if !s.trim().is_empty() {
+                return s.trim().parse().ok();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        None
+    };
+    for _ in 0..100 {
+        if create(path).map_err(|e| io("create", e))? {
+            return Ok(());
+        }
+        if let Some(p) = holder() {
+            if alive(p) {
+                return Err(PidLockError::Held(p));
+            }
+        }
+        // Stale: replace it, serialized through the takeover guard.
+        match create(&guard) {
+            Ok(true) => {
+                let outcome = (|| {
+                    // Re-check inside the guard: the file may have been
+                    // replaced by a live fleet since we read it.
+                    if let Some(p) = holder() {
+                        if alive(p) {
+                            return Err(PidLockError::Held(p));
+                        }
+                    }
+                    match std::fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == ErrorKind::NotFound => {}
+                        Err(e) => return Err(io("remove the stale", e)),
+                    }
+                    // Lost to a fresh creator (`Ok(false)`): loop and judge them.
+                    create(path).map_err(|e| io("create", e))
+                })();
+                let _ = std::fs::remove_file(&guard);
+                match outcome {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(false) => {
+                // Someone else is taking over. A guard older than 10s is a
+                // crashed taker's leftover — clear it; otherwise just wait.
+                let old = std::fs::metadata(&guard)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age > Duration::from_secs(10));
+                if old {
+                    let _ = std::fs::remove_file(&guard);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(io("create the takeover guard for", e)),
+        }
+    }
+    Err(PidLockError::Io(format!(
+        "cannot take {} (lost the race repeatedly)",
+        path.display()
+    )))
 }
 
 /// Best-effort "is this pid alive" via `kill -0` semantics, without a libc
@@ -1774,6 +1888,80 @@ fn tree_names(n: u32) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lock_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("sirius-pidlock-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    // B6: a second acquisition while the first holder is alive is refused —
+    // the read-then-write sequence let both through.
+    #[test]
+    fn a_second_fleet_cannot_take_a_live_lock() {
+        let d = lock_dir("live");
+        let p = d.join("run.pid");
+        assert_eq!(acquire_pid_lock(&p, 1001, &|_| true), Ok(()));
+        assert_eq!(
+            acquire_pid_lock(&p, 1002, &|_| true),
+            Err(PidLockError::Held(1001))
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "1001");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_dead_or_garbage_holder_is_taken_over() {
+        let d = lock_dir("stale");
+        let p = d.join("run.pid");
+        std::fs::write(&p, "999999").unwrap();
+        assert_eq!(acquire_pid_lock(&p, 1001, &|_| false), Ok(()));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "1001");
+        std::fs::write(&p, "not a pid").unwrap();
+        assert_eq!(acquire_pid_lock(&p, 1002, &|_| true), Ok(()));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "1002");
+        // No grave left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(leftovers, vec!["run.pid"], "{leftovers:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // B6: N launches racing — over a missing lock AND over a stale one —
+    // yield exactly ONE winner.
+    #[test]
+    fn racing_acquisitions_have_exactly_one_winner() {
+        for stale in [false, true] {
+            let d = lock_dir(if stale { "race-stale" } else { "race-fresh" });
+            let p = d.join("run.pid");
+            if stale {
+                std::fs::write(&p, "999999").unwrap();
+            }
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let handles: Vec<_> = (0..8u32)
+                .map(|i| {
+                    let (p, barrier) = (p.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        // 999999 is the only dead pid; every contender's own
+                        // pid reads as alive once written.
+                        acquire_pid_lock(&p, 2000 + i, &|pid| pid != 999999)
+                    })
+                })
+                .collect();
+            let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let winners = results.iter().filter(|r| r.is_ok()).count();
+            assert_eq!(winners, 1, "stale={stale}: {results:?}");
+            assert!(results
+                .iter()
+                .all(|r| r.is_ok() || matches!(r, Err(PidLockError::Held(_)))));
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
 
     #[test]
     fn a_red_integration_blocks_only_when_configured_to() {

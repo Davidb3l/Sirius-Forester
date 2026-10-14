@@ -411,7 +411,9 @@ function Write-SuiteHint {
     if ($missing.Count -eq 0) { return }
 
     Write-Log ''
-    Write-Log ('fleet suite: missing: ' + ($missing -join ' ') + '. Sirius is the foreman; for full fleet control install the whole suite (one-shot: /sirius:install-suite):')
+    Write-Log ('fleet suite: missing: ' + ($missing -join ' ') + '. Sirius is the foreman; for full fleet control install the whole suite.')
+    Write-Log '  The Sothis suite now lives at github.com/Davidb3l/Sothis - install with `sothis install` (or the `sothis@sothis` plugin).'
+    Write-Log '  These Sirius-hosted suite installers (/sirius:install-suite) remain for compatibility and will be removed after two Sothis releases. To add just what is missing:'
     # Anyone running this script has the sirius plugin, hence the
     # sirius-forester marketplace: the Sothis bundle entries install with no
     # extra marketplace add.

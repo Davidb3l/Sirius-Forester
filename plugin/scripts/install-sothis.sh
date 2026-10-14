@@ -1,6 +1,10 @@
 #!/bin/sh
 # install-sothis.sh — one-shot installer for the Sothis suite CLIs.
 #
+# NOTE — the Sothis suite now lives at github.com/Davidb3l/Sothis: install with
+# `sothis install` (or the `sothis@sothis` plugin). This Sirius-hosted installer
+# remains for compatibility and will be removed after two Sothis releases.
+#
 # Sothis is the local-first suite led by Sirius Forester: the foreman (`sirius`)
 # claims work from an Ametrite board (`amt`), locks code through a Hayvenhurst
 # code graph (`hayven`), pairs with Catryna Wikinelli (`catryna`) for the
@@ -34,10 +38,11 @@
 # covering macOS, Linux AND Windows under Git Bash / MSYS2 / Cygwin — nothing in
 # this script's own preamble is OS-gated. Of the delegated installers, only
 # install-sirius.sh handles the MINGW*/MSYS*/CYGWIN* uname (it pulls the
-# windows-x64 asset and installs sirius.exe). Hayvenhurst's install-hayven.sh
-# does NOT — it refuses those shells as an "unsupported OS" — so on Windows a
-# hayven failure is a WARNING with the manual route, and the run carries on
-# (anywhere else it stays fatal). PowerShell-only shells: use install-sothis.ps1.
+# windows-x64 asset and installs sirius.exe), and since v0.0.8 so does
+# Hayvenhurst's install-hayven.sh (Windows support; install-hayven.ps1 for
+# PowerShell). A hayven failure on Windows is still a WARNING with the manual
+# route and the run carries on (anywhere else it stays fatal). PowerShell-only
+# shells: use install-sothis.ps1.
 #
 # Usage:
 #   install-sothis.sh                   # install every missing suite CLI
@@ -71,7 +76,7 @@ if [ -n "${SOTHIS_INSTALL_PREFIX:-}" ]; then PREFIX_EXPLICIT=1; fi
 HAYVEN_REPO="${HAYVEN_REPO:-Davidb3l/Hayvenhurst-dev}"
 # A TAG, not `main`: the fetched-over-HTTPS installer should be an immutable,
 # reviewed revision. Bump deliberately when hayven ships installer changes.
-HAYVEN_INSTALLER_REF="${HAYVEN_INSTALLER_REF:-v0.0.6}"
+HAYVEN_INSTALLER_REF="${HAYVEN_INSTALLER_REF:-v0.0.8}"
 AMETRITE_REPO="${AMETRITE_REPO:-Davidb3l/Ametrite}"
 MODE="install"
 REQUIRE_SIG=0
@@ -147,18 +152,29 @@ tool_where() { # tool_where <bin> -> human location on stdout
 # name; installed_plugins.json v2 keys plugins as "<name>@<marketplace>". The
 # same plugin can come from DIFFERENT marketplaces (hayvenhurst@hayvenhurst vs
 # hayvenhurst@sirius-forester), so match the "<name>@ prefix, never a full key.
-# Only the bundle marketplace is matched by its exact name.
+# Only the bundle marketplace is matched by its exact name — and EITHER the
+# canonical `sothis` marketplace (Davidb3l/Sothis) or the legacy
+# `sirius-forester` one (Davidb3l/Sirius-Forester) satisfies it, for the whole
+# two-release compatibility window.
 CLAUDE_PLUGINS_DIR="${CLAUDE_PLUGINS_DIR:-$HOME/.claude/plugins}"
 
 plugin_handoff_missing() { # -> " item," list on stdout; empty = complete
   pm_missing=""
-  grep -qs '"sirius-forester"' "$CLAUDE_PLUGINS_DIR/known_marketplaces.json" \
+  grep -Eqs '"(sothis|sirius-forester)"' "$CLAUDE_PLUGINS_DIR/known_marketplaces.json" \
     || pm_missing="$pm_missing bundle-marketplace,"
   for p in sirius hayvenhurst catryna; do
     grep -qs "\"$p@" "$CLAUDE_PLUGINS_DIR/installed_plugins.json" \
       || pm_missing="$pm_missing $p-plugin,"
   done
   printf '%s' "${pm_missing%,}"
+}
+
+# Catryna is a PLUGIN. It may come from the canonical Sothis marketplace
+# (catryna@sothis), the legacy Sirius-hosted bundle (catryna@sirius-forester) or
+# its standalone marketplace (catryna@catryna-wikinelli) — accept any.
+catryna_plugin_installed() {
+  grep -Eqs '"catryna@(sothis|sirius-forester|catryna-wikinelli)"' \
+    "$CLAUDE_PLUGINS_DIR/installed_plugins.json"
 }
 
 # ---- the SSH-clone trap ------------------------------------------------------
@@ -219,6 +235,11 @@ attempt_plugin_autoinstall() {
   [ -z "$ph" ] && return 0
   log ""
   log "install-sothis: finishing the plugin half via the claude CLI (non-interactive)"
+  # Which marketplace the plugin installs come from: the canonical `sothis` one
+  # (Davidb3l/Sothis) when it is already added, else the legacy Sirius-hosted
+  # one — the one that is published today (two-release compatibility window).
+  pm="sirius-forester"
+  if grep -qs '"sothis"' "$CLAUDE_PLUGINS_DIR/known_marketplaces.json"; then pm="sothis"; fi
   case "$ph" in *bundle-marketplace*)
     # stdin stays redirected from /dev/null so a prompting CLI can never block;
     # 2>&1 into the capture so the reason survives instead of going to /dev/null.
@@ -235,13 +256,13 @@ attempt_plugin_autoinstall() {
   esac
   for p in sirius hayvenhurst catryna; do
     case "$ph" in *" $p-plugin"*|"$p-plugin"*)
-      if pi_out="$(claude plugin install "$p@sirius-forester" </dev/null 2>&1)"; then
-        log "  installed plugin: $p@sirius-forester"
+      if pi_out="$(claude plugin install "$p@$pm" </dev/null 2>&1)"; then
+        log "  installed plugin: $p@$pm"
       else
         log "  $p plugin install failed — it said:"
         log_indented "$pi_out"
         if plugin_out_is_ssh_failure "$pi_out"; then
-          print_ssh_workaround "claude plugin install $p@sirius-forester"
+          print_ssh_workaround "claude plugin install $p@$pm"
         else
           log "  (routes to finish it by hand are in the block below)"
         fi
@@ -263,7 +284,7 @@ print_plugin_handoff_block() {
     log ""
     log "install-sothis: no Claude Code detected on this machine — skipping the"
     log "  plugin-half check. If you use Claude Code elsewhere, finish there with:"
-    log "  claude plugin marketplace add Davidb3l/Sirius-Forester"
+    log "  claude plugin marketplace add Davidb3l/Sothis"
     return 0
   fi
   ph="$(plugin_handoff_missing)"
@@ -279,20 +300,23 @@ print_plugin_handoff_block() {
   log ""
   log "  Any ONE of these routes finishes it:"
   log ""
-  log "  a) From any shell (claude CLI v2.1.195+):"
-  case "$ph" in *bundle-marketplace*) log "       claude plugin marketplace add Davidb3l/Sirius-Forester" ;; esac
-  case "$ph" in *" sirius-plugin"*|"sirius-plugin"*) log "       claude plugin install sirius@sirius-forester" ;; esac
-  case "$ph" in *hayvenhurst-plugin*) log "       claude plugin install hayvenhurst@sirius-forester" ;; esac
-  case "$ph" in *catryna-plugin*)     log "       claude plugin install catryna@sirius-forester" ;; esac
+  log "  a) From any shell (claude CLI v2.1.195+) — the canonical Sothis marketplace:"
+  case "$ph" in *bundle-marketplace*) log "       claude plugin marketplace add Davidb3l/Sothis" ;; esac
+  case "$ph" in *" sirius-plugin"*|"sirius-plugin"*) log "       claude plugin install sirius@sothis" ;; esac
+  case "$ph" in *hayvenhurst-plugin*) log "       claude plugin install hayvenhurst@sothis" ;; esac
+  case "$ph" in *catryna-plugin*)     log "       claude plugin install catryna@sothis" ;; esac
+  log "     (The old Sirius-hosted marketplace — Davidb3l/Sirius-Forester, plugins"
+  log "      @sirius-forester — still works during the compatibility window and"
+  log "      satisfies this check too.)"
   if [ "$SSH_FAILURE_SEEN" = "1" ]; then
     log ""
     log "     This machine hit the SSH-clone failure above, so those commands need"
     log "     the HTTPS rewrite in front of them, e.g. on one line:"
-    log "       GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=url.https://github.com/.insteadOf GIT_CONFIG_VALUE_0=git@github.com: claude plugin install hayvenhurst@sirius-forester"
+    log "       GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=url.https://github.com/.insteadOf GIT_CONFIG_VALUE_0=git@github.com: claude plugin install hayvenhurst@sothis"
   fi
   log ""
   log "  b) Claude DESKTOP APP (no terminal): click + next to the prompt box"
-  log "     -> Plugins -> Add plugin -> add the Davidb3l/Sirius-Forester"
+  log "     -> Plugins -> Add plugin -> add the Davidb3l/Sothis"
   log "     marketplace and install what's listed above."
   log ""
   log "  c) Terminal claude session: the interactive /plugin dialog."
@@ -314,10 +338,16 @@ pingmybell_where() {
 
 if [ "$MODE" = "check" ]; then
   log "Sothis suite status:"
-  for t in sirius hayven amt catryna; do
+  for t in sirius hayven amt; do
     log "  $t: $(tool_where "$t")"
   done
-  # catryna is a plugin, not a PATH binary; report its runtime instead.
+  # catryna is a Claude Code PLUGIN, not a PATH binary — a PATH lookup always
+  # said "not installed" (SOT-26). Report the plugin, and its runtime (bun).
+  if catryna_plugin_installed; then
+    log "  catryna (plugin): installed"
+  else
+    log "  catryna (plugin): not installed"
+  fi
   have bun && log "  bun (catryna runtime): $(command -v bun)" || log "  bun (catryna runtime): not installed"
   # pingmybell is a desktop app; report the bundle.
   log "  pingmybell (the bell): $(pingmybell_where)"
@@ -376,19 +406,22 @@ find_local_hayven_installer() {
   return 1
 }
 
-# On Windows a hayven failure is a WARNING, not an abort. Hayvenhurst's
-# install-hayven.sh refuses MINGW*/MSYS*/CYGWIN* ("unsupported OS") and there is
-# no native Windows installer yet, so on this platform the delegated install is
-# EXPECTED to fail — and a `fail` here would take amt / catryna / sirius doctor /
-# the plugin half down with it. Say what happened, how to get hayven by hand,
-# and carry on. On macOS/Linux a failure is a real failure: still fatal.
+# On Windows a hayven failure is a WARNING, not an abort: a `fail` here would
+# take amt / catryna / sirius doctor / the plugin half down with it. Say what
+# happened, how to get hayven by hand, and carry on. On macOS/Linux a failure
+# is a real failure: still fatal.
+#
+# Hayvenhurst v0.0.8+ ships Windows-capable installers (install-hayven.sh under
+# Git Bash/MSYS/Cygwin and install-hayven.ps1 for PowerShell); an OLDER pinned
+# ref (v0.0.6 and earlier) refused MINGW*/MSYS*/CYGWIN* as an "unsupported OS".
 hayven_failed() { # hayven_failed <reason>
   [ "$IS_WINDOWS" = "1" ] || fail "$1"
   log ""
   log "hayven: WARNING: $1"
   log "        Skipping hayven and carrying on with the rest of the suite."
-  log "        Hayvenhurst has no native Windows installer yet (its install-hayven.sh"
-  log "        only covers macOS/Linux), so install hayven by hand: from"
+  log "        Hayvenhurst v0.0.8+ has Windows installers (install-hayven.sh /"
+  log "        install-hayven.ps1) — if this ran an older HAYVEN_INSTALLER_REF it"
+  log "        may have refused this shell. Either way, install hayven by hand: from"
   log "          https://github.com/$HAYVEN_REPO/releases/latest"
   log "        take hayvenhurst-<version>-windows-x64.tar.gz, check it against the"
   log "        .sha256 published beside it, extract it (tar -xzf), and put hayven.exe"
@@ -505,9 +538,10 @@ check_amt() {
 
 # ---- catryna (a plugin; verify its bun runtime) ----------------------------
 check_catryna() {
-  # Catryna may be installed from the Sothis bundle (catryna@sirius-forester) or
-  # its standalone marketplace (catryna@catryna-wikinelli) — accept either.
-  if grep -Eqs '"catryna@(sirius-forester|catryna-wikinelli)"' "$HOME/.claude/plugins/installed_plugins.json" 2>/dev/null; then
+  # Catryna may come from the canonical Sothis marketplace (catryna@sothis), the
+  # legacy Sirius-hosted bundle (catryna@sirius-forester) or its standalone
+  # marketplace (catryna@catryna-wikinelli) — catryna_plugin_installed accepts any.
+  if catryna_plugin_installed; then
     log "catryna: plugin installed."
   else
     log ""

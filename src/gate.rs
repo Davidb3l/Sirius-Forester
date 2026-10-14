@@ -467,6 +467,7 @@ fn run_cmd(
         // A test server a suite leaves behind holds its port and poisons the
         // NEXT gate: kill the tree on a normal exit too, not only on a timeout.
         kill_tree_on_exit: true,
+        cwd: None,
     };
     let args = [shell.flag.as_str(), full.as_str()];
     let outcome = match run.idle {
@@ -933,6 +934,7 @@ pub fn run_setup(
     // worker (or, at launch, the whole fleet) forever.
     let run_opts = AgentRunOpts {
         kill_tree_on_exit: false,
+        cwd: None,
         timeout: opts.timeout,
         heartbeat_interval: opts.heartbeat_interval,
         log_path: opts.log_path.clone(),
@@ -942,10 +944,10 @@ pub fn run_setup(
         let from_log = opts
             .log_path
             .as_ref()
-            // Lossy: one non-UTF-8 byte in an installer's output must not
-            // drop the whole tail.
-            .and_then(|p| std::fs::read(p).ok())
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            // BOUNDED (the last LOG_TAIL_BYTES, lossy): an installer's whole
+            // log can be hundreds of MB, and one non-UTF-8 byte must not drop
+            // the tail either.
+            .map(|p| read_log_tail(p))
             .unwrap_or_default();
         let (o, e) = if out.stdout.is_empty() && out.stderr.is_empty() {
             (from_log.as_str(), "")
@@ -2166,6 +2168,35 @@ mod tests {
         let _ = std::fs::remove_file(&log);
         // Only the OUTPUT says `real-found` (the command line does not).
         assert!(err.contains("real-found"), "{err}");
+    }
+
+    /// B5: the failing setup's tail is read through the bounded `read_log_tail`
+    /// (last 1 MiB), so a multi-MB install log still yields its final lines.
+    #[cfg(unix)]
+    #[test]
+    fn a_huge_setup_log_still_yields_its_tail() {
+        let log =
+            std::env::temp_dir().join(format!("sirius-setup-huge-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&log);
+        let opts = SetupOpts {
+            timeout: std::time::Duration::from_secs(60),
+            heartbeat_interval: std::time::Duration::from_secs(60),
+            log_path: Some(log.clone()),
+        };
+        let sh = crate::shell::resolve_shell();
+        let err = run_setup(
+            &crate::shell::RealRunner::default(),
+            &sh,
+            "head -c 3000000 /dev/zero | tr '\\0' x; echo; echo 'error: the-real-end'; exit 3",
+            &opts,
+            &mut || {},
+        )
+        .unwrap_err();
+        let len = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
+        let _ = std::fs::remove_file(&log);
+        assert!(len > super::LOG_TAIL_BYTES, "fixture must exceed the cap");
+        assert!(err.contains("error: the-real-end"), "{err}");
+        assert!(err.len() < 20_000, "tail stays small: {} bytes", err.len());
     }
 
     /// A stalled install is killed at the setup wall clock, not waited on.

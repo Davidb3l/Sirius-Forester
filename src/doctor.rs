@@ -293,7 +293,7 @@ pub fn plugin_version_check(plugin_root: Option<&Path>, cli_version: &str) -> Ch
 
 /// The Claude Code plugin directory for this user, if resolvable.
 fn default_plugins_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude").join("plugins"))
+    crate::workspace::home_dir().map(|h| h.join(".claude").join("plugins"))
 }
 
 /// Read a JSON file into a Value; None if absent or unparseable.
@@ -308,9 +308,12 @@ fn read_json(path: &Path) -> Option<serde_json::Value> {
 /// Detection rules (the gotcha that produces false negatives if ignored):
 /// the same plugin can be installed from DIFFERENT marketplaces — on a real
 /// machine Hayvenhurst is `hayvenhurst@hayvenhurst`, via the bundle it would be
-/// `hayvenhurst@sirius-forester`. So plugins match on the `<name>@` KEY PREFIX,
-/// never one full key. Only the bundle MARKETPLACE is matched by its exact
-/// name, because that is the thing only this repo provides.
+/// `hayvenhurst@sothis`. So plugins match on the `<name>@` KEY PREFIX, never one
+/// full key. Only the bundle MARKETPLACE is matched by its exact name — and
+/// EITHER the canonical `sothis` marketplace (Davidb3l/Sothis) or the legacy
+/// `sirius-forester` one (Davidb3l/Sirius-Forester, kept for the two-release
+/// compatibility window) satisfies it. The printed fix is always the canonical
+/// Sothis command.
 pub fn plugin_handoff_check(plugins_dir: Option<&Path>) -> Check {
     const NAME: &str = "plugin_handoff";
     let dir = match plugins_dir {
@@ -330,7 +333,10 @@ pub fn plugin_handoff_check(plugins_dir: Option<&Path>) -> Check {
     // Marketplace: known_marketplaces.json is an object keyed by marketplace
     // name. Absent/unparseable counts as "not added" — that IS the cold state.
     let marketplace_ok = read_json(&dir.join("known_marketplaces.json"))
-        .and_then(|v| v.as_object().map(|o| o.contains_key("sirius-forester")))
+        .and_then(|v| {
+            v.as_object()
+                .map(|o| o.contains_key("sothis") || o.contains_key("sirius-forester"))
+        })
         .unwrap_or(false);
 
     // Plugins: installed_plugins.json v2 is {version, plugins: {"name@mkt": …}}.
@@ -354,8 +360,8 @@ pub fn plugin_handoff_check(plugins_dir: Option<&Path>) -> Check {
     let mut fixes: Vec<String> = Vec::new();
     let mut missing: Vec<&str> = Vec::new();
     if !marketplace_ok {
-        missing.push("sirius-forester marketplace");
-        fixes.push("claude plugin marketplace add Davidb3l/Sirius-Forester".into());
+        missing.push("sothis marketplace");
+        fixes.push("claude plugin marketplace add Davidb3l/Sothis".into());
     }
     for name in ["sirius", "hayvenhurst", "catryna"] {
         if !has_plugin(name) {
@@ -364,7 +370,7 @@ pub fn plugin_handoff_check(plugins_dir: Option<&Path>) -> Check {
                 "hayvenhurst" => "hayvenhurst plugin",
                 _ => "catryna plugin",
             });
-            fixes.push(format!("claude plugin install {name}@sirius-forester"));
+            fixes.push(format!("claude plugin install {name}@sothis"));
         }
     }
 
@@ -655,7 +661,7 @@ pub fn integration_check(ws: &Workspace) -> Check {
     let red = crate::ledger::Ledger::open(&ws.ledger_path())
         .ok()
         .and_then(|l| crate::integrate::red_state(&l));
-    let parked = std::process::Command::new("git")
+    let parked = crate::shell::command("git")
         .current_dir(&ws.root)
         .args([
             "for-each-ref",
@@ -737,7 +743,7 @@ pub fn models_check(ws: &Workspace) -> Check {
     if m.default.as_deref().is_some_and(|d| !d.trim().is_empty()) {
         return Check::advisory(NAME, true, describe);
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = crate::workspace::home_dir();
     let would = crate::models::claude_default_model(&ws.root, home.as_deref())
         .map(|(model, from)| format!("`{model}` (from {from})"))
         .unwrap_or_else(|| "the CLI's built-in default".into());
@@ -1050,17 +1056,15 @@ mod tests {
         assert!(!c.pass && !c.gating);
         // Hayvenhurst and catryna are present via their standalone marketplaces
         // (prefix rule) — ONLY the marketplace and the sirius plugin may be named.
-        assert!(c.detail.contains("sirius-forester marketplace"));
+        assert!(c.detail.contains("sothis marketplace"));
         assert!(c.detail.contains("sirius plugin"));
         assert!(!c.detail.contains("hayvenhurst plugin"), "{}", c.detail);
         assert!(!c.detail.contains("catryna plugin"), "{}", c.detail);
         // The fix commands are exact, shell-runnable, and in cold-start order.
         assert!(c
             .detail
-            .contains("claude plugin marketplace add Davidb3l/Sirius-Forester"));
-        assert!(c
-            .detail
-            .contains("claude plugin install sirius@sirius-forester"));
+            .contains("claude plugin marketplace add Davidb3l/Sothis"));
+        assert!(c.detail.contains("claude plugin install sirius@sothis"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1090,6 +1094,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // SF-4: the canonical `sothis` marketplace satisfies the handoff on its own,
+    // exactly like the legacy `sirius-forester` one (compatibility window), and
+    // the printed fix is the Sothis command whichever is missing.
+    #[test]
+    fn plugin_handoff_accepts_the_sothis_marketplace() {
+        let dir = plugins_fixture(
+            "sothis",
+            r#"{"sothis":{}}"#,
+            r#"{"version":2,"plugins":{"sirius@sothis":{},"hayvenhurst@sothis":{},"catryna@sothis":{}}}"#,
+        );
+        let c = plugin_handoff_check(Some(&dir));
+        assert!(c.pass && !c.gating, "detail: {}", c.detail);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Legacy marketplace key alone still passes (two-release window).
+        let dir = plugins_fixture(
+            "legacy",
+            r#"{"sirius-forester":{}}"#,
+            r#"{"version":2,"plugins":{"sirius@sirius-forester":{},"hayvenhurst@sirius-forester":{},"catryna@sirius-forester":{}}}"#,
+        );
+        assert!(plugin_handoff_check(Some(&dir)).pass);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Neither marketplace: the fix names the Sothis one, never the legacy.
+        let dir = plugins_fixture(
+            "neither",
+            r#"{"claude-plugins-official":{}}"#,
+            r#"{"version":2,"plugins":{}}"#,
+        );
+        let c = plugin_handoff_check(Some(&dir));
+        assert!(!c.pass);
+        assert!(c
+            .detail
+            .contains("claude plugin marketplace add Davidb3l/Sothis"));
+        assert!(c.detail.contains("claude plugin install catryna@sothis"));
+        assert!(!c.detail.contains("Sirius-Forester"), "{}", c.detail);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // Absent files inside an existing plugins dir = the true cold state.
     #[test]
     fn plugin_handoff_cold_state_names_everything() {
@@ -1099,7 +1142,7 @@ mod tests {
         let c = plugin_handoff_check(Some(&dir));
         assert!(!c.pass && !c.gating);
         for needle in [
-            "sirius-forester marketplace",
+            "sothis marketplace",
             "sirius plugin",
             "hayvenhurst plugin",
             "catryna plugin",
