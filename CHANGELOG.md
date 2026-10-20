@@ -5,6 +5,8 @@ release moves them under its version (see AGENTS.md → "Releases are batched").
 
 ## Unreleased
 
+## 0.1.8 — 2026-10-20
+
 ### Added
 - `gate.timeout_secs` (default 3600) and `gate.idle_secs` (default off) bound a `gate.test_cmd` run; a limit kills the whole process tree and fails the gate with the new `timed_out` reason code (`sirius gate --json`), naming the limit and the key to raise. A suite's leftover processes are killed when it exits, and the fleet renews the amt lease and entity claims while the suite runs. (SF-17)
 
