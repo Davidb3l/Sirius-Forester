@@ -42,7 +42,7 @@ strictly through their CLIs.
 
 ## Requirements
 
-- **Rust** ≥ 1.74, only to build the `sirius` binary from source. The prebuilt
+- **Rust** ≥ 1.85, only to build the `sirius` binary from source. The prebuilt
   binaries need no toolchain.
 - **[Ametrite](https://github.com/Davidb3l/Ametrite)** (`amt` CLI, schema ≥ v3)
   — the issue tracker it claims from.
@@ -187,7 +187,7 @@ tar -xzf "$Stem.tar.gz"
 # then move $Stem\sirius.exe onto your %PATH%
 ```
 
-**From source.** Needs Rust ≥ 1.74:
+**From source.** Needs Rust ≥ 1.85:
 
 ```bash
 git clone https://github.com/Davidb3l/Sirius-Forester && cd Sirius-Forester
