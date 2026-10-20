@@ -76,7 +76,7 @@ if [ -n "${SOTHIS_INSTALL_PREFIX:-}" ]; then PREFIX_EXPLICIT=1; fi
 HAYVEN_REPO="${HAYVEN_REPO:-Davidb3l/Hayvenhurst-dev}"
 # A TAG, not `main`: the fetched-over-HTTPS installer should be an immutable,
 # reviewed revision. Bump deliberately when hayven ships installer changes.
-HAYVEN_INSTALLER_REF="${HAYVEN_INSTALLER_REF:-v0.0.9}"
+HAYVEN_INSTALLER_REF="${HAYVEN_INSTALLER_REF:-v0.0.10}"
 AMETRITE_REPO="${AMETRITE_REPO:-Davidb3l/Ametrite}"
 MODE="install"
 REQUIRE_SIG=0
