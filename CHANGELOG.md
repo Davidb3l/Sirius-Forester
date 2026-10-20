@@ -8,6 +8,9 @@ release moves them under its version (see AGENTS.md → "Releases are batched").
 ### Changed
 - The legacy suite installer (`install-sothis.sh` / `.ps1`) fetches Hayvenhurst's installer at v0.0.10 (was v0.0.9). Hayvenhurst's own installer still installs the latest release by default; the ref only pins which version of the installer script runs.
 
+### Fixed
+- `catryna@sirius-forester` can update on machines without a GitHub SSH key: the bundle marketplace declared Catryna with the `github` shorthand, which `claude plugin update` clones over SSH (install falls back to HTTPS; update does not). It now uses an explicit HTTPS git URL, like the other entries.
+
 ## 0.1.8 — 2026-10-20
 
 ### Added
