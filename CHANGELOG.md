@@ -5,6 +5,9 @@ release moves them under its version (see AGENTS.md → "Releases are batched").
 
 ## Unreleased
 
+### Changed
+- The legacy suite installer (`install-sothis.sh` / `.ps1`) fetches Hayvenhurst's installer at v0.0.10 (was v0.0.9). Hayvenhurst's own installer still installs the latest release by default; the ref only pins which version of the installer script runs.
+
 ## 0.1.8 — 2026-10-20
 
 ### Added

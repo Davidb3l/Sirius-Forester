@@ -144,7 +144,7 @@ if ([string]::IsNullOrEmpty($HayvenRepo)) { $HayvenRepo = 'Davidb3l/Hayvenhurst-
 # A TAG, not `main`: the fetched-over-HTTPS installer should be an immutable,
 # reviewed revision. Bump deliberately when hayven ships installer changes.
 $HayvenInstallerRef = $env:HAYVEN_INSTALLER_REF
-if ([string]::IsNullOrEmpty($HayvenInstallerRef)) { $HayvenInstallerRef = 'v0.0.9' }
+if ([string]::IsNullOrEmpty($HayvenInstallerRef)) { $HayvenInstallerRef = 'v0.0.10' }
 
 $AmetriteRepo = $env:AMETRITE_REPO
 if ([string]::IsNullOrEmpty($AmetriteRepo)) { $AmetriteRepo = 'Davidb3l/Ametrite' }
