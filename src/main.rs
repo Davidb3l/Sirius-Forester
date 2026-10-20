@@ -1101,7 +1101,7 @@ fn cmd_run(
         .gate
         .test_cmd
         .as_deref()
-        .map_or(true, |c| c.trim().is_empty());
+        .is_none_or(|c| c.trim().is_empty());
     if test_cmd_unset && cfg.gate.fallback != config::GateFallback::PassWithWarning {
         eprint_err(
             "gate.test_cmd is not set — every gate would fail closed and no issue could \

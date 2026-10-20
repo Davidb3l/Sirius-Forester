@@ -437,7 +437,7 @@ pub fn reconcile(previous: &[Finding], report: &ReviewReport, block_on: &[String
         let re_reported = out.blocking.iter().any(|f| f.id == p.id);
         // A finding re-reported under its own id is OPEN, whatever the
         // verdict says (contradictory output must never count as "fixed").
-        let closed = !re_reported && verdict.map_or(true, Verdict::closes);
+        let closed = !re_reported && verdict.is_none_or(Verdict::closes);
         // An AUTO fact is never closed BY a rebuttal (it is recomputed, not
         // judged): a vanished one counts as fixed, an open one as no verdict.
         let rebutted = !is_auto(&p.id) && p.response.as_ref().is_some_and(FixResponse::is_rebuttal);
