@@ -24,8 +24,8 @@
     {
       "name": "catryna",
       "source": {
-        "source": "github",
-        "repo": "Davidb3l/Catryna-Wikinelli"
+        "source": "url",
+        "url": "https://github.com/Davidb3l/Catryna-Wikinelli.git"
       },
       "description": "Living documentation for agents + humans. Ships the Catryna MCP server (create/update/search .docs/ MDX docs, coverage reports) and an Agent Skill that teaches Claude to search project docs before coding and keep them updated after changes. Local-first, git-versioned, no database. The code-wiki pillar of the Sothis suite."
     }
